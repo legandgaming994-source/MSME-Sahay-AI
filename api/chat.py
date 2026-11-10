@@ -1,0 +1,4529 @@
+"""
+WebSocket chat interface with agentic reasoning loop.
+
+The LLM receives tool definitions that map to existing ERP service functions.
+It reasons about what to do, calls tools, gets results, and iterates until
+it has a final answer — all streamed back to the browser via WebSocket.
+
+Supports multiple chat sessions, each with their own history and auto-generated title.
+"""
+
+import asyncio
+import base64
+import copy
+import difflib
+import io
+import json
+import logging
+import os
+import re
+import traceback
+import uuid
+from datetime import date
+
+import httpx
+from dotenv import load_dotenv
+from fastapi import APIRouter, Depends as _Depends, HTTPException, WebSocket, WebSocketDisconnect
+from openai import OpenAI
+
+from api.time_filters import TIME_FILTER_SCHEMA, time_filter_fields
+from api import services
+from api.erp_context import WORKFLOW_GUIDANCE, get_erp_context
+from api.chat_links import with_record_view_urls
+from api.tool_permissions import tool_allowed, tool_permission_error
+from api.demo_limits import (
+    demo_call_reserve_usd,
+    demo_max_completion_tokens,
+    demo_max_message_chars,
+    is_demo_role,
+    limiter as demo_limiter,
+)
+from api.providers import cost_of_openai_call, cost_of_transcription
+from api.routers.masters import create_master_record, update_master_record, delete_master_record
+from api.routers.analytics import DATASET_FILTER_DESCRIPTION
+from lambda_erp.database import get_db
+from lambda_erp.utils import flt, now, nowdate
+
+load_dotenv()
+
+from api.auth import require_role, get_current_user, refresh_auth_principal
+
+router = APIRouter(prefix="/chat", tags=["chat"], dependencies=[_Depends(require_role("viewer"))])
+logger = logging.getLogger("chat")
+def _resolve_demo_script_path() -> str:
+    """Locate live-demo-script.json in both dev and prod layouts.
+
+    In local dev the source of truth is `frontend/public/` (Vite serves
+    it from there). The Docker build only copies `frontend/dist/` into
+    the image, and Vite inlines everything from `public/` into `dist/`
+    at build time — so in the container the file lives under `dist/`.
+    Prefer whichever exists so the same code runs in both places.
+    """
+    here = os.path.dirname(__file__)
+    for subdir in ("public", "dist"):
+        candidate = os.path.join(here, "..", "frontend", subdir, "live-demo-script.json")
+        if os.path.isfile(candidate):
+            return candidate
+    # Fall back to the dev path — makes the FileNotFoundError message
+    # useful when neither exists (e.g. frontend wasn't built).
+    return os.path.join(here, "..", "frontend", "public", "live-demo-script.json")
+
+
+DEMO_SCRIPT_PATH = _resolve_demo_script_path()
+DEMO_TYPE_MS_PER_CHAR = 14
+DEMO_TYPE_INITIAL_MS = 90
+DEMO_AFTER_TYPED_USER_MS = 180
+
+SESSION_SELECT = """
+    SELECT
+        cs.id,
+        cs.title,
+        cs.user_id,
+        cs.created_at,
+        cs.updated_at,
+        (
+            SELECT MAX(cm.created_at)
+            FROM "Chat Message" cm
+            WHERE cm.session_id = cs.id
+              AND cm.role IN ('user', 'assistant')
+        ) AS last_message_at
+    FROM "Chat Session" cs
+"""
+
+# ---------------------------------------------------------------------------
+# Chat session & message persistence
+# ---------------------------------------------------------------------------
+
+
+def create_session(user_id: str | None = None) -> dict:
+    """Create a new chat session."""
+    db = get_db()
+    session_id = str(uuid.uuid4())[:8]
+    # Use now() (server-local ISO) to match the message `created_at` format;
+    # SQLite's CURRENT_TIMESTAMP default is UTC with a space separator, which
+    # would cause the sidebar to sort a brand-new session below older ones
+    # whose last_message_at came from now().
+    created_at = now()
+    db.sql(
+        'INSERT INTO "Chat Session" (id, title, user_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)',
+        [session_id, "New Chat", user_id, created_at, created_at],
+    )
+    db.conn.commit()
+    return get_session(session_id) or {"id": session_id, "title": "New Chat"}
+
+
+def list_sessions(user_id: str | None = None, role: str | None = None) -> list[dict]:
+    """List chat sessions for a user."""
+    db = get_db()
+    clauses: list[str] = []
+    params: list = []
+    if user_id:
+        clauses.append("cs.user_id = ?")
+        params.append(user_id)
+    if role == "public_manager":
+        # Hide demo-only and empty sessions — they pile up from drive-by visitors.
+        # Only surface sessions with at least one real (non-demo) message.
+        clauses.append(
+            'EXISTS (SELECT 1 FROM "Chat Message" cm WHERE cm.session_id = cs.id AND cm.message_type != ?)'
+        )
+        params.append("demo")
+    where = f" WHERE {' AND '.join(f'({c})' for c in clauses)}" if clauses else ""
+    rows = db.sql(f"{SESSION_SELECT}{where} ORDER BY created_at DESC", params)
+    return [dict(r) for r in rows]
+
+
+def get_session(session_id: str) -> dict | None:
+    db = get_db()
+    rows = db.sql(f"{SESSION_SELECT} WHERE cs.id = ?", [session_id])
+    return dict(rows[0]) if rows else None
+
+
+def can_access_session(session: dict | None, user: dict | None) -> bool:
+    if not session or not user:
+        return False
+    if user.get("role") == "admin":
+        return True
+    return session.get("user_id") == user.get("name")
+
+
+def delete_session(session_id: str):
+    """Delete a chat session, its messages, and its attachments."""
+    try:
+        from api.attachments import delete_session_attachments
+        delete_session_attachments(session_id)
+    except Exception:
+        pass
+    db = get_db()
+    db.sql('DELETE FROM "Chat Message" WHERE session_id = ?', [session_id])
+    db.sql('DELETE FROM "Chat Session" WHERE id = ?', [session_id])
+    db.conn.commit()
+
+
+def update_session_title(session_id: str, title: str):
+    db = get_db()
+    db.sql('UPDATE "Chat Session" SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', [title, session_id])
+    db.conn.commit()
+
+
+def touch_session(session_id: str):
+    db = get_db()
+    db.sql('UPDATE "Chat Session" SET updated_at = CURRENT_TIMESTAMP WHERE id = ?', [session_id])
+    db.conn.commit()
+
+
+def save_chat_message(session_id: str, role: str, content: str, message_type: str = "chat", metadata: dict = None):
+    """Save a chat message to the database."""
+    db = get_db()
+    metadata_json = json.dumps(metadata, default=str) if metadata else None
+    db.sql(
+        'INSERT INTO "Chat Message" (session_id, role, message_type, content, metadata_json) VALUES (?, ?, ?, ?, ?)',
+        [session_id, role, message_type, content, metadata_json],
+    )
+    db.conn.commit()
+    touch_session(session_id)
+
+
+def _save_tool_trace(session_id: str, message_type: str, payload: dict):
+    """Audit visible tool activity without masking a completed business write."""
+    try:
+        save_chat_message(session_id, "tool", json.dumps(payload, default=str), message_type=message_type)
+    except Exception:
+        # A session can be deleted while a tool is running. In particular, a
+        # failed result audit must not turn a successful write into a retry.
+        get_db().conn.rollback()
+        logger.warning("Could not persist %s trace for session %s", message_type, session_id)
+
+
+def load_chat_history(session_id: str, limit: int = 50, before_id: int | None = None) -> list[dict]:
+    """Load recent chat messages for a session.
+
+    When `before_id` is provided, load messages strictly older than that id
+    (used for "Load older messages" pagination).
+    """
+    db = get_db()
+    if before_id:
+        rows = db.sql(
+            'SELECT id, role, message_type, content, metadata_json, created_at '
+            'FROM "Chat Message" WHERE session_id = ? AND role IN (\'user\', \'assistant\') AND id < ? ORDER BY id DESC LIMIT ?',
+            [session_id, int(before_id), limit],
+        )
+    else:
+        rows = db.sql(
+            'SELECT id, role, message_type, content, metadata_json, created_at '
+            'FROM "Chat Message" WHERE session_id = ? AND role IN (\'user\', \'assistant\') ORDER BY id DESC LIMIT ?',
+            [session_id, limit],
+        )
+    rows.reverse()
+    return [dict(r) for r in rows]
+
+
+def build_conversation(session_id: str, limit: int = 20) -> list[dict]:
+    """Build the user/assistant conversation context for a session.
+
+    Demo-replay messages are included: the docs they narrate actually exist
+    (bootstrap's ensure_demo_chat_records creates them), so the history is an
+    accurate summary the LLM can build on when the user's first real message
+    refers back to "that quotation" or similar.
+    """
+    conversation = []
+    for row in load_chat_history(session_id, limit=max(limit * 2, 50)):
+        role = row["role"]
+        content = row.get("content", "")
+        if role in ("user", "assistant") and content:
+            conversation.append({"role": role, "content": content})
+    return conversation[-limit:]
+
+
+def serialize_chat_message(
+    role: str,
+    content: str,
+    created_at: str | None = None,
+    attachments: list | None = None,
+    message_id: int | None = None,
+) -> dict:
+    msg = {
+        "role": role,
+        "content": content,
+        "created_at": created_at or now(),
+    }
+    if attachments:
+        msg["attachments"] = attachments
+    if message_id is not None:
+        msg["id"] = message_id
+    return msg
+
+
+def load_serialized_chat_history(
+    session_id: str,
+    limit: int = 20,
+    before_id: int | None = None,
+) -> dict:
+    """Return a page of chat history plus pagination metadata.
+
+    Returns {messages, has_more, oldest_id}. `has_more` is True when older
+    messages exist beyond this page.
+    """
+    rows = load_chat_history(session_id, limit=limit, before_id=before_id)
+    history_messages = []
+    for row in rows:
+        role = row["role"]
+        content = row.get("content", "") or ""
+        if role not in ("user", "assistant"):
+            continue
+        attachments = None
+        meta_json = row.get("metadata_json")
+        if meta_json:
+            try:
+                meta = json.loads(meta_json)
+                attachments = meta.get("attachments")
+            except (json.JSONDecodeError, AttributeError):
+                pass
+        if content or attachments:
+            history_messages.append(
+                serialize_chat_message(
+                    role, content, row.get("created_at"), attachments, row.get("id"),
+                )
+            )
+
+    oldest_id = history_messages[0].get("id") if history_messages else None
+    has_more = False
+    if oldest_id is not None:
+        db = get_db()
+        older = db.sql(
+            'SELECT 1 FROM "Chat Message" WHERE session_id = ? AND role IN (\'user\', \'assistant\') AND id < ? LIMIT 1',
+            [session_id, int(oldest_id)],
+        )
+        has_more = bool(older)
+
+    return {
+        "messages": history_messages,
+        "has_more": has_more,
+        "oldest_id": oldest_id,
+    }
+
+
+def clear_chat_history(session_id: str):
+    """Delete all messages (and attachments) in a session."""
+    db = get_db()
+    db.sql('DELETE FROM "Chat Message" WHERE session_id = ?', [session_id])
+    db.conn.commit()
+    try:
+        from api.attachments import delete_session_attachments
+        delete_session_attachments(session_id)
+    except Exception:
+        pass
+
+
+def count_assistant_messages(session_id: str) -> int:
+    """Count assistant messages in a session (used to decide when to generate title)."""
+    db = get_db()
+    rows = db.sql(
+        'SELECT COUNT(*) as cnt FROM "Chat Message" WHERE session_id = ? AND role = \'assistant\' AND message_type = \'chat\'',
+        [session_id],
+    )
+    return rows[0]["cnt"] if rows else 0
+
+
+def load_demo_script() -> list[dict]:
+    """Load the scripted-chat replay and substitute runtime placeholders.
+
+    The JSON template references docs/values that only exist after the demo
+    bootstrap has run (quotation name, PO name, top-customer analytics…).
+    Those are written to the Settings table by api/bootstrap.py, so we pull
+    them here and do a simple {{KEY}} replacement on the string contents.
+    """
+    with open(DEMO_SCRIPT_PATH, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    db = get_db()
+    settings_rows = db.sql(
+        'SELECT key, value FROM "Settings" WHERE key LIKE "demo_chat_%"'
+    )
+    key_map = {
+        "demo_chat_company": "COMPANY",
+        "demo_chat_quotation": "DEMO_QUOTATION",
+        "demo_chat_purchase_order": "DEMO_PO",
+        # Top 3 customer ranking
+        "demo_chat_top1_id": "DEMO_TOP1_ID",
+        "demo_chat_top1_name": "DEMO_TOP1_NAME",
+        "demo_chat_top1_revenue": "DEMO_TOP1_REVENUE",
+        "demo_chat_top1_invoices": "DEMO_TOP1_INVOICES",
+        "demo_chat_top2_id": "DEMO_TOP2_ID",
+        "demo_chat_top2_name": "DEMO_TOP2_NAME",
+        "demo_chat_top2_revenue": "DEMO_TOP2_REVENUE",
+        "demo_chat_top3_id": "DEMO_TOP3_ID",
+        "demo_chat_top3_name": "DEMO_TOP3_NAME",
+        "demo_chat_top3_revenue": "DEMO_TOP3_REVENUE",
+        # Per-customer last invoice snapshots
+        "demo_chat_top1_last_inv": "DEMO_TOP1_LAST_INV",
+        "demo_chat_top1_last_inv_date": "DEMO_TOP1_LAST_INV_DATE",
+        "demo_chat_top1_last_inv_items": "DEMO_TOP1_LAST_INV_ITEMS",
+        "demo_chat_top2_last_inv": "DEMO_TOP2_LAST_INV",
+        "demo_chat_top2_last_inv_date": "DEMO_TOP2_LAST_INV_DATE",
+        "demo_chat_top2_last_inv_items": "DEMO_TOP2_LAST_INV_ITEMS",
+        "demo_chat_top3_last_inv": "DEMO_TOP3_LAST_INV",
+        "demo_chat_top3_last_inv_date": "DEMO_TOP3_LAST_INV_DATE",
+        "demo_chat_top3_last_inv_items": "DEMO_TOP3_LAST_INV_ITEMS",
+        # Analytics draft + follow-up sales invoice
+        "demo_chat_top7_report_id": "DEMO_TOP7_REPORT_ID",
+        "demo_chat_redstone_sinv": "DEMO_REDSTONE_SINV",
+        "demo_chat_redstone_sinv_date": "DEMO_REDSTONE_SINV_DATE",
+        "demo_chat_redstone_due_date": "DEMO_REDSTONE_DUE_DATE",
+    }
+    substitutions = {placeholder: "" for placeholder in key_map.values()}
+    for row in settings_rows:
+        placeholder = key_map.get(row["key"])
+        if placeholder:
+            substitutions[placeholder] = row["value"] or ""
+
+    def _sub(text: str) -> str:
+        for placeholder, value in substitutions.items():
+            text = text.replace("{{" + placeholder + "}}", value)
+        return text
+
+    result = []
+    for m in data:
+        if m.get("role") not in ("user", "assistant"):
+            continue
+        content = str(m.get("content", "")).strip()
+        if not content:
+            continue
+        entry = dict(m)
+        entry["content"] = _sub(content)
+        # Also substitute inside flash.item so placeholders like the custom
+        # analytics report id resolve to real identifiers the UI can match.
+        flash = entry.get("flash")
+        if isinstance(flash, dict):
+            entry["flash"] = {
+                k: _sub(str(v)) if isinstance(v, str) else v
+                for k, v in flash.items()
+            }
+        result.append(entry)
+    return result
+
+
+def load_demo_history(session_id: str) -> list[dict]:
+    db = get_db()
+    rows = db.sql(
+        'SELECT role, content, created_at FROM "Chat Message" '
+        'WHERE session_id = ? AND message_type = \'demo\' ORDER BY id',
+        [session_id],
+    )
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# REST endpoints for session management
+# ---------------------------------------------------------------------------
+
+
+@router.get("/sessions")
+def api_list_sessions(user: dict = _Depends(get_current_user)):
+    return list_sessions(user_id=user["name"], role=user.get("role"))
+
+
+@router.post("/sessions")
+def api_create_session(user: dict = _Depends(get_current_user)):
+    return create_session(user_id=user["name"])
+
+
+@router.get("/sessions/{session_id}")
+def api_get_session(session_id: str, user: dict = _Depends(get_current_user)):
+    session = get_session(session_id)
+    if not can_access_session(session, user):
+        return {"detail": "Session not found"}
+    return session
+
+
+@router.delete("/sessions/{session_id}")
+def api_delete_session(session_id: str, user: dict = _Depends(get_current_user)):
+    session = get_session(session_id)
+    if not can_access_session(session, user):
+        return {"detail": "Session not found"}
+    delete_session(session_id)
+    return {"ok": True}
+
+
+@router.put("/sessions/{session_id}/title")
+def api_rename_session(session_id: str, data: dict, user: dict = _Depends(get_current_user)):
+    session = get_session(session_id)
+    if not can_access_session(session, user):
+        return {"detail": "Session not found"}
+    title = data.get("title", "").strip()
+    if title:
+        update_session_title(session_id, title)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Tool definitions (OpenAI function-calling format)
+# ---------------------------------------------------------------------------
+
+DOCUMENT_SLUGS = [
+    "quotation", "proposal", "sales-order", "sales-invoice",
+    "purchase-order", "purchase-invoice",
+    "payment-entry", "journal-entry", "stock-entry",
+    "delivery-note", "purchase-receipt", "pos-invoice",
+    "pricing-rule", "budget", "subscription", "bank-account", "bank-transaction",
+    # Owned equipment and its hire calendar. Core doctypes, so they belong in
+    # this list rather than surfacing as "deployment-specific extensions"
+    # (_extra_document_slugs is defined as everything NOT named here).
+    "asset", "reservation",
+]
+
+MASTER_TYPES = ["customer", "supplier", "item", "warehouse", "account", "company", "cost-center"]
+
+# Discovery for direct (MCP) clients, which don't get the chat system prompt.
+# The native chat already carries WORKFLOW_GUIDANCE in its prompt; offering the
+# tool there made the model re-fetch ~4k tokens of the same context most turns.
+DIRECT_CLIENT_ONLY_TOOLS = frozenset({"get_erp_context"})
+
+TOOLS = [
+    {"type": "function", "function": {
+        "name": "get_erp_context",
+        "description": "Discover this ERP's live document/master types, relationships, PDF capabilities and workflow guidance. Read this before using an unfamiliar ERP. No LLM is invoked. Use field tools for detailed schemas and tools/list for permitted operations.",
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    }},
+    {
+        "type": "function",
+        "function": {
+            "name": "list_documents",
+            "description": "List or search documents of a given type. With time_filter or include_meta=true returns {rows,total,has_more,next_offset,time_filter,coverage,warnings}; otherwise returns an array of document summaries (header fields only — child tables like 'items' and 'taxes' are NOT included to keep results compact). Use get_document to drill into a single document's line items. Results default to creation DESC, or the parsed time_filter field DESC when supplied. Page past `limit` with `offset`; trim the payload to only the columns you need with `fields`.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "time_filter": TIME_FILTER_SCHEMA,
+                    "include_meta": {"type": "boolean", "description": "Use true for complete lists or overviews: returns exact total and pagination/coverage metadata."},
+                    "include_discarded": {"type": "boolean", "description": "Include discarded drafts when checking recent changes; default false."},
+                    "doctype": {"type": "string", "enum": DOCUMENT_SLUGS, "description": "Document type slug"},
+                    "filters": {"type": "object", "description": "Optional filters on any column. Equality: {\"status\": \"Draft\", \"customer\": \"CUST-001\"}. Comparison (value = a 2-item array [op, value]): {\"grand_total\": [\">\", 100]}, {\"fit\": [\"!=\", \"A\"]}. Case-insensitive text substring: {\"customer_name\": [\"contains\", \"acme\"]}. NULL checks (1-item array): {\"fit\": [\"is null\"]}, {\"main_email\": [\"is not null\"]}. Allowed ops: =, !=, >, <, >=, <=, in, not in, contains, like, not like, is null, is not null. IN example: {\"type\": [\"in\", [\"call\", \"email\", \"note\"]]}. Free-text search: {\"search\": \"acme\"} matches the doctype's default text columns; narrow it with {\"search\": \"acme\", \"search_fields\": [\"company_name\", \"tags\"]}.", "default": {}},
+                    "order_by": {"type": "string", "description": "Optional column to sort by. Defaults to the time_filter field when supplied, otherwise creation."},
+                    "order": {"type": "string", "enum": ["asc", "desc"], "description": "Sort direction (default desc)", "default": "desc"},
+                    "limit": {"type": "integer", "description": "Max results (default 20, max 500)", "default": 20},
+                    "offset": {"type": "integer", "description": "Skip this many rows before returning — for paging past `limit`. Default 0.", "default": 0},
+                    "fields": {"type": "array", "items": {"type": "string"}, "description": "Optional: return ONLY these columns (plus name) instead of every field — keeps results lean when you need just a few. Unknown fields are ignored."},
+                },
+                "required": ["doctype"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_document_fields",
+            "description": "List available columns, text fields and supported time_filter_fields of a document type. Call this before building list_documents filters when you are unsure of a field name or whether it supports the case-insensitive contains operator. Also returns required fields, conditional business rules, child requirements, dynamic links and supported transient inputs. Check these before creating or updating a document; unknown fields are rejected.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "doctype": {"type": "string", "enum": DOCUMENT_SLUGS},
+                },
+                "required": ["doctype"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_document_pdf",
+            "description": "Generate and validate the actual PDF before offering or sending it. Returns a downloadable file snapshot only after successful rendering and content checks. Read get_document_fields.pdf for support and output requirements. Relay errors; never invent a PDF URL or claim a file is attached without this tool succeeding.",
+            "parameters": {"type": "object", "properties": {
+                "doctype": {"type": "string", "enum": DOCUMENT_SLUGS},
+                "name": {"type": "string"}}, "required": ["doctype", "name"]},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_document",
+            "description": "Load a specific document by its name/ID. Returns the full document with all fields and child tables.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "doctype": {"type": "string", "enum": DOCUMENT_SLUGS},
+                    "name": {"type": "string", "description": "Document name/ID, e.g. 'QTN-0001'"},
+                },
+                "required": ["doctype", "name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_document",
+            "description": (
+                "Create a new draft document (docstatus=0). The document is saved but NOT submitted. Use get_document_fields for required/conditional fields. Never omit an ambiguous business reference to make a call succeed: ask a targeted question. Relay _validation.warnings from saved documents. IMPORTANT: you MUST pass the 'data' object with ALL document fields — doctype alone is not enough. Example: {\"doctype\": \"purchase-order\", \"data\": {\"supplier\": \"SUPP-001\", \"company\": \"My Co\", \"transaction_date\": \"2026-04-14\", \"items\": [{\"item_code\": \"ITEM-001\", \"qty\": 10, \"rate\": 100}]}}\n"
+                "Currency: `currency` is optional — it defaults to the customer/supplier's currency, else the company's base currency. To bill in a foreign currency, also pass `conversion_rate` = how many units of the company's base currency equal 1 unit of the document currency (no automatic FX lookup yet, so you MUST supply it for a foreign currency). Item rates stay in the document currency. Example (base USD, invoicing in EUR at 1 EUR = 1.10 USD): {\"doctype\": \"sales-invoice\", \"data\": {\"customer\": \"CUST-001\", \"company\": \"My Co\", \"posting_date\": \"2026-05-22\", \"currency\": \"EUR\", \"conversion_rate\": 1.10, \"items\": [{\"item_code\": \"ITEM-001\", \"qty\": 1, \"rate\": 100}]}}"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "doctype": {"type": "string", "enum": DOCUMENT_SLUGS},
+                    "data": {"type": "object", "description": "REQUIRED. All document fields. Must include: supplier/customer, company, date, and items array. Optional: currency + conversion_rate (see description) for foreign-currency documents. Without this the call will fail."},
+                },
+                "required": ["doctype", "data"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_document",
+            "description": "Update fields on an existing draft document (docstatus=0). Only drafts can be edited. You MUST include the `data` object with the fields to change. For parent fields: {\"data\": {\"company\": \"X\"}}. For child table fields (like setting warehouse on items): first call get_document to see the current items, then pass the full items array back with your changes: {\"data\": {\"items\": [{\"item_code\": \"ITEM-001\", \"qty\": 10, \"rate\": 100, \"warehouse\": \"WH-001\"}]}}. To change the document's currency, pass `currency` (and `conversion_rate` for a foreign currency, as in create_document).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "doctype": {"type": "string", "enum": DOCUMENT_SLUGS},
+                    "name": {"type": "string", "description": "Document name/ID to update"},
+                    "data": {"type": "object", "description": "Fields to change. MUST be provided. For child tables like items, pass the complete array."},
+                },
+                "required": ["doctype", "name", "data"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "batch_update_documents",
+            "description": (
+                "Update MANY existing documents of the SAME doctype in ONE call — far cheaper than a "
+                "separate update_document per record when applying changes across a set (e.g. tagging or "
+                "qualifying a batch of leads). Pass `doctype` and `updates`: an array of {\"name\", \"data\"} "
+                "objects where `data` holds the fields to change on that record (identical shape to "
+                "update_document's `data`, including child-table arrays). Best-effort and per-item: each "
+                "record is updated independently, so one failure doesn't undo the others. Max 200 per call. "
+                "Only drafts (docstatus=0) can be updated. Returns {\"updated\", \"failed\", "
+                "\"results\": [{\"name\", \"ok\", \"error\"?}]}."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "doctype": {"type": "string", "enum": DOCUMENT_SLUGS},
+                    "updates": {
+                        "type": "array",
+                        "description": "Up to 200 {name, data} objects — one per record to update.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string", "description": "Document name/ID to update"},
+                                "data": {"type": "object", "description": "Fields to change on this record (same as update_document's data)."},
+                            },
+                            "required": ["name", "data"],
+                        },
+                    },
+                },
+                "required": ["doctype", "updates"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "submit_document",
+            "description": "Submit a draft document (changes docstatus from 0 to 1). This posts GL entries, stock entries, etc. Only works on drafts (docstatus=0). Once submitted, the document is locked and can only be cancelled, not edited.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "doctype": {"type": "string", "enum": DOCUMENT_SLUGS},
+                    "name": {"type": "string"},
+                },
+                "required": ["doctype", "name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_document",
+            "description": "Cancel a SUBMITTED document (reverses its GL/stock entries). Only works on submitted documents (docstatus=1). For an unwanted DRAFT (docstatus=0), use discard_document instead — do NOT submit a draft just to cancel it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "doctype": {"type": "string", "enum": DOCUMENT_SLUGS},
+                    "name": {"type": "string"},
+                },
+                "required": ["doctype", "name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "discard_document",
+            "description": "Void/discard an unwanted DRAFT document (docstatus=0). This is a soft delete: the record is kept for the audit trail but flagged 'Discarded' and hidden from default lists. It has no financial or stock impact (a draft never posted anything). Only works on drafts — a submitted document must be cancelled instead. There is no hard delete in the system.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "doctype": {"type": "string", "enum": DOCUMENT_SLUGS},
+                    "name": {"type": "string"},
+                },
+                "required": ["doctype", "name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "convert_document",
+            "description": "Convert a submitted document to the next type in the workflow, OR create a return. Forward: Quotation -> Sales Order or Sales Invoice or Delivery Note, Sales Order -> Sales Invoice or Delivery Note, Purchase Order -> Purchase Invoice or Purchase Receipt. Returns: convert to the SAME type (e.g. Sales Invoice -> Sales Invoice creates a Credit Note, Purchase Invoice -> Purchase Invoice creates a Debit Note, Delivery Note -> Delivery Note or Purchase Receipt -> Purchase Receipt for stock returns).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "doctype": {"type": "string", "enum": DOCUMENT_SLUGS, "description": "Source document type slug"},
+                    "name": {"type": "string", "description": "Source document name"},
+                    "target_doctype": {"type": "string", "description": "Target document type DISPLAY NAME, e.g. 'Sales Order', 'Delivery Note'"},
+                },
+                "required": ["doctype", "name", "target_doctype"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_masters",
+            "description": "Search and filter master data (customers, suppliers, items, warehouses, accounts, companies, cost centers). `query` is a case-insensitive free-text lookup with fuzzy fallback for simple misspellings. Use `filters` for deterministic field-aware queries and for combining different values across fields. With time_filter or include_meta=true returns a page object with rows, total, pagination and coverage (default limit 50, max 500; no fuzzy fallback). Legacy simple lookups return all matches as an array unless limit is supplied.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "time_filter": TIME_FILTER_SCHEMA,
+                    "include_meta": {"type": "boolean", "description": "Use true for overviews: returns rows, exact total, pagination and coverage. Automatically enabled with time_filter."},
+                    "master_type": {"type": "string", "enum": MASTER_TYPES},
+                    "query": {"type": "string", "description": "Search term (empty string returns all)", "default": ""},
+                    "fields": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Recommended: the column(s) to search, e.g. [\"city\"] or [\"customer_name\"]. Narrowing here is faster and avoids matching unrelated columns. Omit only when you genuinely don't know which field holds the value, to search all standard text fields.",
+                    },
+                    "filters": {
+                        "type": "object",
+                        "description": "Optional deterministic filters on any real column or registered alias (item_code = name), ANDed together and with `query`. Scalar values are exact: {\"disabled\": 0}. Text substring: {\"legal_form\": [\"contains\", \"AG\"]}. Comparisons and NULL checks use the same forms as list_documents. `contains` is only valid for schema-confirmed text fields.",
+                        "default": {},
+                    },
+                    "order_by": {"type": "string", "description": "Optional real column or registered alias (item_code = name) to sort by. Defaults to the time_filter field when supplied, otherwise name."},
+                    "order": {"type": "string", "enum": ["asc", "desc"], "description": "Sort direction (default asc).", "default": "asc"},
+                    "limit": {"type": "integer", "description": "Maximum results. With time_filter/include_meta: default 50, range 1–500. Legacy simple lookups have no cap when omitted."},
+                    "offset": {"type": "integer", "description": "Skip this many matching rows. Use with limit for pagination.", "default": 0},
+                    "result_fields": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional result projection. Returns requested columns plus name. Registered aliases are accepted: item_code resolves to name and is also returned as item_code when requested. This is separate from `fields`, which selects columns searched by `query`.",
+                    },
+                    "include_disabled": {"type": "boolean", "description": "Default false (active records only). Set true to ALSO return disabled/archived records — needed to find a record you must inspect, re-enable, or reference, or to answer 'what's disabled'. Retry with this if a lookup for a record you know exists comes back empty."},
+                },
+                "required": ["master_type"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_master_fields",
+            "description": "List the available columns of a master type (customer, supplier, item, ...). Call this WHENEVER you're unsure which columns exist: before passing `fields`, `filters`, `result_fields` or `order_by` to search_masters, and before building a create/update payload. Returns real fields, field_aliases (e.g. item_code maps to name), text fields (the columns that support `contains`), default free-text search fields, and bulk text fields that are searched only when explicitly named.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "master_type": {"type": "string", "enum": MASTER_TYPES},
+                },
+                "required": ["master_type"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_master",
+            "description": (
+                "Create a new master record. You MUST include the full `data` object using the EXACT field names listed below — unknown fields are rejected. Call get_master_fields for the live schema, including extension fields.\n\n"
+                "Every record's id is `name`. Customer/Supplier/Item/Warehouse auto-generate it (CUST-/SUPP-/ITEM-/WH-NNN) when omitted; Company defaults it to company_name. Account/Cost Center require an explicit `name`.\n\n"
+                "**Customer fields:** name (optional custom id; auto CUST-NNN), customer_name (required), customer_group, territory, default_currency, credit_limit, website, email, phone, address, city, zip_code, country, tax_id, contact_person (named contact at the customer), contact_email, contact_phone.\n"
+                "**Supplier fields:** name (optional custom id; auto SUPP-NNN), supplier_name (required), supplier_group, default_currency, email, phone, address, city, zip_code, country, tax_id.\n"
+                "**Item fields:** name (the unique item code/id, e.g. \"SVC-SPARK\" — optional, may use ANY prefix, not just ITEM; auto-generated as ITEM-NNN if omitted), item_name (required, the human-readable name), item_group, stock_uom (prefer one of the units listed under 'Item Units' in the system context — exact spelling; a new unit is allowed when none fits), standard_rate, is_stock_item, default_warehouse, description.\n"
+                "**Warehouse fields:** name (optional custom id; auto WH-NNN), warehouse_name (required), company, parent_warehouse (omit or null when not needed), address, city, zip_code, country.\n"
+                "**Company fields:** name (the company id — optional, defaults to company_name), company_name (required), default_currency, email, phone, address, city, zip_code, country, tax_id.\n"
+                "**Account fields:** name (REQUIRED — full account id, conventionally \"<account_name> - <company abbr>\", e.g. \"Marketing Expenses - LAMB\"), account_name (required), company (required), root_type (Asset/Liability/Equity/Income/Expense), report_type (\"Balance Sheet\" or \"Profit and Loss\"), account_type (e.g. Receivable, Payable, Bank, Cash, Stock, Tax), parent_account, account_currency, is_group (0/1).\n"
+                "**Cost Center fields:** name (REQUIRED — e.g. \"Marketing - LAMB\"), cost_center_name (required), company (required), parent_cost_center, is_group (0/1).\n\n"
+                "zip_code is free text (e.g. \"8400\", \"ZH 8400\", \"59123\"), never numeric.\n"
+                "When the user names a contact person at a customer (e.g. \"Kontakt/Ansprechpartner ist Marlene Voss, 079 123 45 67\"), put the person's name in contact_person and their phone/email in contact_phone/contact_email — NOT in the company-level phone/email. There is no separate contact tool; contact-person data lives on these Customer columns, so never claim you cannot store a contact person.\n"
+                "Supplier example: {\"master_type\":\"supplier\",\"data\":{\"supplier_name\":\"Schlafteq\",\"email\":\"jacob@schlafteq.ch\",\"phone\":\"+1 555-0104\",\"address\":\"145 Harbor Rd\",\"city\":\"Seattle\",\"zip_code\":\"98101\",\"country\":\"US\",\"tax_id\":\"98-7654321\"}}\n"
+                "Item example (custom code): {\"master_type\":\"item\",\"data\":{\"name\":\"SVC-SPARK\",\"item_name\":\"Spark\",\"item_group\":\"Services\",\"is_stock_item\":0,\"standard_rate\":310}}\n"
+                "Customer example (with contact person): {\"master_type\":\"customer\",\"data\":{\"customer_name\":\"Foglio AG\",\"address\":\"Seeweg 12\",\"city\":\"Bramblewick\",\"zip_code\":\"9999\",\"contact_person\":\"Marlene Voss\",\"contact_phone\":\"079 123 45 67\"}}"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "master_type": {"type": "string", "enum": MASTER_TYPES},
+                    "data": {"type": "object", "description": "REQUIRED. Full master data payload using the field names listed in the tool description."},
+                },
+                "required": ["master_type", "data"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_master",
+            "description": (
+                "Update an existing master record. You MUST include the `name` of the existing record and a `data` object with the fields to change. Use the same field names listed in create_master (customer: customer_name, website, email, phone, address, city, zip_code, country, tax_id, contact_person, contact_email, contact_phone, etc.). Example: {\"master_type\":\"customer\",\"name\":\"CUST-001\",\"data\":{\"address\":\"123 New Street\",\"city\":\"Boston\",\"zip_code\":\"02110\"}}"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "master_type": {"type": "string", "enum": MASTER_TYPES},
+                    "name": {"type": "string", "description": "Existing master record ID/name to update."},
+                    "data": {"type": "object", "description": "REQUIRED. Fields to change on the existing master record."},
+                },
+                "required": ["master_type", "name", "data"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_master",
+            "description": (
+                "Delete a master record (customer, supplier, item, ...). ADMIN role only. "
+                "Reference-protected and safe by design: an UNREFERENCED record is permanently deleted; "
+                "a record referenced anywhere (documents, GL, stock, ...) is NOT deleted — it is automatically "
+                "disabled/archived instead and the result names the blocking reference (status='disabled'). "
+                "Use when the user explicitly asks to delete/remove a master record (e.g. a mistakenly created "
+                "or duplicate one). If they merely want it out of the way, prefer update_master with "
+                "{\"disabled\": 1}. Example: {\"master_type\":\"customer\",\"name\":\"CUST-007\"}"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "master_type": {"type": "string", "enum": MASTER_TYPES},
+                    "name": {"type": "string", "description": "Existing master record ID/name to delete."},
+                },
+                "required": ["master_type", "name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_report",
+            "description": "Run a financial or stock report.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "report_type": {"type": "string", "enum": ["trial-balance", "general-ledger", "stock-balance", "dashboard-summary", "profit-and-loss", "balance-sheet", "ar-aging", "ap-aging"]},
+                    "filters": {"type": "object", "description": "Optional filters: company, account, from_date, to_date, item_code, warehouse. For trial-balance / profit-and-loss / balance-sheet you may also pass `presentation_currency` (e.g. \"EUR\") to view the report translated from the company's base currency at the period's closing rate — display only, the ledger stays in base currency.", "default": {}},
+                },
+                "required": ["report_type"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "revalue_currencies",
+            "description": "Preview or post period-end FX revaluation of open foreign-currency balances (foreign receivables, payables, and bank/cash accounts). Restates them to the closing rate and books the unrealized gain/loss, plus a next-day auto-reversal. Use post=false (default) to preview the exposure without posting; post=true to commit. Returns a per-balance breakdown and the net unrealized P&L impact.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "company": {"type": "string", "description": "Company name. Defaults to the only/first company."},
+                    "date": {"type": "string", "description": "Period-end date (YYYY-MM-DD). Defaults to today. The closing rate is looked up for this date."},
+                    "post": {"type": "boolean", "description": "false = preview only (no GL); true = post the revaluation + next-day reversal.", "default": False},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_time",
+            "description": "Get the current date and time.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "retrieve_chat_history",
+            "description": "Retrieve earlier messages from the conversation history. Use this when the user references something said earlier, asks a follow-up to a previous topic, or you need context from past messages. The most recent messages are already in context — this tool fetches older ones.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "num_messages": {"type": "integer", "description": "Number of recent messages to retrieve (default 20, max 50)."},
+                    "date_from": {"type": "string", "description": "Start of date range (ISO 8601)."},
+                    "date_to": {"type": "string", "description": "End of date range (ISO 8601)."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_chat_attachments",
+            "description": "List all files the user has uploaded in this chat session — PDFs, images, spreadsheets (Excel/CSV/ODS), documents (Word/OpenDocument), and structured bank files (CAMT XML/ZIP). Returns metadata including id, filename, mime type, size, and upload date. Use this when the user references a previously uploaded file or you need its attachment id.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "preview_bank_statement_attachments",
+            "description": "Safely parse CAMT.053 XML or ZIP chat attachments and return a compact, read-only import preview: masked account, currency, period, balances, entry/detail/batch/QR counts, duplicates, warnings, and any exact Bank Account mapping. The raw XML is never added to the model context. Always call this before importing bank statements.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "attachment_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": 20,
+                        "description": "CAMT XML/ZIP attachment ids from this chat.",
+                    },
+                },
+                "required": ["attachment_ids"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "import_bank_statement_attachments",
+            "description": "Import previously previewed CAMT attachments as Bank Transactions without creating or posting any Payment Entry, Journal Entry, or GL entry. Exact file re-uploads and stable duplicate bank entries are skipped. Use only after showing the preview and receiving explicit user confirmation. Requires manager access and is unavailable in public demo mode.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "attachment_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": 20,
+                    },
+                    "mappings": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                        "description": "Optional mapping of statement_key from the preview to Bank Account document name. Exact IBAN matches are used automatically.",
+                    },
+                    "confirmed": {
+                        "type": "boolean",
+                        "description": "Must be true, and only after the user explicitly confirmed the displayed preview.",
+                    },
+                },
+                "required": ["attachment_ids", "confirmed"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_bank_reconciliation_queue",
+            "description": "List imported bank transactions awaiting reconciliation, or recently reconciled rows. Returns compact transaction details with masked counterparty IBANs. Requires manager access.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "enum": ["Unreconciled", "Reconciled", "All"], "default": "Unreconciled"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "suggest_bank_reconciliation",
+            "description": "Return deterministic candidates for one imported Bank Transaction: exact existing Payment/Journal vouchers and open invoice matches scored by amount, document reference, counterparty and date. This is read-only and must be called before proposing a reconciliation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "bank_transaction": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 12},
+                },
+                "required": ["bank_transaction"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "reconcile_bank_transaction",
+            "description": "Reconcile imported bank transactions after explicit user confirmation. Always pass bank_transactions: use a one-item list for an individual reconciliation and the complete list returned by an existing_voucher_group suggestion for a grouped reconciliation. mode=invoice_payment creates and submits a Payment Entry allocated to one or more invoices; mode=existing_voucher links an already-submitted Payment Entry or Journal Entry with an exactly matching bank leg, atomically for a group; mode=journal creates and submits a two-sided Journal Entry against a non-bank, non-AR/AP account. invoice_payment and journal accept exactly one bank transaction. This posts or links real accounting data. Never call in the same turn as the first proposal; confirmed must reflect a later explicit confirmation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "bank_transactions": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                        "maxItems": 100,
+                        "description": "Bank Transaction names to reconcile: exactly one for an individual match/payment/journal, or the complete exact group returned by the suggestion.",
+                    },
+                    "mode": {"type": "string", "enum": ["invoice_payment", "existing_voucher", "journal"]},
+                    "allocations": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "reference_doctype": {"type": "string", "enum": ["Sales Invoice", "Purchase Invoice"]},
+                                "reference_name": {"type": "string"},
+                                "allocated_amount": {"type": "number", "exclusiveMinimum": 0},
+                            },
+                            "required": ["reference_doctype", "reference_name", "allocated_amount"],
+                        },
+                    },
+                    "voucher_type": {"type": "string", "enum": ["Payment Entry", "Journal Entry"]},
+                    "voucher_no": {"type": "string"},
+                    "counterparty_account": {"type": "string"},
+                    "conversion_rate": {"type": "number", "exclusiveMinimum": 0},
+                    "remarks": {"type": "string"},
+                    "confirmed": {"type": "boolean"},
+                },
+                "required": ["bank_transactions", "mode", "confirmed"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "undo_bank_reconciliation",
+            "description": "Reverse an active bank reconciliation after explicit user confirmation. Vouchers created by reconciliation are cancelled and reversed; an existing linked voucher is only unlinked and remains submitted. If the selected transaction belongs to a group, every transaction in that group is unlinked atomically. Never call without listing the affected group, explaining that distinction, and receiving confirmation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "bank_transaction": {"type": "string"},
+                    "confirmed": {"type": "boolean"},
+                },
+                "required": ["bank_transaction", "confirmed"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "retrieve_chat_attachment",
+            "description": "Retrieve a previously uploaded file (PDF, image, spreadsheet, or document) by its id and inject it back into the conversation so you can read/analyze it — e.g. to cross-check a spreadsheet of companies against the CRM. Use this when the user asks a follow-up about a file they uploaded earlier in the chat but it's no longer in the immediate context. Call list_chat_attachments first if you don't know the id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "attachment_id": {"type": "string", "description": "The id of the attachment (from list_chat_attachments)."},
+                },
+                "required": ["attachment_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_dataset",
+            "description": (
+                "Run a deterministic SQL GROUP BY aggregation over a semantic "
+                "dataset and return the aggregated rows. Use this for factual "
+                "answers that require aggregating many rows (top customer by "
+                "revenue, total sales this month, outstanding AR by customer, "
+                "count of invoices per supplier, etc.) — instead of calling "
+                "`list_documents` and adding things up in your head.\n\n"
+                "Available datasets (same as for custom analytics):\n"
+                "- `sales_invoices` — submitted sales invoices (includes returns)\n"
+                "- `sales_invoice_lines` — submitted sales invoice line items\n"
+                "- `purchase_invoices` — submitted purchase invoices (includes returns)\n"
+                "- `purchase_invoice_lines` — submitted purchase invoice line items\n"
+                "- `payments` — submitted payment entries\n"
+                "- `ar_open_items` — outstanding sales invoice amounts\n"
+                "- `ap_open_items` — outstanding purchase invoice amounts\n"
+                "- `stock_balances` — current stock on hand by item × warehouse\n"
+                "- `stock_movements` — stock ledger entries (movement history); "
+                "`abs_qty` = units moved (use `sum`), `actual_qty` = net flow\n"
+                "- `gl_entries` — posted ledger rows; use `income_amount` and "
+                "`expense_amount` for P&L analysis\n"
+                "- `bank_transactions` — imported cash movements; use `deposit` "
+                "and `withdrawal` for bank inflow/outflow analysis\n\n"
+                "Shape your call like: `{dataset, group_by, measures, filters?, "
+                "order_by?, limit?}`. `group_by` is a list of field names. "
+                "`measures` is an object of `{alias: [op, field]}` where `op` "
+                "is one of sum, count, avg, min, max (count may omit field). "
+                "`filters` is a dict keyed by field name — same shape as for "
+                "`create_custom_analytics_report` (equality, [\"in\", [values]] or a flat list for IN, "
+                "[\"not in\", [values]], `{from, to}` for ranges). Invalid filter shapes "
+                "are errors, not evidence of zero stock or activity. `order_by` is a list of "
+                "`{field, direction}` where `field` is a group_by field or a "
+                "measure alias and `direction` is asc/desc.\n\n"
+                "Example — top 5 customers by revenue:\n"
+                "```json\n"
+                "{\"dataset\": \"sales_invoices\", "
+                "\"group_by\": [\"customer\", \"customer_name\"], "
+                "\"measures\": {\"revenue\": [\"sum\", \"net_total\"], "
+                "\"invoices\": [\"count\"]}, "
+                "\"filters\": {\"is_return\": 0}, "
+                "\"order_by\": [{\"field\": \"revenue\", \"direction\": \"desc\"}], "
+                "\"limit\": 5}\n"
+                "```\n\n"
+                "Only reference fields that are exposed by the chosen dataset. "
+                "Only filter on the dataset's `filter_fields`. Do not invent "
+                "fields. The tool returns `{rows: [{…group fields, …measure "
+                "aliases}], row_count, truncated}` — you can cite these numbers "
+                "directly in your reply."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "dataset": {
+                        "type": "string",
+                        "enum": [
+                            "sales_invoices",
+                            "sales_invoice_lines",
+                            "purchase_invoices",
+                            "purchase_invoice_lines",
+                            "payments",
+                            "ar_open_items",
+                            "ap_open_items",
+                            "stock_balances",
+                            "stock_movements",
+                            "gl_entries",
+                            "bank_transactions",
+                        ],
+                    },
+                    "group_by": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "measures": {
+                        "type": "object",
+                        "description": "Map of alias -> [op, field]. op ∈ sum|count|avg|min|max.",
+                    },
+                    "filters": {"type": "object", "description": DATASET_FILTER_DESCRIPTION},
+                    "order_by": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "field": {"type": "string"},
+                                "direction": {"type": "string", "enum": ["asc", "desc"]},
+                            },
+                            "required": ["field"],
+                        },
+                    },
+                    "limit": {"type": "integer"},
+                },
+                "required": ["dataset", "measures"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_custom_analytics_report",
+            "description": (
+                "Create a draft custom analytics report that opens in "
+                "/reports/analytics?report_id=... . Use this when the user wants "
+                "a bespoke chart/table beyond preset analytics. Prefer passing "
+                "a plain-language `intent`; the report specialist generates a "
+                "validated declarative `data_requests` + `report` specification. "
+                "No executable JavaScript is accepted.\n\n"
+                "Available semantic datasets include: sales_invoices, "
+                "sales_invoice_lines, purchase_invoices, purchase_invoice_lines, "
+                "payments, ar_open_items, ap_open_items, stock_balances, "
+                "stock_movements, gl_entries, bank_transactions.\n\n"
+                "The report language supports grouped dimensions, month/quarter/year "
+                "date buckets, sum/count/avg/min/max measures and KPIs, sorting, "
+                "limits, tables, and single- or multi-series bar/line charts plus "
+                "pie charts. Request only fields "
+                "exposed by dataset metadata. Always include the returned URL."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "description": {"type": "string"},
+                    "intent": {
+                        "type": "string",
+                        "description": (
+                            "Plain-language description of what the user wants "
+                            "in this report — the report specialist will use this "
+                            "to generate data_requests + report. Include "
+                            "any specific filters, groupings, sort orders, or "
+                            "chart preferences the user mentioned."
+                        ),
+                    },
+                    "data_requests": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "dataset": {
+                                    "type": "string",
+                                    "enum": [
+                                        "sales_invoices",
+                                        "sales_invoice_lines",
+                                        "purchase_invoices",
+                                        "purchase_invoice_lines",
+                                        "payments",
+                                        "ar_open_items",
+                                        "ap_open_items",
+                                        "stock_balances",
+                                        "stock_movements",
+                                        "gl_entries",
+                                        "bank_transactions",
+                                    ],
+                                },
+                                "fields": {"type": "array", "items": {"type": "string"}},
+                                "filters": {"type": "object", "description": DATASET_FILTER_DESCRIPTION},
+                                "limit": {"type": "integer"},
+                            },
+                            "required": ["dataset"],
+                        },
+                    },
+                    "report": {"type": "object"},
+                },
+                "required": ["title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_custom_analytics_report",
+            "description": (
+                "Load an existing custom analytics draft by report_id. Use this "
+                "when the user says a draft report is broken, wants to refine an "
+                "existing report, or references a /reports/analytics?report_id=... link."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "report_id": {"type": "string"},
+                },
+                "required": ["report_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_custom_analytics_report",
+            "description": (
+                "Update an existing custom analytics draft in place while "
+                "keeping the same report_id and URL. Load the current draft "
+                "with `get_custom_analytics_report` first so you understand "
+                "what it does.\n\n"
+                "**Preferred usage:** provide `report_id` and `feedback` — a "
+                "plain-language description of what needs to change (e.g. "
+                "\"chart is empty because grand_total is not in "
+                "sales_invoice_lines; use amount instead\", or \"add a line "
+                "chart showing monthly trend\"). The backend will hand both "
+                "the current draft and your feedback to the report specialist "
+                "model to rewrite the declarative spec.\n\n"
+                "Only pass `data_requests` or `report` directly if you already "
+                "have a complete version-1 declarative definition."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "report_id": {"type": "string"},
+                    "feedback": {
+                        "type": "string",
+                        "description": (
+                            "Description of what should change — the code "
+                            "specialist receives this alongside the existing "
+                            "draft and rewrites the spec."
+                        ),
+                    },
+                    "title": {"type": "string"},
+                    "description": {"type": "string"},
+                    "data_requests": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "dataset": {
+                                    "type": "string",
+                                    "enum": [
+                                        "sales_invoices",
+                                        "sales_invoice_lines",
+                                        "purchase_invoices",
+                                        "purchase_invoice_lines",
+                                        "payments",
+                                        "ar_open_items",
+                                        "ap_open_items",
+                                        "stock_balances",
+                                        "stock_movements",
+                                        "gl_entries",
+                                        "bank_transactions",
+                                    ],
+                                },
+                                "fields": {"type": "array", "items": {"type": "string"}},
+                                "filters": {"type": "object", "description": DATASET_FILTER_DESCRIPTION},
+                                "limit": {"type": "integer"},
+                            },
+                            "required": ["dataset"],
+                        },
+                    },
+                    "report": {"type": "object"},
+                },
+                "required": ["report_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "plan_company_setup",
+            "description": (
+                "PREVIEW a new company's chart of accounts — creates NOTHING. Use this "
+                "when the user asks to set up a company / get started / create their books. "
+                "Returns the proposed jurisdiction, currency, the full account tree, the "
+                "sector-specific accounts that would be added, the company default-account "
+                "wiring, and — importantly — `sector.guidance` (why the chart looks this way) "
+                "and `sector.big_decisions` (points you MUST confirm with the user before "
+                "applying). Call this first, walk the user through the plan and the big "
+                "decisions in plain language, and only call `apply_company_setup` once they "
+                "confirm.\n\n"
+                "It also returns an `existing` block: if `existing.company_exists` is true, tell "
+                "the user up front that the company already exists — setup will only add what's "
+                "missing and leave the rest. If `existing.needs_confirmation` is true (already "
+                "configured, or a currency/jurisdiction mismatch), surface `existing.advisory` as "
+                "a clear warning before proceeding.\n\n"
+                "`sector` is one of: services, retail_pos, hospitality, distribution, "
+                "import_export, manufacturing, construction. If you're unsure which fits, "
+                "ASK the user about their business rather than guessing. `country` selects "
+                "the jurisdiction chart. Available: 'generic' (international, USD); 'CH' "
+                "(Switzerland — Kontenrahmen KMU, German account names, CHF, with MWST tax "
+                "templates); and 'DE' (Germany — DATEV chart, German account names, EUR, with "
+                "Umsatzsteuer/Vorsteuer tax templates at 19 %/7 %). Germany has two chart "
+                "`variant`s: 'skr03' (process-ordered, the most common — the default for a bare "
+                "'DE') and 'skr04' (balance-sheet-ordered, DATEV's recommendation for newly "
+                "founded companies); ask which they use if it matters. Any other country falls "
+                "back to the generic chart — tell the user when `jurisdiction.is_fallback` is true."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The company name"},
+                    "sector": {
+                        "type": "string",
+                        "enum": ["services", "retail_pos", "hospitality", "distribution",
+                                 "import_export", "manufacturing", "construction"],
+                        "description": "Operating-mode profile. Omit if the business is generic/unknown.",
+                    },
+                    "country": {"type": "string", "description": "Jurisdiction code, e.g. 'CH' or 'DE'. Defaults to generic."},
+                    "variant": {"type": "string", "description": "Sub-chart variant. For 'DE': 'skr03' (default) or 'skr04'. Omit otherwise."},
+                    "currency": {"type": "string", "description": "Base currency, e.g. 'USD', 'CHF'. Defaults to the pack currency."},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "apply_company_setup",
+            "description": (
+                "CREATE/converge the company, its chart of accounts (base + sector overlay), "
+                "the company default accounts, any jurisdiction tax templates, and the default "
+                "cost center — in one step. Only call AFTER `plan_company_setup` and AFTER the "
+                "user has confirmed the plan and any big decisions. Pass the SAME arguments you "
+                "used for the approved plan.\n\n"
+                "This is idempotent and safe to run alongside an existing deployment: it only "
+                "adds accounts that are missing, fills only empty defaults, and never modifies "
+                "or deletes existing data. The result is a reconciliation report "
+                "(accounts_created vs accounts_skipped, defaults_set vs defaults_left_untouched) "
+                "— relay it plainly.\n\n"
+                "GUARDRAIL: if the company is already configured, or its currency differs from "
+                "this setup, the call returns `{ok:false, needs_confirmation:true, advisory}` "
+                "instead of proceeding. In that case, WARN the user clearly using the advisory "
+                "(especially a currency/jurisdiction mismatch, which mixes two charts), and only "
+                "re-call with `confirm_existing=true` if the user explicitly insists."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The company name (must match the approved plan)"},
+                    "sector": {
+                        "type": "string",
+                        "enum": ["services", "retail_pos", "hospitality", "distribution",
+                                 "import_export", "manufacturing", "construction"],
+                    },
+                    "country": {"type": "string"},
+                    "variant": {"type": "string"},
+                    "currency": {"type": "string"},
+                    "confirm_existing": {
+                        "type": "boolean",
+                        "description": "Set true ONLY to proceed after a needs_confirmation "
+                                       "response and the user has insisted despite the warning.",
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    },
+]
+
+
+def _extra_document_slugs():
+    """Doctype slugs registered beyond the core list (via register_doctype)."""
+    return sorted(s for s in services.SLUG_TO_DOCTYPE if s not in DOCUMENT_SLUGS)
+
+
+def _extra_master_types():
+    """Master types registered beyond the core list (via register_master)."""
+    return sorted(m for m in services.MASTER_TABLES if m not in MASTER_TYPES)
+
+
+def _chat_doctype_section() -> str:
+    """A '## Custom record types' block for doctypes registered via
+    register_chat_doctype: each type's description, key fields, and its
+    LINK_FIELDS relationships (read live from the Document class). Tells the
+    model these are driven with the DOCUMENT tools and how they attach to a
+    parent (e.g. a contact links to a lead via `lead_id`). Empty when none."""
+    slugs = [s for s in services.CHAT_DOCTYPES if s in services.SLUG_TO_DOCTYPE]
+    if not slugs:
+        return ""
+    lines = []
+    for slug in slugs:
+        meta = services.CHAT_DOCTYPES[slug]
+        doctype = services.SLUG_TO_DOCTYPE[slug]
+        cls = services.DOCUMENT_CLASSES.get(doctype)
+        links = getattr(cls, "LINK_FIELDS", None) or {}
+        line = f"- **{doctype}** (slug `{slug}`): {meta['description']}"
+        if meta.get("fields"):
+            line += f" Key fields: {', '.join('`' + f + '`' for f in meta['fields'])}."
+        if links:
+            link_str = ", ".join(f"`{f}` → the {t}'s name" for f, t in links.items())
+            line += f" Links: {link_str}."
+        # How to open a record of this type (so links resolve).
+        page = services.chat_doctype_page_info(slug)
+        if page and page["kind"] == "self":
+            line += f" Open a record at `/app/{slug}/<name>`."
+        elif page and page["kind"] == "via":
+            line += (f" It has NO page of its own — open it via its parent: "
+                     f"`/app/{page['parent_slug']}/<{page['link_field']}>`; "
+                     f"never link `/app/{slug}/…`.")
+        elif page and page["kind"] == "none":
+            line += " It has no page — do not emit a link for it."
+        lines.append(line)
+    return (
+        "\n\n## Custom record types (deployment-specific)\n"
+        "Manage these with the DOCUMENT tools (`create_document`, `update_document`, "
+        "`list_documents`, `get_document`) — NOT the master tools — so their `validate()` "
+        "runs. To attach one to a parent, set its link field to the parent record's `name` "
+        "(find the parent first, e.g. with `search_masters` or `list_documents`). Do not put "
+        "child data on the parent's own fields.\n" + "\n".join(lines)
+    )
+
+
+def build_tools(user_info: dict | None = None, *, native_chat: bool = False):
+    """TOOLS widened with live plugin types and registered business actions.
+
+    Plugins register doctypes and masters at startup — after this module is
+    imported — so the static TOOLS constant can't know about them. The tool
+    handlers already resolve through the live registries; the enums in the
+    schemas were the only thing shutting registered types out of chat. Built
+    per request (cheap next to the LLM call), which also makes plugin load
+    order irrelevant. Only enums that exactly match the core lists are
+    widened, so any differently-constrained doctype/master param (e.g. a
+    curated subset) is left alone. `native_chat` drops the direct-client-only
+    discovery tools the chat prompt already covers.
+    """
+    extra_docs = _extra_document_slugs()
+    extra_masters = _extra_master_types()
+    action_tools = services.registered_action_tools()
+    hidden_tools: set[str] = set(DIRECT_CLIENT_ONLY_TOOLS) if native_chat else set()
+    if user_info is not None:
+        role = user_info.get("role")
+        action_tools = [
+            tool for tool in action_tools
+            if tool_allowed(tool["function"]["name"], role)
+        ]
+        hidden_tools |= {
+            tool["function"]["name"] for tool in TOOLS
+            if not tool_allowed(tool["function"]["name"], role)
+        }
+    if not extra_docs and not extra_masters and not action_tools and not hidden_tools:
+        return TOOLS
+    tools = copy.deepcopy(TOOLS)
+    if hidden_tools:
+        tools = [tool for tool in tools if tool["function"]["name"] not in hidden_tools]
+    for tool in tools:
+        props = tool["function"].get("parameters", {}).get("properties", {})
+        for schema in props.values():
+            if schema.get("enum") == DOCUMENT_SLUGS:
+                schema["enum"] = DOCUMENT_SLUGS + extra_docs
+            elif schema.get("enum") == MASTER_TYPES:
+                schema["enum"] = MASTER_TYPES + extra_masters
+    existing_names = {tool["function"]["name"] for tool in tools}
+    tools.extend(tool for tool in action_tools if tool["function"]["name"] not in existing_names)
+    return tools
+
+
+# ---------------------------------------------------------------------------
+# Tool handlers — dispatch to existing service functions
+# ---------------------------------------------------------------------------
+
+
+# Filter/order keys that aren't real columns but are meaningful to list_documents.
+_LIST_META_FILTER_KEYS = {"from_date", "to_date", "date_field", "search", "search_fields"}
+
+
+def _validate_filter_columns(doctype_slug, filters) -> str | None:
+    """Reject a filter naming a column the doctype doesn't have. The key is
+    interpolated into SQL, so this both closes that injection seam and hands the
+    model a clean error instead of a 500. Returns an error string, or None."""
+    if not filters:
+        return None
+    cols = services.document_columns(doctype_slug)
+    if not cols:
+        return None  # unknown doctype -> handled downstream
+    bad = [k for k in filters if k not in cols and k not in _LIST_META_FILTER_KEYS]
+    if bad:
+        return (f"Unknown filter column(s) for {doctype_slug}: {', '.join(bad)}. "
+                f"Valid columns include: {', '.join(sorted(cols)[:40])}.")
+    return None
+
+
+@with_record_view_urls("doctype")
+def _handle_list_documents(args):
+    doctype = args["doctype"]
+    try:
+        kwargs = dict(
+            filters=args.get("filters") or {}, limit=args.get("limit", 20),
+            offset=args.get("offset", 0) or 0, order_by=args.get("order_by"),
+            order=args.get("order", "desc"), fields=args.get("fields"),
+            include_discarded=bool(args.get("include_discarded")),
+        )
+        if isinstance(kwargs["limit"], bool) or not isinstance(kwargs["limit"], int) or not 1 <= kwargs["limit"] <= 500:
+            raise ValueError("limit must be an integer between 1 and 500")
+        if not isinstance(kwargs["offset"], int) or isinstance(kwargs["offset"], bool) or kwargs["offset"] < 0:
+            raise ValueError("offset must be a non-negative integer")
+        meta = args.get("include_meta") or args.get("time_filter") is not None
+        result = services.list_document_page(doctype, time_filter=args.get("time_filter"), **kwargs) if meta else services.list_documents(doctype, **kwargs)
+        rows = result["rows"] if meta else result
+        cls = services.DOCUMENT_CLASSES.get(services.SLUG_TO_DOCTYPE.get(doctype, ""))
+        for row in rows:
+            for key in (cls.CHILD_TABLES if cls else {}):
+                row.pop(key, None)
+        return result
+    except (TypeError, ValueError) as exc:
+        return {"error": str(exc)}
+
+
+def _handle_generate_document_pdf(args, user=None):
+    from api.pdf_exports import create_pdf_export
+    from api.pdf_contract import PDFError
+    try:
+        return create_pdf_export(args.get('doctype'), args.get('name'), user)
+    except PDFError as exc:
+        return {'error': str(exc), 'code': exc.code, 'fields': exc.fields}
+
+
+def _handle_get_document_fields(args):
+    return services.document_field_metadata(args["doctype"])
+
+
+@with_record_view_urls("doctype")
+def _handle_get_document(args):
+    return services.load_document(args["doctype"], args["name"])
+
+
+@with_record_view_urls("doctype")
+def _handle_create_document(args):
+    data = args.get("data")
+    if not data:
+        return {"error": "You must pass a 'data' object with the document fields (supplier/customer, company, items, etc.). You only passed the doctype."}
+    return services.create_document(args["doctype"], data)
+
+
+@with_record_view_urls("doctype")
+def _handle_update_document(args):
+    return services.update_document(args["doctype"], args["name"], args.get("data", {}))
+
+
+@with_record_view_urls("doctype")
+def _handle_batch_update_documents(args):
+    try:
+        return services.batch_update_documents(args["doctype"], args.get("updates"))
+    except ValueError as e:  # bad doctype / empty or oversized batch
+        return {"error": str(e)}
+
+
+@with_record_view_urls("doctype")
+def _handle_submit_document(args):
+    return services.submit_document(args["doctype"], args["name"])
+
+
+@with_record_view_urls("doctype")
+def _handle_cancel_document(args):
+    return services.cancel_document(args["doctype"], args["name"])
+
+
+@with_record_view_urls("doctype")
+def _handle_discard_document(args):
+    return services.discard_document(args["doctype"], args["name"])
+
+
+@with_record_view_urls("target_doctype")
+def _handle_convert_document(args):
+    return services.convert_document(args["doctype"], args["name"], args["target_doctype"])
+
+
+# Minimum difflib similarity for a fuzzy (misspelled) match to be returned.
+_MASTER_FUZZY_THRESHOLD = 0.6
+# Bounds for the fuzzy scorer so a single large value can't blow up cost:
+# skip whole-value scoring past this length, and only score the first N tokens.
+_FUZZY_MAX_VALUE_LEN = 200
+_FUZZY_MAX_TOKENS = 16
+
+
+def _master_search_columns(db, doctype):
+    """Compatibility wrapper for the shared REST/MCP field policy."""
+    return services.master_search_columns(db, doctype)
+
+
+def _fuzzy_master_search(db, doctype, search_cols, query, has_disabled, limit):
+    """Fallback for misspellings: rank active rows by best per-field similarity.
+
+    Substring search misses typos ("Meynex" vs "medynex"), so when it finds
+    nothing we pull a capped candidate set and score it in Python with difflib —
+    portable across SQLite and Postgres, no DB extensions required."""
+    where = "WHERE disabled = 0 " if has_disabled else ""
+    candidates = db.sql(f'SELECT * FROM "{doctype}" {where}LIMIT 1000')
+
+    q = query.lower()
+    scored = []
+    for row in candidates:
+        best = 0.0
+        for col in search_cols:
+            val = row.get(col)
+            if not val:
+                continue
+            val = str(val).lower()
+            # Skip whole-value scoring of big blobs (low ratio anyway, high cost).
+            if len(val) <= _FUZZY_MAX_VALUE_LEN:
+                best = max(best, difflib.SequenceMatcher(None, q, val).ratio())
+            # Also score the first few words so a typo'd single token still
+            # matches a multi-word field (e.g. "medynex" within "medynex ag").
+            for token in val.split()[:_FUZZY_MAX_TOKENS]:
+                best = max(best, difflib.SequenceMatcher(None, q, token).ratio())
+        if best >= _MASTER_FUZZY_THRESHOLD:
+            scored.append((best, row))
+
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [dict(row) for _, row in scored[:limit]]
+
+
+def _handle_get_master_fields(args):
+    from api.routers.masters import master_requirements, MASTER_LINK_FIELDS
+    db = get_db()
+    master_type = args["master_type"]
+    entry = services.MASTER_TABLES.get(master_type)
+    if not entry:
+        return {"error": f"Unknown master type: {master_type}"}
+    doctype, _ = entry
+    default_search = _master_search_columns(db, doctype)
+    bulk = services.master_bulk_text_columns(db, doctype)
+    cls = services.DOCUMENT_CLASSES.get(doctype)
+    return {
+        "master_type": master_type,
+        "field_aliases": services.master_field_aliases(master_type),
+        "time_filter_fields": time_filter_fields(db, doctype),
+        "fields": sorted(db._get_table_columns(doctype)),
+        "text_fields": sorted(db._get_text_columns(doctype)),
+        # What search_masters searches when `fields` is omitted.
+        "default_search_fields": default_search,
+        # Large text fields searched ONLY when named in search_masters `fields`.
+        "bulk_text_fields": bulk,
+        "requirements": master_requirements(master_type),
+        "link_fields": dict(cls.LINK_FIELDS) if cls else MASTER_LINK_FIELDS.get(master_type, {}),
+        "dynamic_link_fields": dict(cls.DYNAMIC_LINK_FIELDS) if cls else {},
+        "input_fields": sorted(set(cls.INPUT_FIELDS if cls else ()) | set(services.master_field_aliases(master_type))),
+    }
+
+
+@with_record_view_urls("master_type", master=True)
+def _handle_search_masters(args):
+    db = get_db()
+    meta = bool(args.get("include_meta")) or args.get("time_filter") is not None
+    master_type = args["master_type"]
+    query = (args.get("query") or "").strip()
+
+    # Optional result cap the caller sets per call; omit for NO cap (return all —
+    # e.g. the whole chart of accounts). Coerced to int so the LIMIT clause below
+    # can't be injected.
+    _raw_limit = args.get("limit")
+    limit = None
+    if _raw_limit not in (None, "", 0):
+        try:
+            limit = max(1, int(_raw_limit))
+        except (TypeError, ValueError):
+            limit = None
+    if meta:
+        limit = args.get("limit", 50)
+        offset = args.get("offset", 0)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500:
+            return {"error": "limit must be an integer between 1 and 500"}
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            return {"error": "offset must be a non-negative integer"}
+
+    entry = services.MASTER_TABLES.get(master_type)
+    if not entry:
+        return {"error": f"Unknown master type: {master_type}"}
+
+    doctype, _name_field = entry
+    columns = set(db._get_table_columns(doctype))
+    has_disabled = "disabled" in columns
+    # Active-only by default (retired/archived records are hidden — you shouldn't
+    # book to them or wade through them). Set include_disabled to reach a disabled
+    # record you need to inspect, re-enable, or reference. Only meaningful when the
+    # table has a `disabled` column.
+    filter_disabled = has_disabled and not bool(args.get("include_disabled"))
+
+    # Optional `fields` narrows the search to specific columns — cheaper, more
+    # precise, and the only way to reach bulk columns (description, templates)
+    # that the default search skips. Unknown names are ignored.
+    requested = args.get("fields") or []
+    if requested:
+        valid = columns
+        aliases = services.master_field_aliases(master_type)
+        search_cols = []
+        for c in requested:
+            if c in valid:
+                search_cols.append(c)
+            elif c in aliases:
+                search_cols.append(aliases[c])
+        search_cols = sorted(set(search_cols))
+        # Nothing resolved (all names unknown) — degrade to the default text
+        # search rather than erroring: the value the caller meant is almost
+        # always in the columns the default already covers (incl. the `name`
+        # code). Honours the "unknown names are ignored" contract above.
+        if not search_cols:
+            search_cols = _master_search_columns(db, doctype)
+    else:
+        search_cols = _master_search_columns(db, doctype)
+
+    filters = args.get("filters") or {}
+    result_fields = args.get("result_fields") or None
+    offset = args.get("offset", 0) or 0
+    order_by = args.get("order_by")
+    order = args.get("order", "asc")
+    try:
+        result = services.list_master_records(
+            master_type,
+            filters=filters,
+            search=query or None,
+            search_fields=search_cols if query else None,
+            include_disabled=bool(args.get("include_disabled")),
+            order_by=order_by,
+            order=order,
+            limit=limit,
+            offset=offset,
+            fields=result_fields,
+            with_total=meta,
+            time_filter=args.get("time_filter"),
+        )
+    except (TypeError, ValueError) as exc:
+        return {"error": str(exc)}
+    rows = [dict(row) for row in result["rows"]]
+    if meta:
+        return result
+    if rows or not query:
+        return rows
+
+    # Preserve the established fuzzy fallback for a simple lookup. A
+    # deterministic field-filter query must return exactly its literal result;
+    # relaxing only the free-text part could otherwise select the wrong record.
+    if filters or offset or order_by or result_fields:
+        return []
+    return _fuzzy_master_search(db, doctype, search_cols, query, filter_disabled, limit=limit)
+
+
+@with_record_view_urls("master_type", master=True)
+def _handle_create_master(args):
+    master_type = args["master_type"]
+    data = args.get("data")
+    if not data:
+        return {"error": "You must pass a 'data' object with the master fields. For a warehouse, include at least 'warehouse_name' and 'company'. 'parent_warehouse' is optional."}
+
+    if master_type == "warehouse" and data.get("parent_warehouse") in ("", "-", "none", "None", None):
+        data = {k: v for k, v in data.items() if k != "parent_warehouse"}
+
+    try:
+        result = dict(create_master_record(master_type, data))
+    except Exception as exc:
+        detail = getattr(exc, "detail", None)
+        return {"error": detail or str(exc)}
+
+    return result
+
+
+@with_record_view_urls("master_type", master=True)
+def _handle_update_master(args):
+    master_type = args["master_type"]
+    name = args.get("name")
+    data = args.get("data")
+    if not name:
+        return {"error": "You must pass the existing master record 'name' to update. Example: {\"master_type\":\"supplier\",\"name\":\"SUPP-001\",\"data\":{\"email\":\"new@example.com\"}}"}
+    if not data:
+        return {"error": f"You must pass a 'data' object with the fields to change. Example: {{\"master_type\":\"{master_type}\",\"name\":\"{name}\",\"data\":{{\"email\":\"foo@bar.com\",\"phone\":\"+1 555-0100\"}}}}. Valid fields for {master_type} are listed in the create_master tool description."}
+
+    if master_type == "warehouse" and data.get("parent_warehouse") in ("", "-", "none", "None", None):
+        data = {k: v for k, v in data.items() if k != "parent_warehouse"}
+
+    try:
+        result = dict(update_master_record(master_type, name, data))
+    except Exception as exc:
+        detail = getattr(exc, "detail", None)
+        return {"error": detail or str(exc)}
+
+    return result
+
+
+def _handle_delete_master(args, user_info=None):
+    """Reference-protected master deletion, gated to the admin role.
+
+    Registered per-run (run_thinking_loop scopes it with the caller's
+    user_info) — NOT in the base TOOL_HANDLERS dict, whose handlers are
+    called with (args) only.
+    """
+    role = (user_info or {}).get("role")
+    if role != "admin":
+        return {
+            "error": (
+                "Deleting master records requires the admin role. Ask an ERP admin to do it, "
+                "or disable the record instead: update_master with {\"disabled\": 1}."
+            )
+        }
+    name = args.get("name")
+    if not name:
+        return {"error": "You must pass the existing master record 'name' to delete. Example: {\"master_type\":\"customer\",\"name\":\"CUST-007\"}"}
+    try:
+        return dict(delete_master_record(args["master_type"], name))
+    except Exception as exc:
+        detail = getattr(exc, "detail", None)
+        return {"error": detail or str(exc)}
+
+
+def _handle_get_current_time(args):
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    return {
+        "utc_time": now.strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "date": now.strftime("%Y-%m-%d"),
+        "weekday": now.strftime("%A"),
+    }
+
+
+def _handle_retrieve_chat_history(args, session_id=None):
+    db = get_db()
+    date_from = args.get("date_from")
+    date_to = args.get("date_to")
+
+    session_clause = 'AND session_id = ?' if session_id else ''
+    session_params = [session_id] if session_id else []
+
+    if date_from:
+        params = session_params + [date_from]
+        date_clause = 'AND created_at >= ?'
+        if date_to:
+            date_clause += ' AND created_at <= ?'
+            params.append(date_to)
+        rows = db.sql(
+            f'SELECT role, content, created_at FROM "Chat Message" '
+            f'WHERE role IN (\'user\', \'assistant\') {session_clause} {date_clause} '
+            f'ORDER BY id ASC LIMIT 50',
+            params,
+        )
+    else:
+        num = min(int(args.get("num_messages", 20)), 50)
+        rows = db.sql(
+            f'SELECT role, content, created_at FROM "Chat Message" '
+            f'WHERE role IN (\'user\', \'assistant\') {session_clause} '
+            f'ORDER BY id DESC LIMIT ?',
+            session_params + [num],
+        )
+        rows.reverse()
+
+    return [
+        {"role": m["role"], "content": (m.get("content") or "")[:2000], "created_at": m.get("created_at")}
+        for m in rows
+    ]
+
+
+def _handle_get_report(args):
+    report_type = args["report_type"]
+    filters = args.get("filters", {})
+    db = get_db()
+
+    if report_type == "trial-balance":
+        from api.routers.reports import _trial_balance, _present
+        rep = _trial_balance(db, filters.get("company"), filters.get("from_date"), filters.get("to_date"))
+        return _present(db, rep, filters.get("company"), filters.get("presentation_currency"), filters.get("to_date"))
+    elif report_type == "general-ledger":
+        from api.routers.reports import _general_ledger
+        return _general_ledger(db, filters)
+    elif report_type == "stock-balance":
+        from api.routers.reports import _stock_balance
+        return _stock_balance(db, filters.get("item_code"), filters.get("warehouse"))
+    elif report_type == "dashboard-summary":
+        from api.routers.reports import _dashboard_summary
+        return _dashboard_summary(db, filters.get("company"))
+    elif report_type == "profit-and-loss":
+        from api.routers.reports import _profit_and_loss, _present
+        rep = _profit_and_loss(db, filters.get("company"), filters.get("from_date"), filters.get("to_date"))
+        return _present(db, rep, filters.get("company"), filters.get("presentation_currency"), filters.get("to_date"))
+    elif report_type == "balance-sheet":
+        from api.routers.reports import _balance_sheet, _present
+        rep = _balance_sheet(db, filters.get("company"), filters.get("as_of_date"))
+        return _present(db, rep, filters.get("company"), filters.get("presentation_currency"), filters.get("as_of_date"))
+    elif report_type == "ar-aging":
+        from api.routers.reports import _ar_aging
+        return _ar_aging(db, filters.get("company"), filters.get("as_of_date"))
+    elif report_type == "ap-aging":
+        from api.routers.reports import _ap_aging
+        return _ap_aging(db, filters.get("company"), filters.get("as_of_date"))
+    return {"error": f"Unknown report type: {report_type}"}
+
+
+def _handle_revalue_currencies(args):
+    db = get_db()
+    company = args.get("company")
+    if not company:
+        companies = db.get_all("Company", fields=["name"], limit=1)
+        company = companies[0]["name"] if companies else None
+    if not company:
+        return {"error": "No company found; create one first."}
+    from lambda_erp.accounting.revaluation import run_period_revaluation
+    try:
+        return run_period_revaluation(company, args.get("date"), post=bool(args.get("post", False)))
+    except Exception as exc:
+        return {"error": getattr(exc, "detail", None) or str(exc)}
+
+
+def _handle_list_chat_attachments(_args, session_id: str | None = None, user_id: str | None = None):
+    if not session_id or not user_id:
+        return {"error": "No active chat session for attachments."}
+    from api.attachments import list_session_attachments
+    items = list_session_attachments(session_id, user_id)
+    return {"attachments": items, "count": len(items)}
+
+
+def _handle_retrieve_chat_attachment(args, session_id: str | None = None, user_id: str | None = None):
+    if not session_id or not user_id:
+        return {"error": "No active chat session for attachments."}
+    attachment_id = args.get("attachment_id")
+    if not attachment_id:
+        return {"error": "attachment_id is required."}
+    from api.attachments import get_attachments_by_ids, build_multimodal_content
+    atts = get_attachments_by_ids([attachment_id], user_id)
+    if not atts:
+        return {"error": "Attachment not found or access denied."}
+    att = atts[0]
+    return {
+        "id": att["id"],
+        "filename": att["filename"],
+        "mime_type": att["mime_type"],
+        "size_bytes": att["size_bytes"],
+        "_multimodal_content": build_multimodal_content(att),
+    }
+
+
+def _load_camt_chat_attachments(args, user_id: str | None):
+    attachment_ids = args.get("attachment_ids") or []
+    if not user_id:
+        return None, {"error": "No authenticated user for bank statement attachments."}
+    if not isinstance(attachment_ids, list) or not 1 <= len(attachment_ids) <= 20:
+        return None, {"error": "attachment_ids must contain between 1 and 20 attachment ids."}
+    from api.attachments import get_attachments_by_ids
+    from lambda_erp.accounting.camt import CamtError, parse_camt_upload
+
+    attachments = get_attachments_by_ids(attachment_ids, user_id)
+    found = {item["id"] for item in attachments}
+    missing = [item for item in attachment_ids if item not in found]
+    if missing:
+        return None, {"error": "One or more attachments were not found or access was denied."}
+    documents = []
+    try:
+        for attachment in attachments:
+            documents.extend(parse_camt_upload(attachment["data"], attachment["filename"]))
+    except CamtError as exc:
+        return None, {"error": str(exc)}
+    return documents, None
+
+
+def _handle_preview_bank_statement_attachments(args, user_id: str | None = None):
+    documents, error = _load_camt_chat_attachments(args, user_id)
+    if error:
+        return error
+    from lambda_erp.accounting.bank_statement_import import preview_documents
+    return preview_documents(documents)
+
+
+def _handle_import_bank_statement_attachments(args, user_info: dict | None = None):
+    role = (user_info or {}).get("role")
+    if role not in {"manager", "admin"}:
+        return {"error": "Importing bank statements requires manager access and is unavailable in demo mode."}
+    if args.get("confirmed") is not True:
+        return {
+            "error": (
+                "Explicit confirmation is required. Show the bank statement preview, ask the user "
+                "to confirm it, and call the import tool in a later turn with confirmed=true."
+            )
+        }
+    user_id = (user_info or {}).get("name")
+    documents, error = _load_camt_chat_attachments(args, user_id)
+    if error:
+        return error
+    from lambda_erp.accounting.bank_statement_import import import_documents, preview_documents
+    from lambda_erp.exceptions import ValidationError
+
+    mappings = args.get("mappings") or {}
+    if not isinstance(mappings, dict):
+        return {"error": "mappings must be an object of statement_key to Bank Account name."}
+    # Exact IBAN matches are safe to fill automatically; anything ambiguous or
+    # unmapped is returned to the model as a focused question for the user.
+    preview = preview_documents(documents)
+    effective_mappings = dict(mappings)
+    missing = []
+    for statement in preview["statements"]:
+        if statement["already_imported"]:
+            continue
+        key = statement["statement_key"]
+        matched = statement.get("matched_bank_account")
+        if key not in effective_mappings and matched:
+            effective_mappings[key] = matched["name"]
+        if key not in effective_mappings:
+            missing.append({
+                "statement_key": key,
+                "file_name": statement["file_name"],
+                "account_iban_masked": statement["account_iban_masked"],
+                "currency": statement["account_currency"],
+            })
+    if missing:
+        return {
+            "error": "Bank Account mapping is required before import.",
+            "unmapped_statements": missing,
+        }
+    try:
+        result = import_documents(
+            documents, effective_mappings, imported_by=user_id
+        )
+    except ValidationError as exc:
+        return {"error": str(exc)}
+    # Keep the model context bounded even for multi-year statements.
+    return {
+        "imports": [
+            {key: value for key, value in item.items() if key != "transactions"}
+            for item in result["imports"]
+        ],
+        "exact_duplicate_imports": result["exact_duplicate_imports"],
+    }
+
+
+def _bank_reconciliation_access(user_info: dict | None):
+    if (user_info or {}).get("role") not in {"manager", "admin"}:
+        return {"error": "Bank reconciliation requires manager access and is unavailable in demo mode."}
+    return None
+
+
+def _handle_list_bank_reconciliation_queue(args, user_info: dict | None = None):
+    denied = _bank_reconciliation_access(user_info)
+    if denied:
+        return denied
+    from lambda_erp.accounting.bank_reconciliation import list_bank_transactions
+    return list_bank_transactions(
+        status=args.get("status") or "Unreconciled",
+        limit=args.get("limit") or 100,
+    )
+
+
+def _handle_suggest_bank_reconciliation(args, user_info: dict | None = None):
+    denied = _bank_reconciliation_access(user_info)
+    if denied:
+        return denied
+    from lambda_erp.accounting.bank_reconciliation import suggest_matches
+    try:
+        return suggest_matches(args.get("bank_transaction"), limit=args.get("limit") or 12)
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def _handle_reconcile_bank_transaction(args, user_info: dict | None = None):
+    denied = _bank_reconciliation_access(user_info)
+    if denied:
+        return denied
+    if args.get("confirmed") is not True:
+        return {
+            "error": (
+                "Explicit confirmation is required. Show the exact bank transaction, proposed "
+                "voucher/allocations and any on-account remainder, then ask the user to confirm. "
+                "Call this tool in a later turn with confirmed=true."
+            )
+        }
+    from lambda_erp.accounting.bank_reconciliation import (
+        reconcile_with_existing_voucher_group,
+        reconcile_with_journal,
+        reconcile_with_payment,
+    )
+    user = (user_info or {}).get("name")
+    mode = args.get("mode")
+    bank_transactions = args.get("bank_transactions")
+    if not isinstance(bank_transactions, list) or not bank_transactions:
+        return {"error": "bank_transactions must contain at least one Bank Transaction name"}
+    if mode in {"invoice_payment", "journal"} and len(bank_transactions) != 1:
+        return {"error": f"mode={mode} requires exactly one bank transaction"}
+    bank_transaction = bank_transactions[0]
+    try:
+        if mode == "invoice_payment":
+            return reconcile_with_payment(
+                bank_transaction, args.get("allocations") or [],
+                conversion_rate=args.get("conversion_rate"), user=user, confirmed=True,
+            )
+        if mode == "existing_voucher":
+            return reconcile_with_existing_voucher_group(
+                bank_transactions, args.get("voucher_type"), args.get("voucher_no"),
+                user=user, confirmed=True,
+            )
+        if mode == "journal":
+            return reconcile_with_journal(
+                bank_transaction, args.get("counterparty_account"),
+                conversion_rate=args.get("conversion_rate"), remarks=args.get("remarks"),
+                user=user, confirmed=True,
+            )
+        return {"error": "mode must be invoice_payment, existing_voucher, or journal"}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def _handle_undo_bank_reconciliation(args, user_info: dict | None = None):
+    denied = _bank_reconciliation_access(user_info)
+    if denied:
+        return denied
+    if args.get("confirmed") is not True:
+        return {
+            "error": (
+                "Explicit confirmation is required. Explain whether the linked voucher will be "
+                "cancelled or only unlinked, then ask the user to confirm."
+            )
+        }
+    from lambda_erp.accounting.bank_reconciliation import undo_reconciliation
+    try:
+        return undo_reconciliation(
+            args.get("bank_transaction"),
+            user=(user_info or {}).get("name"),
+            confirmed=True,
+        )
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def _handle_query_dataset(args):
+    from api.routers.analytics import aggregate_semantic_dataset
+
+    dataset = args.get("dataset")
+    if not dataset:
+        return {"error": "dataset is required"}
+    measures = args.get("measures") or {}
+    if not measures:
+        return {"error": "measures is required — e.g. {\"revenue\": [\"sum\", \"net_total\"]}"}
+    try:
+        result = aggregate_semantic_dataset(
+            dataset=dataset,
+            group_by=args.get("group_by") or [],
+            measures=measures,
+            filters=args.get("filters"),
+            order_by=args.get("order_by") or [],
+            limit=args.get("limit"),
+        )
+    except HTTPException as e:
+        return {"error": str(e.detail)}
+    except Exception as e:
+        return {"error": f"Aggregation failed: {e}"}
+    return result
+
+
+def _handle_create_custom_analytics_report(args, user_info: dict | None = None, session_id: str | None = None, client_ip: str | None = None):
+    from api.routers.analytics import create_report_draft_record
+
+    # GPT may pass intent + (optionally) a sketch. If the declarative spec is
+    # missing, delegate to the report-spec specialist.
+    if not args.get("report") or not args.get("data_requests"):
+        intent = args.get("intent") or args.get("description") or args.get("title")
+        if not intent:
+            return {"error": "Provide either `intent` or a complete spec (data_requests + report)."}
+        try:
+            spec = _generate_report_spec_via_openai(
+                intent,
+                client_ip=client_ip,
+                user_role=(user_info or {}).get("role"),
+                session_id=session_id,
+            )
+        except Exception as e:
+            return {"error": f"Report specialist failed: {e}"}
+        args["data_requests"] = spec["data_requests"]
+        args["report"] = spec["report"]
+        if not args.get("title"):
+            args["title"] = spec.get("title") or (intent[:60] if intent else "Custom Report")
+        if not args.get("description") and spec.get("description"):
+            args["description"] = spec["description"]
+
+    if not args.get("title"):
+        return {"error": "title is required"}
+    # ``intent`` is a tool-control field for the specialist handoff, not part
+    # of the persisted declarative report.  Keep every other key so the strict
+    # ReportDraftPayload boundary still rejects unexpected/executable fields.
+    payload = {key: value for key, value in args.items() if key != "intent"}
+    return create_report_draft_record(payload, user_info, source_chat_session_id=session_id)
+
+
+def _handle_get_custom_analytics_report(args, user_info: dict | None = None):
+    from api.routers.analytics import get_report_draft_record
+
+    report_id = args.get("report_id")
+    if not report_id:
+        return {"error": "report_id is required"}
+    row = get_report_draft_record(report_id, user_info)
+    if not row:
+        return {"error": f"Report draft '{report_id}' not found"}
+    return row
+
+
+def _handle_update_custom_analytics_report(
+    args,
+    user_info: dict | None = None,
+    client_ip: str | None = None,
+    session_id: str | None = None,
+):
+    from api.routers.analytics import get_report_draft_record, update_report_draft_record
+
+    report_id = args.get("report_id")
+    if not report_id:
+        return {"error": "report_id is required"}
+
+    feedback = args.get("feedback") or args.get("intent")
+    # If the caller provided a feedback/intent hint and didn't already hand-roll
+    # a report or data_requests change, let the report specialist rewrite
+    # the spec based on the existing draft.
+    if feedback and "report" not in args and "data_requests" not in args:
+        existing = get_report_draft_record(report_id, user_info)
+        if not existing:
+            return {"error": f"Report draft '{report_id}' not found"}
+        try:
+            spec = _generate_report_spec_via_openai(
+                intent=existing.get("description") or existing.get("title") or "",
+                existing_spec=existing,
+                feedback=feedback,
+                client_ip=client_ip,
+                user_role=(user_info or {}).get("role"),
+                session_id=session_id,
+            )
+        except Exception as e:
+            return {"error": f"Report specialist failed: {e}"}
+        args["data_requests"] = spec["data_requests"]
+        args["report"] = spec["report"]
+        if spec.get("title") and "title" not in args:
+            args["title"] = spec["title"]
+        if spec.get("description") and "description" not in args:
+            args["description"] = spec["description"]
+
+    payload = {key: value for key, value in args.items() if key not in ("report_id", "feedback", "intent")}
+    if not payload:
+        return {"error": "At least one field to update (or a `feedback` hint) is required"}
+    row = update_report_draft_record(report_id, payload, user_info)
+    if not row:
+        return {"error": f"Report draft '{report_id}' not found"}
+    return row
+
+
+def _handle_plan_company_setup(args):
+    from lambda_erp.accounting.setup import plan_company_setup
+    name = (args.get("name") or "").strip()
+    if not name:
+        return {"error": "A company name is required to plan the setup."}
+    return plan_company_setup(
+        name,
+        country=(args.get("country") or None),
+        variant=(args.get("variant") or None),
+        sector=(args.get("sector") or None),
+        currency=(args.get("currency") or None),
+    )
+
+
+def _handle_apply_company_setup(args):
+    from lambda_erp.accounting.setup import apply_company_setup
+    name = (args.get("name") or "").strip()
+    if not name:
+        return {"error": "A company name is required to apply the setup."}
+    return apply_company_setup(
+        name,
+        country=(args.get("country") or None),
+        variant=(args.get("variant") or None),
+        sector=(args.get("sector") or None),
+        currency=(args.get("currency") or None),
+        confirm_existing=bool(args.get("confirm_existing")),
+    )
+
+
+TOOL_HANDLERS = {
+    "get_erp_context": get_erp_context,
+    "list_documents": _handle_list_documents,
+    "get_document_fields": _handle_get_document_fields,
+    "generate_document_pdf": _handle_generate_document_pdf,
+    "get_document": _handle_get_document,
+    "create_document": _handle_create_document,
+    "update_document": _handle_update_document,
+    "batch_update_documents": _handle_batch_update_documents,
+    "submit_document": _handle_submit_document,
+    "cancel_document": _handle_cancel_document,
+    "discard_document": _handle_discard_document,
+    "convert_document": _handle_convert_document,
+    "get_master_fields": _handle_get_master_fields,
+    "search_masters": _handle_search_masters,
+    "create_master": _handle_create_master,
+    "update_master": _handle_update_master,
+    "get_report": _handle_get_report,
+    "revalue_currencies": _handle_revalue_currencies,
+    "get_current_time": _handle_get_current_time,
+    "retrieve_chat_history": lambda args: _handle_retrieve_chat_history(args),
+    "list_chat_attachments": _handle_list_chat_attachments,
+    "retrieve_chat_attachment": _handle_retrieve_chat_attachment,
+    "preview_bank_statement_attachments": _handle_preview_bank_statement_attachments,
+    "import_bank_statement_attachments": _handle_import_bank_statement_attachments,
+    "list_bank_reconciliation_queue": _handle_list_bank_reconciliation_queue,
+    "suggest_bank_reconciliation": _handle_suggest_bank_reconciliation,
+    "reconcile_bank_transaction": _handle_reconcile_bank_transaction,
+    "undo_bank_reconciliation": _handle_undo_bank_reconciliation,
+    "query_dataset": _handle_query_dataset,
+    "create_custom_analytics_report": lambda args: _handle_create_custom_analytics_report(args),
+    "get_custom_analytics_report": lambda args: _handle_get_custom_analytics_report(args),
+    "update_custom_analytics_report": lambda args: _handle_update_custom_analytics_report(args),
+    "plan_company_setup": _handle_plan_company_setup,
+    "apply_company_setup": _handle_apply_company_setup,
+}
+
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
+
+
+def _prompt_company_context() -> str:
+    try:
+        companies = get_db().get_all("Company", fields=["name"], order_by="name asc", limit=20)
+    except Exception:
+        return "## Companies In This ERP\n- Company names could not be loaded for this prompt.\n"
+    if not companies:
+        return "## Companies In This ERP\n- No companies found.\n"
+    names = [row.get("name") for row in companies if row.get("name")]
+    if not names:
+        return "## Companies In This ERP\n- No companies found.\n"
+    bullets = "\n".join(f"- {name}" for name in names)
+    return (
+        "## Companies In This ERP\n"
+        "Use these exact company names when you need a company filter or document company value. "
+        "Do not invent company names.\n"
+        f"{bullets}\n"
+    )
+
+
+def _prompt_analytics_context() -> str:
+    db = get_db()
+    datasets = [
+        ("sales invoices", "Sales Invoice", "posting_date", "docstatus = 1"),
+        ("purchase invoices", "Purchase Invoice", "posting_date", "docstatus = 1"),
+        ("payments", "Payment Entry", "posting_date", "docstatus = 1"),
+    ]
+    lines: list[str] = []
+    for label, table, date_field, where in datasets:
+        try:
+            row = db.sql(
+                f'''
+                SELECT
+                    MIN({date_field}) AS min_date,
+                    MAX({date_field}) AS max_date,
+                    COUNT(*) AS row_count
+                FROM "{table}"
+                WHERE {where}
+                '''
+            )[0]
+        except Exception:
+            continue
+        row_count = int(row["row_count"] or 0)
+        if row_count <= 0:
+            lines.append(f"- {label}: no submitted records")
+            continue
+        lines.append(
+            f"- {label}: {row_count} submitted records from {row['min_date']} to {row['max_date']}"
+        )
+    if not lines:
+        return "## Analytics Data Coverage\n- Coverage could not be loaded for this prompt.\n"
+    return (
+        "## Analytics Data Coverage\n"
+        "Use these date ranges when drafting analytics. Do not invent narrow date filters outside the "
+        "known coverage unless the user explicitly asks for them.\n"
+        f"{chr(10).join(lines)}\n"
+    )
+
+
+def _prompt_uom_context() -> str:
+    """Dynamic list of the item units (stock_uom) currently in use.
+
+    The unit list is NOT a fixed vocabulary — users add new units simply by
+    using them — so the guidance is rebuilt from the Item table on every turn
+    rather than hardcoded. Nudging the agent toward existing spellings keeps
+    items consistent (and matching the GUI's dropdown), while still allowing a
+    genuinely new unit when none fits.
+    """
+    try:
+        rows = get_db().get_all("Item", fields=["stock_uom"], limit=1000)
+    except Exception:
+        return ""
+    uoms = sorted({(row.get("stock_uom") or "").strip() for row in rows} - {""})
+    if not uoms:
+        return ""
+    return (
+        "## Item Units (stock_uom)\n"
+        f"Units currently in use in this ERP: {', '.join(uoms)}.\n"
+        "When creating or editing items, PREFER one of these exact spellings so "
+        "items stay consistent. A new unit is allowed when none of them fits — "
+        "use a short singular noun (e.g. \"Stück\", \"Bottle\", \"Hour\").\n"
+    )
+
+
+def _prompt_validation_context():
+    from lambda_erp.validation import document_requirements
+    from api.routers.masters import master_requirements
+    groups = {}
+    for doctype, cls in services.DOCUMENT_CLASSES.items():
+        rules = document_requirements(cls)
+        if not any(rules.values()):
+            continue
+        key = json.dumps(rules, sort_keys=True)
+        groups.setdefault(key, []).append(doctype)
+    for slug, (doctype, _) in services.MASTER_TABLES.items():
+        if doctype not in services.DOCUMENT_CLASSES:
+            key = json.dumps(master_requirements(slug), sort_keys=True)
+            groups.setdefault(key, []).append(doctype + ' (master)')
+    return "\n".join(f"- {', '.join(names)}: {rules}" for rules, names in groups.items())
+
+
+def build_system_prompt(user_info: dict | None = None, channel: str = "web"):
+    user_name = user_info.get("full_name", "User") if user_info else "User"
+    user_role = user_info.get("role", "viewer") if user_info else "viewer"
+    company_context = _prompt_company_context()
+    analytics_context = _prompt_analytics_context()
+    uom_context = _prompt_uom_context()
+    validation_context = _prompt_validation_context()
+
+    # Deployment-registered types (register_doctype / register_master). Folded
+    # into the type lists below so the assistant knows they exist and can act
+    # on them from day one — the tool schemas widen the same way (build_tools).
+    extra_docs = _extra_document_slugs()
+    extra_masters = _extra_master_types()
+    extension_doctypes_line = (
+        f"\n- **Extensions (deployment-specific):** {', '.join(extra_docs)}" if extra_docs else ""
+    )
+    master_types_line = ", ".join(MASTER_TYPES + extra_masters)
+    extension_master_keys = ""
+    for master in extra_masters:
+        meta = services.MASTER_METADATA.get(master, {})
+        extension_master_keys += (
+            f"\n- **{services.MASTER_TABLES[master][0]}** (master_type `{master}`): "
+            f"key = `name`, display = `{services.MASTER_TABLES[master][1]}`"
+        )
+        if meta.get("description"):
+            extension_master_keys += f". {meta['description']}"
+        if meta.get("fields"):
+            extension_master_keys += (
+                ". Key fields: "
+                + ", ".join(f"`{field}`" for field in meta["fields"])
+            )
+    chat_doctype_section = _chat_doctype_section()
+    from api.pdf_profiles import pdf_metadata
+    chat_doctype_section += "\n## PDF output contracts\n" + "\n".join(
+        f"- {services.DOCTYPE_TO_SLUG[dt]}: {json.dumps(pdf_metadata(dt), ensure_ascii=False)}"
+        for dt in services.DOCUMENT_CLASSES
+    )
+
+    # Channel-aware link guidance. On the "web" channel the reader is a browser
+    # inside the ERP, so web-relative links are clickable. On the "api" channel the
+    # reply is relayed to an EXTERNAL app (lambda-web / the Lambda app) that is not
+    # logged into the ERP web UI — `/app` and `/masters` links are dead there, so we
+    # tell the agent to name records by their identifier instead. The one link we
+    # DO keep is the canonical `/api/documents/{slug}/{name}/pdf` PDF link: the
+    # calling platform detects it, fetches the bytes over the Bearer document API,
+    # and re-delivers the PDF as a native attachment. See docs/chat-api.md.
+    if channel == "api":
+        markdown_links_section = """## Referring to records
+Your reply is relayed to an external application (the user's Lambda assistant / app), NOT the ERP web interface. Links into the ERP web UI are NOT clickable there, so refer to every record by its human identifier in plain text — e.g. "Quotation **QTN-2298**", "Sales Invoice **SINV-0012**". Do not paste `/app/...`, `/masters/...`, or `/reports/...` URLs; they do not work outside the ERP."""
+        document_links_section = """## Delivering document PDFs
+Call generate_document_pdf for every requested file. Only a successful result means a file is generated and available for attachment. The platform attaches that exact validated file. Do not invent PDF URLs or claim generation after an error. Name the document in prose; no /app or /masters view links on this channel."""
+    else:
+        markdown_links_section = """## Always use markdown links
+Every URL you mention in chat MUST be written as a markdown link `[label](url)` — never a bare URL on its own. The chat UI only turns `[label](url)` into a proper clickable link. A bare `/reports/analytics?report_id=...` still works (a fallback linkifier catches it), but markdown form is the expected shape.
+
+Examples:
+- Correct: `[Open report](/reports/analytics?report_id=RPT-AB12CD34)`
+- Correct: `[SINV-0012](/app/sales-invoice/SINV-0012)`
+- Avoid:   `/reports/analytics?report_id=RPT-AB12CD34` (bare URL)"""
+        document_links_section = """## Document & Master Links
+Document and master tools return a canonical `view_url` on each record, including list/search rows and successful batch results. When linking a record, copy that exact value into a markdown link `[label](view_url)`. Never construct a record URL yourself, add a `#`, change the path, or re-encode the returned URL.
+`view_url` is tool output metadata, not a document/master field; never include it in create/update data.
+If `view_url` is null, refer to the record in plain text. For a projected document list or batch result missing parent-page information, call get_document to obtain its view_url if a link is needed. Some records have no page at all.
+Always include the returned view link, when available, after creating, submitting, converting, or updating a record.
+For PDF files, call generate_document_pdf and copy its returned download_url only after successful generation. Never construct PDF links yourself."""
+
+    if user_role == "admin":
+        role_desc = "You have **admin** access — full permissions to create, edit, submit, cancel documents, manage master data, run reports, and manage users."
+    elif user_role == "manager":
+        role_desc = "You have **manager** access — you can create, edit, submit, and cancel documents, create and edit master data, and run reports. You cannot manage users or company setup."
+    elif user_role == "public_manager":
+        role_desc = "You are in **public demo mode** — you can create, edit, submit, and cancel documents and run reports, but you cannot create, edit, or delete master data, and you cannot manage users or company setup."
+    else:
+        role_desc = "You have **viewer** access — you can view documents, master data, and reports, but you cannot create or modify data. If the user asks you to create or change something, let them know they need a manager or admin to do that."
+
+    # Only admins can run setup, so only they get the wizard playbook (keeps the
+    # prompt lean for everyone else). Triggered from chat OR the Tutorial page's
+    # "Get started" button, which sends a set-up-my-company message.
+    if user_role == "admin":
+        company_setup_section = """## Guided company setup (chart of accounts)
+When the user wants to **set up a new company**, get started, or create their books/chart of accounts, run the guided setup — do NOT hand-create accounts one by one:
+1. **Identify the business type.** Which of these fits: services/consulting, retail/POS, hospitality/F&B, distribution/wholesale, import/export, manufacturing, or construction? If the conversation doesn't make it obvious, ASK — never guess the sector.
+2. **Preview with `plan_company_setup`** (company name + sector + country/currency if known). This creates NOTHING; it returns the proposed chart.
+3. **Walk them through the plan** in plain language: the sector-specific accounts (`sector_added_accounts`) and the `sector.guidance` (why the chart is shaped this way). Present every item in `sector.big_decisions` and get an explicit yes/no on each — these are the decisions you must not make for them.
+4. **Only after they confirm, call `apply_company_setup`** with the SAME arguments to create the company, accounts, defaults, and cost center.
+If `jurisdiction.is_fallback` is true, tell the user their country isn't localized yet and you're using the generic international chart for now.
+
+**Existing companies.** Setup is idempotent — it adds only missing accounts, fills only empty defaults, and never modifies or deletes existing data, so it runs safely alongside an existing deployment. Use the `existing` block the plan returns: if the company already exists, say so up front ("it already exists — I'll add what's missing and leave the rest"). If `apply_company_setup` returns `needs_confirmation` (the company is already configured, or the currency/jurisdiction differs and would mix two charts), do NOT force it — relay the `advisory` as a clear warning and re-call with `confirm_existing: true` only if the user explicitly insists. After applying, relay the reconciliation report plainly (how many accounts were created vs already present).
+"""
+    else:
+        company_setup_section = ""
+
+    return f"""You are an ERP assistant for Lambda ERP. Today's date is {date.today().isoformat()}.
+
+{WORKFLOW_GUIDANCE}
+
+You help users manage their business by creating documents, looking up data, and running reports — all through natural conversation.
+
+## Enforced document requirements (generated from backend rule metadata)
+{validation_context}
+Use get_document_fields for full field and relationship metadata. On updates these rules apply to the merged document, so already stored values need not be resubmitted. Never remove an ambiguous link to bypass a validation error.
+
+## Never fabricate actions or results
+Only state that something was done — created, changed, enabled/disabled, booked, repointed — **after a tool call returns a success result that confirms it**, and check the returned record actually reflects the change (after `update_master` with {{"disabled": 0}}, confirm the returned row shows `disabled = 0`; after submitting a journal entry, confirm it posted non-zero GL). An error means the action failed. For a successful result with warnings, explain both what was saved and what remains incomplete (for example, pool capacity reserved but no machine assigned). If the record doesn't reflect your intent, explain the mismatch — never smooth it over as success.
+- If a capability doesn't exist, say so plainly. There is **no rename** for accounts or other masters — a master's identifying `name`/number is immutable; you can only edit display fields or create a new record and migrate. Never claim you "renamed" an account.
+- Never assert a field or capability is missing without checking (e.g. an item's income account) — verify with `get_master_fields` / `search_masters` first.
+- A master you can't find via `search_masters` may just be **disabled** (search hides disabled by default). Retry with `include_disabled: true` before concluding it doesn't exist — you need this to re-enable a disabled account.
+- Respect document requirements from get_document_fields. Missing required data or ambiguous matches require a targeted question, not guessed IDs, omitted links, or zero quantities. A tool error means the action failed; _validation.warnings must be explained.
+- If you can't confirm an action took effect, re-fetch and look, or tell the user you couldn't confirm it — never guess.
+
+## Answering data questions — three paths
+
+**Path 1: single-record lookup → `list_documents` / `get_document`.** For "is SINV-0042 paid", "what did customer X order last", "show me the latest 5 purchase orders" — fetch the rows directly. Don't try to aggregate in your head unless there are only a handful of rows in front of you.
+
+**Recent changes and outreach:** For "last N hours" use `list_documents` or
+`search_masters` with `time_filter={{"field":"modified","last_hours":24}}`
+(or the requested hours), so the server resolves the exact window. Use `creation`
+for newly created records, `modified` for changed records, `occurred_at` for CRM
+interactions. Never substitute yesterday at midnight for the last 24 hours. Reuse
+returned `time_filter` since/until for subsequent pages and other types; for today
+or yesterday resolve local calendar boundaries using the user's known timezone
+(and get_current_time), asking if the timezone is unknown and affects the answer.
+For "what happened in this ERP", cover relevant documents, masters and registered
+CRM activities; query changes as well as creations. Do not claim no changes from
+a creation-only search. Describe which areas were checked; this is a current-record
+overview, not a complete audit trail of deletions, old field values or every edit.
+For outreach include relevant `note` entries describing draft preparation and
+scheduled sends, as well as calls/emails/meetings; a call/email-only filter misses
+planned outreach. Preserve distinctions between prepared, scheduled, sent and
+replied, and between interaction time and planned future send time. Load linked
+leads only to enrich the matching activities; unfiltered old lead state is not
+proof of activity during the period. Use supported IN filters to select multiple
+types; if a filter fails, fix it without silently dropping its restriction.
+For overviews use time_filter or include_meta=true, inspect total/has_more, and
+page when exhaustive detail is requested. Never count only the first page as the
+total. Mention coverage warnings: missing/invalid timestamps mean unknown history,
+not no activity. Unsupported fields/query errors are not empty results. Do not
+infer who changed what from modified alone; current fields are not before/after
+history. For core masters predating timestamp capture, creation can be unknown. Include
+disabled/discarded records when the overview requires them. Low-level SQL and some
+indirect document updates may not maintain modified; do not promise all changes.
+
+**Path 2: aggregated facts → `query_dataset`.** For "who is our top customer by revenue", "total sales this month", "outstanding AR by customer", "average invoice size", "count of POs per supplier" — anything that requires summing, counting, ranking, or grouping across many rows — call `query_dataset`. It runs a deterministic SQL aggregation server-side and returns the actual aggregated numbers you can cite in chat. NEVER try to compute a top-N or sum by eyeballing a `list_documents` sample — it defaults to 20 rows and will give a wrong answer on any meaningful dataset.
+
+**Path 3: charts / complex reports → `create_custom_analytics_report`.** Only call this when the user **explicitly asks for** a chart, graph, visualization, dashboard, trend, pivot, breakdown, or saved report — or when the analysis genuinely needs a reusable report. Do **not** invoke it for a factual question `query_dataset` could answer in one call.
+
+Important constraint on the analytics report tool: its bounded declarative specification runs **client-side only** — you never see its output. So you cannot "open the report to read the numbers." If the user asks you to summarise or interpret the result after the fact, re-answer via `query_dataset` or a standard financial report; do not infer data coverage from an empty invoice dataset when GL or bank data may exist.
+
+When you do build a custom report, pass a plain-language `intent` to `create_custom_analytics_report` (a specialist model writes the bounded declarative spec for you) and reply with the returned `/reports/analytics?report_id=…` link as a markdown link. The draft appears under **Custom Analytics** in the sidebar so the user can reopen or share it.
+
+{markdown_links_section}
+
+## Current User
+You are speaking with **{user_name}** (role: **{user_role}**).
+{role_desc}
+{company_setup_section}
+{company_context}
+{analytics_context}
+{uom_context}
+## User Roles
+Lambda ERP has four roles:
+- **admin**: Full access to everything — documents, masters, reports, company setup, and user management (inviting team members, changing roles).
+- **manager**: Can create, edit, submit, and cancel documents. Can create and edit master data. Can run all reports and use the chat. Cannot manage users or company setup.
+- **public_manager**: Demo-mode access. Can create, edit, submit, and cancel documents and use reports/chat, but cannot create, edit, or delete master data. Cannot manage users or company setup.
+- **viewer**: Read-only access to documents, masters, and reports. Can use the chat but cannot create or modify data.
+
+When a user asks you to do something they don't have permission for, explain what role is needed instead of attempting the action (the API will reject it anyway).
+
+## Available Document Types (use the slug when calling tools)
+- **Selling:** quotation, proposal, sales-order, sales-invoice, pos-invoice
+- **Buying:** purchase-order, purchase-invoice
+- **Accounting:** payment-entry, journal-entry, budget, subscription, bank-account, bank-transaction
+- **Stock:** stock-entry, delivery-note, purchase-receipt
+- **Assets & hire:** asset, reservation
+- **Settings:** pricing-rule{extension_doctypes_line}{chat_doctype_section}
+
+## Document Workflow & What Each Document Does
+
+### CAMT bank statement imports
+CAMT XML/ZIP attachments are structured financial inputs. Never retrieve their raw contents into
+the conversation and never try to interpret the XML manually. Use this workflow:
+1. Find the attachment ids with `list_chat_attachments` when necessary.
+2. Call `preview_bank_statement_attachments` and present its period, masked account, currency,
+   opening/closing balances, credits/debits, entry/detail/batch counts, QR-reference count,
+   duplicate status, warnings, and proposed Bank Account mapping.
+3. If there is no exact mapping, list or create a `bank-account` document. It must link the external
+   IBAN to the correct Company and GL Account; never guess that accounting mapping.
+4. Ask the user for explicit confirmation after showing the preview. Do not call the import tool in
+   the same turn in which you first show the preview.
+5. Only after that confirmation, call `import_bank_statement_attachments` with `confirmed=true`.
+
+The CAMT import creates unposted Bank Transactions and their batch details only. It never creates,
+submits, or posts a Payment Entry, Journal Entry, or GL Entry. Do not imply that invoices have been
+settled or the ledger changed merely because a statement was imported. Keep Bank Account IBANs
+masked in ordinary chat responses.
+
+### Bank reconciliation
+Use `list_bank_reconciliation_queue` and then `suggest_bank_reconciliation`; never guess from a raw
+description alone. Explain one exact proposal before doing anything. Reconciliation has three safe
+paths: (1) link an existing submitted Payment/Journal voucher whose bank leg matches exactly—either
+one transaction or every transaction in an exact `existing_voucher_group`,
+(2) create and submit a Payment Entry allocated to one or more open invoices of the same party, or
+(3) create and submit a Journal Entry against a user-selected non-bank, non-AR/AP account. A created
+voucher changes the GL and may change invoice outstanding amounts. Ask for explicit confirmation in
+a later user turn, then call `reconcile_bank_transaction` with `confirmed=true`. Clearly disclose any
+unallocated on-account remainder. Disclose all group members and their total before asking for
+confirmation. Every reconciliation call uses `bank_transactions`: pass a one-item list for an
+individual reconciliation; for a group, copy the complete list from the suggestion and never add or
+omit IDs.
+Never match a Bank Transaction directly to an invoice because that
+would omit the cash posting. For reversals, first explain whether the voucher was created by the
+reconciliation (it will be cancelled and reversed) or merely linked (it will only be unlinked), and
+whether the selected transaction belongs to a group that will be unlinked together, and then require
+explicit confirmation before `undo_bank_reconciliation`.
+
+### Sales Cycle
+Quotation → Sales Order → Delivery Note (shipping) / Sales Invoice (billing) → Payment Entry
+Shortcuts: Quotation can also convert directly to Sales Invoice or Delivery Note (skipping Sales Order) for quick deals.
+
+- **Quotation:** Non-binding offer. No financial or stock impact.
+- **Sales Order:** Confirmed customer commitment. No financial impact, but reserves stock for planning.
+- **Delivery Note:** Ships goods to customer. **Posts stock entries** (inventory decreases). Requires warehouse on each item. No GL impact on its own.
+- **Sales Invoice:** Bills the customer. **Posts GL entries:** Debit Accounts Receivable, Credit Sales Revenue (+ Credit Tax Payable if taxes). Creates outstanding amount.
+- **Payment Entry (Receive):** Records customer payment. **Posts GL entries:** Debit Bank, Credit Accounts Receivable. Reduces invoice outstanding.
+
+### Proposal (slug `proposal`) — combine several offers into one PDF
+German names for this doctype: **Sammelofferte / Sammelofferten**, also called a Sammelangebot, Offertenbündel, or "kombinierte Offerte". If a user asks about their "Sammelofferten", "Sammelaufträge" in the sense of bundled offers, or "proposals", they mean THIS doctype — use `list_documents(doctype="proposal")`, don't ask whether they mean sales/purchase orders.
+
+A **Proposal** bundles several EXISTING quotations into one branded, customer-facing PDF, each shown as a lettered position (A, B, C…). It is **print-only**: no financial or stock impact, it references the quotations without changing them, and it is **never submitted** — to deliver it you just generate its PDF.
+
+Shape — note it does NOT use `items`:
+- Parent fields: `title` (e.g. "Offerte"), `customer`, `company`, `proposal_date`, `partner_name`, `partner_email`, `cover_letter` (the intro/greeting letter text).
+- Child table `quotations[]` — one row per offer to include, in display order. Each row has: `quotation` (the name of an existing Quotation), optional `position_title` and `position_blurb` (default from the quotation), and `is_recommended` (0 or 1 — set 1 on the offer you recommend, which draws an "Empfehlung" badge).
+
+To build one: ensure each offer already exists as its own Quotation (create them first if needed), then call create_document with doctype "proposal" and a data object whose `quotations` array references those quotations by name. Do NOT submit it; call generate_document_pdf with doctype proposal and link the returned download_url (and the editor at `/app/proposal/<name>`).
+
+### Recurring offer lines (quotation line `frequency`)
+A **Quotation** line item carries an optional `frequency` that controls how it is billed and totalled on the offer:
+- `One-time` (the default) — a normal one-off line.
+- `Monthly` / `Quarterly` / `Half-Yearly` / `Yearly` — a recurring line.
+When a quote mixes one-time and recurring lines, the one-time lines form the headline grand total (the "Gesamttotal"), and each recurring cadence is totalled **separately** (its own net + MWSt) so a monthly fee never inflates the one-time total. To put a recurring service ON the offer as a real line, set that line's `frequency` alongside its item_code / qty / rate — e.g. a CHF 380 line with `frequency` set to `Monthly`. These values match the Subscription billing intervals exactly; the Quotation itself still posts nothing to the ledger.
+
+Use the line `frequency` for a recurring item that is genuinely part of the quote. For recurring info you only want to SHOW but that is NOT part of the quotation (a "billed separately after implementation" aside), use the `>> … | …` notes markup below instead — that is cosmetic free text, not a line item, and never enters any total.
+
+### Notes / Terms markup (the `remarks` field)
+The `remarks` (Notes / Terms) field on quotations, sales orders, and invoices renders on the PDF with a small markup vocabulary, so when a user dictates offer notes, conditions, recurring services, or a sign-off you can compose a polished closing block instead of a flat paragraph. Put this ONLY in `remarks` (never in item descriptions):
+- `# Heading` at the start of a line -> bold heading
+- `*italic*` or `_italic_` -> italic; `**bold**` -> bold
+- `---` (a line of 3+ dashes) -> a full-width thin horizontal rule (divider)
+- A line starting with `>>` is a price line, split by the FIRST `|` pipe: the text BEFORE the pipe goes in the left (frequency) column, the text AFTER it in the right (amount) column — both placed literally as you write them, NOT interpreted (it does not know "Monatlich" is a frequency or that "CHF 380" is a number). Omit the pipe to put everything in the amount column. The two columns line up with the line-items table's frequency/amount columns, so use it for a separately- or recurring-billed item, e.g. `>> Monatlich | CHF 380.—`.
+- Separate blocks with a blank line; a single newline is just a line break.
+Plain text (no special characters) still renders fine, so only reach for the markup when it improves a customer-facing note.
+
+### Purchase Cycle
+Purchase Order → Purchase Receipt (receiving) / Purchase Invoice (billing) → Payment Entry
+
+- **Purchase Order:** Commitment to buy from supplier. No financial or stock impact.
+- **Purchase Receipt:** Receives goods into warehouse. **Posts stock entries** (inventory increases). Requires warehouse on each item.
+- **Purchase Invoice:** Records supplier bill. Always **posts GL entries** and creates outstanding amount.
+  For non-stock/services: Debit Expense, Credit Accounts Payable.
+  For stock after a prior Purchase Receipt: Debit Stock Received But Not Billed, Credit Accounts Payable.
+  If `update_stock=1`: the Purchase Invoice also receives the goods into stock, so stock items require a warehouse and the posting is Debit Stock In Hand, Credit Accounts Payable.
+- **Payment Entry (Pay):** Pays the supplier. **Posts GL entries:** Debit Accounts Payable, Credit Bank. Reduces invoice outstanding.
+
+### Items vs. charges on an invoice
+
+A supplier (or sales) invoice has **two different kinds of lines**, and the LLM MUST keep them separate:
+
+- **Items** (`items[]`): physical goods or distinct services that have an Item master record and a unit × rate shape. Example lines: "10 × Bolt Pack M8", "1 × Engineering Consultation (4 hours)".
+- **Charges** (`taxes[]`): non-item monetary lines like **freight, shipping, postage, handling, customs, import duties, insurance**, plus actual taxes (VAT, GST, sales tax). These do NOT need an Item master. They're rows on the invoice that point at a GL account directly.
+
+Do NOT try to create a new Item master for a line like "Shipping" or "Customs duty". Use the charges table instead.
+
+Each charge row has:
+- `charge_type`: `"Actual"` for a fixed amount (freight, shipping, handling, customs), `"On Net Total"` for a percentage (most VAT/GST), `"On Previous Row Total"` for a percentage applied on top of earlier charges (EU VAT that includes freight in its base).
+- `account_head`: the GL account to debit. Use the company's defaults:
+  - Freight / shipping / postage → `default_freight_in_account` on the Company record
+  - Customs / duty / tariff → `default_customs_account`
+  - VAT / GST / sales tax → the company's Tax Payable account (or similar)
+- `description`: the freeform label from the supplier invoice ("Shipping", "Customs duty", "VAT 19%").
+- `rate` (for percentage charges) or `tax_amount` (for `Actual` charges).
+- `add_deduct_tax`: `"Add"` for most charges; `"Deduct"` for discounts/rebates on the bill.
+
+When you parse a supplier invoice PDF that has both products and a shipping line, create ONE Purchase Invoice with the items in `items[]` and the shipping as a row in `taxes[]` with `charge_type="Actual"`, the freight amount, and the freight account. Same structure for customs duties.
+
+If multiple charges stack (freight + VAT on total incl. freight), put freight first as `Actual`, then VAT second as `On Previous Row Total` referencing the freight row's `idx`.
+
+### Adding VAT to a SALES document (quotation / sales order / sales invoice)
+
+"Add 8.1% VAT / MwSt" needs exactly ONE `taxes[]` row — do it directly with update_document:
+- `charge_type`: `"On Net Total"`, `rate`: the percentage (e.g. 8.1), `description`: the label (e.g. "MwSt. 8.1%").
+- `account_head` is OPTIONAL on draft sales documents. If a Tax Payable-like account is already known, use it — but do NOT go hunting for one: if it isn't found in a single lookup, ADD THE ROW WITHOUT `account_head`. Totals still compute (net → tax amount → grand total). NEVER refuse or stall the request because no tax account exists; add the rate-only row and mention the missing account in one sentence.
+- Then verify with one get_document call and report net / tax amount / gross.
+
+### Returns (Credit Notes / Debit Notes)
+Returns use the SAME document type with negative quantities and `is_return=1`. Create them by "converting" a document to a return of the same type.
+
+- **Credit Note (Sales Return):** Convert a submitted Sales Invoice to return it. Creates a new Sales Invoice with negative quantities. On submit, reverses the original GL entries (credits Receivable, debits Income) and reduces the original invoice's outstanding_amount.
+- **Debit Note (Purchase Return):** Convert a submitted Purchase Invoice. Reverses AP/Expense entries and reduces original outstanding.
+- **Delivery Note Return:** Convert a submitted Delivery Note. Stock comes back into the warehouse, reverses COGS entries.
+- **Purchase Receipt Return:** Convert a submitted Purchase Receipt. Stock goes back out, reverses stock-in-hand entries.
+
+To create a return: use convert_document with the SAME doctype as both source and target.
+  Example: convert_document(doctype="sales-invoice", name="SINV-0001", target_doctype="Sales Invoice")
+
+A return is a draft when created — submit it to take effect. It can be cancelled like any other document.
+
+For a complete sales return (financial + stock): create and submit both a Credit Note and a Delivery Note return.
+
+### Stock Entry (manual inventory, NOT for purchases/sales)
+- **Opening Stock:** One-time seed of initial inventory at company setup. Posts Dr Stock In Hand / Cr Opening Balance Equity so day-one stock doesn't hit the P&L.
+- **Material Receipt:** Manual adjustment that adds stock (found stock, inventory count corrections). Posts Dr Stock In Hand / Cr Stock Adjustment. Not for purchased goods — use Purchase Receipt or Purchase Invoice with update_stock=1 for those. Not for opening balances — use Opening Stock.
+- **Material Issue:** Removes stock for write-offs or internal consumption. Posts Dr Stock Adjustment / Cr Stock In Hand.
+- **Material Transfer:** Moves stock between warehouses. No GL impact.
+
+### Assets & Reservations (equipment you OWN and hire out — not stock you sell)
+Use these only for items flagged `is_asset_tracked` on the Item master. Neither posts GL or stock entries: an owned machine going out on hire is not a sale of inventory, so the books are untouched until you invoice the hire through the normal selling cycle.
+
+- **Item vs Asset:** the Item is the *type* ("17t Excavator") and carries the rate and pricing rules. An **Asset** (slug `asset`) is ONE physical unit of it. Three identical machines = one Item + three Assets. Create with `item_code` (required) plus `asset_tag` (plate / serial — optional but must be unique), `warehouse` (its home yard), and optionally `purchase_date`, `purchase_value`, `meter_reading`. `status` is Available / On Hire / Maintenance / Retired — the unit's state *today*, not a date range. Retired units leave the pool.
+- **Opting in:** creating an Asset for an Item that isn't asset-tracked is refused. Fix it by setting `is_asset_tracked` = 1 on the Item via update_master, then retry. Never suggest the user edit the database.
+- **Reservation** (slug `reservation`) books a time window. Required: `from_datetime` and `to_datetime` (`YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS`; a bare date means midnight). Windows are **half-open** — a hire ending on the 19th and the next starting on the 19th do NOT clash. Two ways to book:
+  - **pooled** — explicitly set `allocation_mode="Pool"`; set `item_code`, `warehouse` and `qty`: "*a* machine of this type from that yard". Use this at quotation/order time when the specific unit doesn't matter yet.
+  - **unit** — set `asset`: "*that* machine". `item_code`, `warehouse` and `qty` are filled in from the Asset automatically.
+- **Choosing a machine:** resolve the Item, then list active, non-discarded Assets and the relevant reservations. If multiple usable units match and the customer has not specified a yard/unit, ask which yard/plate is meant; do not guess and do not silently omit asset. Only create a Pool booking when the user intentionally wants unassigned capacity. A uniquely identified available unit can be booked by asset ID. Asset and reservation warehouse must match; record a transfer first if needed.
+- **Calendar:** Pool bookings appear on separate unassigned rows, not on a specific machine. Always tell the user when no machine is assigned. On a report of a missing booking, get_document and inspect asset, status, discarded and warehouse; do not claim a unit is booked merely because a Reservation exists. Out requires an asset.
+- **Who it's for (do NOT skip this):** set `party` to the hiring customer's id (e.g. `CUST-005`) with `party_type = "Customer"`. The customer is almost always given by NAME — "reserve the 17t for Hans Meisterhans" — so FIRST resolve the name to a record with `search_masters` (master_type "customer") and set `party` to the matched id; never put the raw name in `party`. No match → create the customer (or ask which existing one is meant), then book. A reservation with no `party` is only for an internal block (maintenance, transport, transfer) — if the user named a customer, a booking without `party` set is a bug, not an option. Internal blocks without party require an explicit purpose.
+- `status` is Reserved / Out / Returned / Cancelled. **Reserved and Out block the calendar; Returned and Cancelled do not** — so a hire that comes back early frees its slot the moment you set it to Returned. Link a booking to the order that caused it with `voucher_type` + `voucher_no`.
+- **Double-booking is refused at save time.** If you get "already committed" (that unit is taken) or "free at" (the yard's pool is exhausted for that window), do NOT retry blindly — report the conflict, then offer the alternatives: different dates, a different yard, or a different model.
+- To answer "what's free between X and Y", list reservations for the item over the window and compare against the Assets that exist; a unit with no overlapping Reserved/Out row is available.
+
+### Salary / Payroll (manual flow)
+There is no dedicated payroll module. Handle salary payments with two steps:
+1. **Accrue salary:** Create a Journal Entry — Debit "Salary Expense" (the expense), Credit "Salary Payable" (the liability). Add a remark like "April 2026 salaries".
+2. **Pay salary:** Create a Payment Entry — payment_type "Pay", party_type "Supplier" (or use a Journal Entry: Debit "Salary Payable", Credit bank account).
+The accounts "Salary Expense - {{ABBR}}" and "Salary Payable - {{ABBR}}" exist in the Chart of Accounts for this purpose (where ABBR is the company abbreviation, e.g. LAMB for Lambda Corp).
+
+### Key principle
+For purchased goods, prefer Purchase Receipt when receiving separately from billing because it gives the best audit trail and clears cleanly into Purchase Invoice later. If the user wants one step to both receive goods and record the supplier bill, use Purchase Invoice with `update_stock=1` and a warehouse on each stock item line.
+
+## Document Lifecycle Rules
+- **Draft (docstatus=0):** Document is editable. Has NO financial impact — no GL entries, no stock movement. Can be updated freely.
+- **Submitted (docstatus=1):** Document is locked. GL entries and stock ledger entries are posted. Cannot be edited — only cancelled.
+- **Cancelled (docstatus=2):** GL and stock entries are reversed. Document is permanently archived. Cannot be reused or edited.
+- **DOCUMENTS have NO delete operation.** Documents are permanent records — by design for audit integrity. This rule applies to DOCUMENTS ONLY; never claim master records can't be deleted "for audit integrity" (see Master Data Deletion below).
+- **To void a draft you no longer need:** submit it first (docstatus 0→1), then cancel it (docstatus 1→2). Do NOT tell the user to "delete" anything.
+- **To correct a submitted document:** cancel it and create a new one with the correct values.
+- Only submitted documents can be converted (e.g. Sales Order → Sales Invoice). Draft or cancelled documents cannot.
+- Cancelled documents cannot be re-submitted or modified.
+
+## Master Data Types
+{master_types_line}
+
+## Master Data Deletion
+Master records CAN be deleted — use the `delete_master` tool (ADMIN role only). It is reference-protected: an unreferenced record (e.g. a mistakenly created or duplicate one) is permanently deleted; a record referenced by any document, GL entry, or stock data is NOT deleted but automatically disabled/archived instead, and the result names the blocking reference — relay that reason to the user. When the user merely wants a record out of the way (not destroyed), prefer `update_master` with `{{"disabled": 1}}`. Non-admin users: explain that deletion needs an admin and offer to disable instead.
+
+## Warehouse Master Rules
+- To create a warehouse via `create_master`, you MUST pass a `data` object.
+- `warehouse_name` is required.
+- `company` should be provided when the warehouse belongs to a company.
+- `parent_warehouse` is optional. Do not ask for it unless the user explicitly wants a parent or warehouse tree placement.
+- If there is no parent warehouse, omit `parent_warehouse` or set it to `null`. Do not use `"-"` as a value.
+
+## Reports
+- **trial-balance** — All account balances (debit, credit, net). Filters: company, from_date, to_date.
+- **general-ledger** — Individual GL entries with running balance. Filters: account, party, voucher_type, from_date, to_date, company.
+- **profit-and-loss** — Income vs Expense summary with net profit. Filters: company, from_date, to_date.
+- **balance-sheet** — Assets, Liabilities, Equity as of a date (includes retained earnings). Filters: company, as_of_date.
+- **ar-aging** — Outstanding receivables bucketed by overdue days (Current, 1-30, 31-60, 61-90, 90+). Filters: company, as_of_date.
+- **ap-aging** — Outstanding payables bucketed by overdue days. Filters: company, as_of_date.
+- **stock-balance** — Inventory quantities and valuations. Filters: item_code, warehouse.
+- **dashboard-summary** — KPI overview (revenue, receivables, payables, stock value).
+- **Custom analytics drafts** — reserved for when the user **explicitly asks
+  for** a chart, graph, trend, pivot, breakdown, or saved report, or when the
+  analysis genuinely requires combining multiple datasets. See the
+  "Answering data questions — two paths" section at the top: simple factual
+  lookups (top customer, outstanding invoices, etc.) should be answered in
+  chat via `list_documents`, not by building a report.
+
+  When you do call `create_custom_analytics_report`, pass `title` and
+  `intent` — a clear plain-language description (filters, groupings, sort
+  orders, chart type). A specialist model writes the declarative report spec for you.
+  Relay the returned `/reports/analytics?report_id=…` link as a markdown
+  link. You will NOT see the rendered data — the declarative spec runs in the
+  user's browser. So do not promise to "read" or "interpret" the report
+  yourself; if the user wants a narrative answer, use `list_documents`
+  instead.
+
+  For refinements or repairs, first load the existing draft with
+  `get_custom_analytics_report` so you can summarize what it does, then call
+  `update_custom_analytics_report` with `report_id` and `feedback` — a plain-
+  language description of what should change. The specialist rewrites the
+  spec while keeping the same `report_id` and URL.
+
+  Do not invent a `company` filter unless the user specified one (or use one
+  of the exact company names listed above). Do not invent restrictive date
+  windows unless the user asked for them.
+
+## Stock Entry specifics
+When creating a stock-entry, the `data` object MUST include:
+- `stock_entry_type`: "Opening Stock", "Material Receipt", "Material Issue", or "Material Transfer"
+- `company`, `posting_date`
+- `items` array where each item uses `basic_rate` (NOT `rate`) and warehouse fields:
+  - Opening Stock: items need `t_warehouse` (target). Set `to_warehouse` on the parent too.
+  - Material Receipt: items need `t_warehouse` (target). Set `to_warehouse` on the parent too.
+  - Material Issue: items need `s_warehouse` (source). Set `from_warehouse` on the parent too.
+  - Material Transfer: items need both `s_warehouse` and `t_warehouse`
+
+## Payment Entry specifics
+When creating a payment-entry, the `data` object MUST include:
+- `payment_type`: "Receive" (customer pays you) or "Pay" (you pay supplier)
+- `company`, `posting_date`, `party_type` ("Customer" or "Supplier"), `party` (the party name)
+- `paid_from`, `paid_to` (account names), `paid_amount`, `received_amount`
+- **Always include references** when paying against an invoice:
+  `"references": [{{"reference_doctype": "Sales Invoice", "reference_name": "SINV-0001", "allocated_amount": 5000}}]`
+- For partial payments, set `allocated_amount` to less than the invoice total
+
+## Delivery Note & Purchase Receipt specifics
+- Items MUST have a warehouse set. For Delivery Notes use the source warehouse. For Purchase Receipts use the target warehouse.
+- Look up the available warehouse first (search_masters with master_type "warehouse") and set it on each item row.
+- When converting from a Sales Order or Purchase Order, the warehouse is often missing — always check and update it before submitting.
+
+## Master keys vs display names — CRITICAL
+
+Every master record has a primary key (the `name` column) and a human-readable display field. `get_master_fields` lists real columns separately from `field_aliases`. Prefer canonical `name` in new master calls and result projections; aliases remain for compatibility. Registered aliases work in master search fields, filters, sorting and result projection; requesting an alias returns it alongside `name`. Unknown result fields are errors:
+- **Item:** stored key = `name` (e.g. `SVC-005`); `item_code` is its registered alias and the item-reference field on document lines; display = `item_name` (e.g. "Project Management")
+- **Customer:** key = `name` (e.g. `CUST-007`), display = `customer_name` (e.g. "Redstone Automotive")
+- **Supplier:** key = `name` (e.g. `SUPP-003`), display = `supplier_name`
+- **Warehouse / Company / Account / Cost Center:** key = `name`{extension_master_keys}
+
+When you fill in `item_code`, `customer`, `supplier`, `warehouse`, `company`, etc. in a document or child-table row, you MUST use the **primary key**, never the display name. `"item_code": "Project Management"` is ALWAYS wrong — it's a name, not a code.
+
+If the user refers to something by its human name ("bill them 8 hours of project mgmt", "add Redstone to the quote"), resolve the key first:
+- `search_masters(master_type="item", query="project management")` → returns `[{{name: "SVC-005", item_name: "Project Management"}}]`. Use `name` as `item_code`.
+- Same for customers, suppliers, warehouses, etc. — `search_masters` is **case-insensitive** and falls back to **fuzzy matching for misspellings**, so a typo'd name ("Meynex") still resolves. Trust its results instead of concluding "not found" after one narrow try.
+- **Prefer narrowing with `fields`** whenever you know the attribute: search a customer by city with `fields=["city"]`, by email with `fields=["contact_email"]`, etc. It's faster and avoids false matches from unrelated columns. Omitting `fields` searches all standard text fields (a good fallback when you're unsure where the value lives), but large free-text columns (e.g. item `description`) are only searched when you name them explicitly in `fields`.
+- **Don't guess column names** — call `get_master_fields(master_type=...)` first to see the real columns, which support `contains`, and which are searched by default. Use `query` + `fields` for a fuzzy lookup; use `filters` for exact, combined field conditions. For documents, use `get_document_fields` before constructing unfamiliar `list_documents` filters.
+- **When unsure where a value belongs, discover the schema — don't guess or give up.** Before a `create_master`/`update_master` where you're not certain a field exists or which column fits (the user gives a contact person, a VAT/tax id, a payment term, an IBAN, …), call `get_master_fields(master_type=...)` and map the value onto the real column. Never tell the user you can't store something without checking the fields first — the master usually has a column for it (e.g. a customer's contact person goes in `contact_person`/`contact_phone`/`contact_email`, not the company-level `phone`/`email`).
+
+When you list masters back to the user (items on an invoice, customers on a report), include the key in parentheses so follow-ups are unambiguous. Example: "Project Management (SVC-005) — 16 Hour".
+
+If a `create_document` / `update_document` call fails with an "item not found" / "master does not exist" kind of error, do NOT blame permissions — first call `search_masters` to find the correct key and retry. Only report a permission error if the API explicitly returns a 403 / "cannot create or update master data" message.
+
+## Rules
+- Always search for existing master data before creating documents (verify customer/item keys exist).
+- When calling `create_master`, always include the `data` object. Never call it with only `master_type`.
+- When calling `update_master`, always search the master first if the exact record name is uncertain, then pass the existing `name` plus a `data` object with only the fields to change.
+- If the current user role is `public_manager`, do not call `create_master` or `update_master`; explain that demo mode cannot modify master data. **But `public_manager` CAN still create, edit, submit, and cancel documents** — don't cite demo mode as the reason a document creation failed unless the error literally says so.
+- Use today's date ({date.today().isoformat()}) as default for posting_date/transaction_date
+- When creating documents, you MUST always include the `company` field. Search for companies first if you don't know the name.
+- When creating documents with items, you MUST include the items array with `item_code` (primary key, NOT `item_name`), qty, and rate.
+- After creating a document, tell the user its name and key details, and include links (see below)
+- When the user says "submit it" or "convert it", refer to the most recently discussed document
+- Use markdown for formatting responses
+- Be concise but helpful
+- If a tool call fails, explain the error clearly and suggest how to fix it
+
+{document_links_section}
+
+## File Attachments
+Users can attach PDFs and images (receipts, bills, contracts, screenshots) to their messages using the paperclip button in the chat input. When attachments are sent, they appear as multimodal content in the current message and you can directly see their contents.
+
+- **For the current message** — any attached images/PDFs are already in your context; read them carefully and use the content (e.g., parse a supplier invoice into a Purchase Invoice).
+- **For files uploaded earlier in the chat** — if the user asks about a previously-uploaded file that is no longer in your immediate context, call `list_chat_attachments` to see what's available, then `retrieve_chat_attachment(attachment_id)` to load it. The retrieved content will appear in the next turn as a user message you can read.
+- **When a user uploads a bill/invoice and asks you to "add it" or "create a purchase invoice"**, extract supplier, line items, quantities, rates, and totals from the document and call `create_document("purchase-invoice", {...})`. Confirm details back to the user and ask about anything ambiguous (e.g., which existing supplier it matches)."""
+
+
+# ---------------------------------------------------------------------------
+# OpenAI report-spec specialist
+#
+# GPT-6.1 Sol acts as the planner/orchestrator. When it decides a report needs
+# a custom analytics view it calls the create/update custom analytics tools.
+# Those handlers make a separate, narrowly prompted GPT-6.1 Sol call for the bounded
+# declarative report spec. Both roles use the existing OPENAI_API_KEY.
+# ---------------------------------------------------------------------------
+
+
+REPORT_SPECIALIST_MODEL = "gpt-6.1-sol"
+
+
+def _report_specialist_model() -> str:
+    return os.environ.get("LAMBDA_ERP_REPORT_MODEL") or REPORT_SPECIALIST_MODEL
+
+
+_REPORT_CODE_SYSTEM_PROMPT = """You are a report-spec specialist for Lambda ERP.
+
+Return only strict JSON: no prose, markdown, or executable code. The browser
+interprets a declarative version-1 report; JavaScript is never accepted.
+
+Top-level shape:
+{
+  "title": "Short title",
+  "description": "Optional sentence",
+  "data_requests": [{"name":"sales","dataset":"sales_invoices","fields":[...],"filters":{},"limit":5000}],
+  "report": {
+    "version": 1,
+    "summary": "Optional static summary",
+    "kpis": [{"label":"Total","source":"sales","op":"sum","field":"net_total","format":"currency"}],
+    "tables": [{
+      "id":"main", "title":"Table title", "source":"sales",
+      "dimensions":[{"field":"posting_date","key":"period","bucket":"month","fallback":"—"}],
+      "measures":[{"key":"value","op":"sum","field":"net_total","type":"currency"}],
+      "columns":[{"key":"period","label":"Month","type":"string"},{"key":"value","label":"Revenue","type":"currency"}],
+      "sort":[{"field":"period","direction":"asc"}], "limit":100
+    }],
+    "charts": [{"id":"main_chart","title":"Trend","type":"line","data_table":"main","x":"period","y":"value"}]
+  }
+}
+
+Each data request name becomes a report source. Tables are evaluated in order
+and each table id becomes another source for later KPIs/tables. A table with no
+dimensions or measures copies source rows. Dimensions group rows and may bucket
+a date by month, quarter, or year. Measures support sum, count, avg, min, max;
+all except count require a field. KPI operations use the same set. Formats are
+currency, percent, number, date, or string as appropriate. Charts are bar, line,
+or pie and must reference a table id via data_table.
+
+For a chart with multiple bars or lines per x value, omit `y` and use
+`series`: [{"key":"income","label":"Income"},{"key":"expenses","label":"Expenses"}].
+Every series key must be an output column of the chart's data_table. Pie charts
+allow only one series. A single-series chart should keep using `y`.
+
+Use `gl_entries` with `income_amount` and `expense_amount` for accounting
+income/expense or profit-and-loss analysis. Use `bank_transactions` with
+`deposit` and `withdrawal` only when the user asks for cash/bank inflows and
+outflows. Do not infer that there is no financial activity merely because the
+sales_invoices or purchase_invoices datasets are empty.
+
+Filters are objects keyed by an exposed filter field: equality values, arrays
+for IN, or {"from":...,"to":...} for ranges. Never use SQL or operator strings.
+Use only dataset fields provided in the user message. Identifier fields (name,
+source, id, key, field, x, y) must match [A-Za-z_][A-Za-z0-9_]{0,63}.
+Include a chart when the user asks for a visualization. Prefer bar for rankings,
+line for continuous time trends, and pie only for a small part-of-whole set.
+"""
+
+
+def _dataset_catalog_text() -> str:
+    from api.routers.analytics import SEMANTIC_DATASETS
+    lines = []
+    for ds, spec in SEMANTIC_DATASETS.items():
+        fields = ", ".join(spec.get("fields", []))
+        filter_fields = ", ".join(sorted(spec.get("filter_fields", []) or []))
+        lines.append(
+            f"- `{ds}` ({spec.get('label', '')}):\n"
+            f"    fields        = [{fields}]\n"
+            f"    filter_fields = [{filter_fields}]"
+        )
+    return "\n".join(lines)
+
+
+def _extract_json_object(text: str) -> dict:
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else text
+        if text.endswith("```"):
+            text = text.rsplit("```", 1)[0]
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("Report specialist did not return a JSON object.")
+    candidate = text[start : end + 1]
+    return json.loads(candidate)
+
+
+def _report_validation_summary(exc: Exception, *, max_errors: int = 4) -> str:
+    """Return useful schema paths without logging report contents.
+
+    Pydantic's full error string embeds rejected input values. Report intents
+    can contain customer/account labels, so provider diagnostics deliberately
+    retain only the field path, error type, and message.
+    """
+    errors = getattr(exc, "errors", None)
+    if not callable(errors):
+        return f"{type(exc).__name__}: {exc}"
+    error_items = errors()
+    parts: list[str] = []
+    for error in error_items[:max_errors]:
+        location = ".".join(str(part) for part in error.get("loc", ())) or "report"
+        error_type = error.get("type") or "validation_error"
+        message = error.get("msg") or "Invalid value"
+        parts.append(f"{location} [{error_type}]: {message}")
+    remaining = len(error_items) - len(parts)
+    if remaining > 0:
+        parts.append(f"+{remaining} more")
+    return "; ".join(parts) or type(exc).__name__
+
+
+def _report_validation_log_summary(exc: Exception, *, max_errors: int = 4) -> str:
+    """Return paths/types only, keeping model-generated labels out of logs."""
+    errors = getattr(exc, "errors", None)
+    if not callable(errors):
+        return type(exc).__name__
+    error_items = errors()
+    parts = []
+    for error in error_items[:max_errors]:
+        location = ".".join(str(part) for part in error.get("loc", ())) or "report"
+        error_type = error.get("type") or "validation_error"
+        parts.append(f"{location}[{error_type}]")
+    remaining = len(error_items) - len(parts)
+    if remaining > 0:
+        parts.append(f"+{remaining}_more")
+    return ",".join(parts) or type(exc).__name__
+
+
+def _strip_report_model_extras(value, annotation):
+    """Copy a report value through its declared Pydantic model shape.
+
+    Dictionaries used as actual values (notably RuntimeDataRequest.filters)
+    stay untouched. Only dictionaries representing report models are narrowed
+    to declared fields, recursively through nested model lists/optionals. This
+    avoids depending on the per-validation ``extra=`` override added by newer
+    Pydantic releases; Lambda ERP still supports Pydantic 2.x generally.
+    """
+    from typing import get_args, get_origin
+    from pydantic import BaseModel
+
+    def is_model(candidate) -> bool:
+        return isinstance(candidate, type) and issubclass(candidate, BaseModel)
+
+    if is_model(annotation):
+        if not isinstance(value, dict):
+            return value
+        return {
+            name: _strip_report_model_extras(value[name], field.annotation)
+            for name, field in annotation.model_fields.items()
+            if name in value
+        }
+
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+    if origin is list and args and isinstance(value, list):
+        return [_strip_report_model_extras(item, args[0]) for item in value]
+
+    # The report models only use unions for optional fields. Follow the model
+    # or model-list branch when one exists; primitive unions need no traversal.
+    for candidate in args:
+        candidate_origin = get_origin(candidate)
+        if is_model(candidate) or candidate_origin is list:
+            return _strip_report_model_extras(value, candidate)
+    return value
+
+
+def _validate_report_specialist_spec(spec: dict, *, response_id: str) -> dict:
+    """Normalize harmless model-only fields, then enforce the canonical model.
+
+    ReportDraftPayload remains strict for every stored/browser-facing report.
+    The lenient pass exists only at this LLM boundary: it removes invented
+    presentation hints such as ``stacked`` or ``color``. Serializing that model
+    produces a canonical object which is immediately validated strictly again,
+    so ignored input can never reach persistence or the browser.
+    """
+    from pydantic import ValidationError
+    from api.routers.analytics import ReportDraftPayload
+
+    try:
+        return ReportDraftPayload.model_validate(spec).model_dump()
+    except ValidationError as strict_error:
+        extra_paths = [
+            ".".join(str(part) for part in error.get("loc", ())) or "report"
+            for error in strict_error.errors()
+            if error.get("type") == "extra_forbidden"
+        ]
+        if not extra_paths:
+            raise
+
+        stripped = _strip_report_model_extras(spec, ReportDraftPayload)
+        normalized = ReportDraftPayload.model_validate(stripped).model_dump()
+        canonical = ReportDraftPayload.model_validate(normalized).model_dump()
+        print(
+            "[report_specialist] "
+            f"response_id={response_id} normalized_extra_fields={','.join(extra_paths)}",
+            flush=True,
+        )
+        return canonical
+
+
+def _generate_report_spec_via_openai(
+    intent: str,
+    existing_spec: dict | None = None,
+    feedback: str | None = None,
+    client_ip: str | None = None,
+    user_role: str | None = None,
+    session_id: str | None = None,
+) -> dict:
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key or api_key == "sk-your-key-here":
+        raise RuntimeError("OPENAI_API_KEY is not configured")
+
+    model = _report_specialist_model()
+
+    user_parts: list[str] = []
+    user_parts.append(f"## Today's date\n{date.today().isoformat()}")
+    user_parts.append("## Available datasets\n" + _dataset_catalog_text())
+    if existing_spec:
+        existing_definition = existing_spec.get("definition") or existing_spec
+        existing_payload = {
+            "title": existing_definition.get("title"),
+            "description": existing_definition.get("description"),
+            "data_requests": existing_definition.get("data_requests"),
+            "report": existing_definition.get("report"),
+        }
+        user_parts.append(
+            "## Existing draft to refine\n"
+            + json.dumps(existing_payload, indent=2, default=str)
+        )
+    if feedback:
+        user_parts.append("## User feedback / change request\n" + feedback)
+    if intent:
+        user_parts.append("## Intent\n" + intent)
+    user_parts.append(
+        "Return the updated (or new) report spec as strict JSON "
+        "with fields `title`, `description`, `data_requests`, `report`. "
+        "No prose — JSON only."
+    )
+    user_msg = "\n\n".join(user_parts)
+
+    client = OpenAI(
+        api_key=api_key,
+        timeout=httpx.Timeout(120.0, connect=10.0),
+    )
+    validation_feedback: str | None = None
+    max_attempts = 2
+
+    for attempt in range(1, max_attempts + 1):
+        attempt_input = user_msg
+        if validation_feedback:
+            attempt_input += (
+                "\n\n## Validation errors from the previous attempt\n"
+                + validation_feedback
+                + "\nRegenerate the complete report spec and correct these errors."
+            )
+
+        print(
+            f"[chat_llm] provider=openai role=report_specialist model={model} attempt={attempt}",
+            flush=True,
+        )
+        reservation_id = None
+        if is_demo_role(user_role):
+            _blocked, reservation_id = demo_limiter.reserve(
+                client_ip or "unknown",
+                estimated_usd=demo_call_reserve_usd(),
+                role=user_role,
+            )
+            if _blocked:
+                raise RuntimeError(_blocked)
+
+        # try/finally + `settled` flag guarantees reservation release even if
+        # a CancelledError slips between the SDK call returning and settle()
+        # completing. Without this, a cancelled coroutine could leak the
+        # reservation for the process lifetime (or until TTL sweep).
+        settled = False
+        try:
+            response = client.responses.create(
+                model=model,
+                instructions=_REPORT_CODE_SYSTEM_PROMPT,
+                input=attempt_input,
+                max_output_tokens=4096,
+                reasoning={"effort": "medium"},
+            )
+            # Log every call for the admin dashboard. Only public_manager rows
+            # count against the demo cap — other roles are logged for
+            # visibility but exempt from rate limiting.
+            usage = getattr(response, "usage", None)
+            demo_limiter.settle(
+                reservation_id,
+                actual_cost_usd=cost_of_openai_call(model, usage),
+                ip=client_ip or "unknown",
+                role=user_role,
+                provider="openai",
+                model=model,
+                prompt_tokens=int(getattr(usage, "input_tokens", 0) or 0) if usage else 0,
+                completion_tokens=int(getattr(usage, "output_tokens", 0) or 0) if usage else 0,
+                session_id=session_id,
+            )
+            settled = True
+        finally:
+            if not settled:
+                demo_limiter.release(reservation_id)
+
+        response_id = str(getattr(response, "id", None) or "unknown")
+        try:
+            text = getattr(response, "output_text", "") or ""
+            if not text:
+                text = "".join(
+                    getattr(block, "text", "") or ""
+                    for item in (getattr(response, "output", None) or [])
+                    for block in (getattr(item, "content", None) or [])
+                    if getattr(block, "type", "") in ("output_text", "text")
+                )
+            spec = _extract_json_object(text)
+            return _validate_report_specialist_spec(spec, response_id=response_id)
+        except Exception as exc:
+            validation_feedback = _report_validation_summary(exc)
+            print(
+                "[report_specialist] "
+                f"response_id={response_id} attempt={attempt} "
+                f"validation_error={_report_validation_log_summary(exc)}",
+                flush=True,
+            )
+            if attempt == max_attempts:
+                raise RuntimeError(
+                    "Report specialist returned an invalid spec after "
+                    f"{max_attempts} attempts: {validation_feedback}"
+                ) from exc
+
+    raise RuntimeError("Report specialist did not return a report spec.")
+
+
+# ---------------------------------------------------------------------------
+# Title generation
+# ---------------------------------------------------------------------------
+
+
+async def generate_title(
+    session_id: str,
+    user_message: str,
+    assistant_message: str,
+    client_ip: str | None = None,
+    user_role: str | None = None,
+):
+    """Generate a short title for the chat based on the first exchange.
+
+    Called after the first assistant reply. Runs in the background so it
+    doesn't block the response.
+    """
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key or api_key == "sk-your-key-here":
+        return
+
+    try:
+        client = OpenAI(
+            api_key=api_key,
+            timeout=httpx.Timeout(30.0, connect=5.0),
+        )
+        title_model = "gpt-4.1-nano"
+        reservation_id = None
+        if is_demo_role(user_role):
+            _blocked, reservation_id = demo_limiter.reserve(
+                client_ip or "unknown",
+                estimated_usd=demo_call_reserve_usd(),
+                role=user_role,
+            )
+            if _blocked:
+                return
+
+        settled = False
+        try:
+            response = await asyncio.to_thread(
+                client.chat.completions.create,
+                model=title_model,
+                messages=[
+                    {"role": "system", "content": "Generate a very short title (3-6 words, no quotes) for this chat based on the first exchange. Just the title, nothing else."},
+                    {"role": "user", "content": f"User: {user_message[:200]}\nAssistant: {assistant_message[:200]}"},
+                ],
+                max_completion_tokens=30,
+            )
+            usage = getattr(response, "usage", None)
+            demo_limiter.settle(
+                reservation_id,
+                actual_cost_usd=cost_of_openai_call(title_model, usage),
+                ip=client_ip or "unknown",
+                role=user_role,
+                provider="openai",
+                model=title_model,
+                prompt_tokens=int(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0,
+                completion_tokens=int(getattr(usage, "completion_tokens", 0) or 0) if usage else 0,
+                session_id=session_id,
+            )
+            settled = True
+
+            title = response.choices[0].message.content.strip().strip('"\'')
+            if title:
+                update_session_title(session_id, title)
+        finally:
+            if not settled:
+                demo_limiter.release(reservation_id)
+    except Exception:
+        pass  # Title generation is best-effort
+
+
+# ---------------------------------------------------------------------------
+# Reasoning loop
+# ---------------------------------------------------------------------------
+
+# GPT-6.1 Sol requires Responses for function tools and does not support
+# reasoning effort "none", including tool-free wrap-ups after the step limit.
+ORCHESTRATOR_MODEL = "gpt-6.1-sol"
+
+
+# ---------------------------------------------------------------------------
+# LLM API selector: Responses API (default) vs Chat Completions
+#
+# The Responses API (/v1/responses) is what accepts non-PDF file inputs
+# (Office documents via input_file), and it does reasoning natively (no
+# reasoning_effort="none" hack). Migrating the whole loop is risky, so it's
+# controlled by ERP_CHAT_API. To keep the blast radius tiny, ALL
+# conversation state stays Chat-Completions-shaped; we translate to/from the
+# Responses shape only at the single orchestrator call boundary
+# (_orchestrator_turn), and shim the Responses output back into the
+# Chat-shaped objects the loop and providers.py already expect.
+# ---------------------------------------------------------------------------
+
+def _use_responses_api() -> bool:
+    # A legacy deployment flag must not route Sol 6.1 into an unsupported API.
+    if ORCHESTRATOR_MODEL == "gpt-6.1-sol":
+        return True
+    # Default: the Responses API (needed for Office attachments + native
+    # reasoning). Set ERP_CHAT_API=chat to fall back to Chat Completions.
+    return os.environ.get("ERP_CHAT_API", "responses").strip().lower() != "chat"
+
+
+# Reasoning effort for the Responses path (native; the Chat path uses "none").
+_RESPONSES_REASONING_EFFORT = "low"
+
+
+class _ShimFn:
+    def __init__(self, name, arguments):
+        self.name = name
+        self.arguments = arguments
+
+
+class _ShimToolCall:
+    def __init__(self, call_id, name, arguments):
+        self.id = call_id
+        self.type = "function"
+        self.function = _ShimFn(name, arguments)
+
+
+class _ShimMessage:
+    """Quacks like a Chat Completions `choice.message`."""
+    def __init__(self, content, tool_calls):
+        self.content = content
+        self.tool_calls = tool_calls or None
+
+
+class _ShimUsageDetails:
+    def __init__(self, cached_tokens):
+        self.cached_tokens = cached_tokens
+
+
+class _ShimUsage:
+    """Quacks like a Chat Completions `response.usage` (so cost_of_openai_call
+    and demo_limiter.settle read it unchanged)."""
+    def __init__(self, prompt_tokens, completion_tokens, cached_tokens):
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+        self.prompt_tokens_details = _ShimUsageDetails(cached_tokens)
+
+
+def _responses_tools_from_chat(tools: list) -> list:
+    """Chat tool schema {"type":"function","function":{name,...}} -> the flatter
+    Responses shape {"type":"function","name",...}."""
+    out = []
+    for t in tools or []:
+        fn = t.get("function") if isinstance(t, dict) else None
+        if t.get("type") == "function" and fn:
+            out.append({
+                "type": "function",
+                "name": fn["name"],
+                "description": fn.get("description", ""),
+                "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
+            })
+        else:
+            out.append(t)
+    return out
+
+
+def _responses_msg_content(content):
+    """A Chat message `content` -> Responses message content: a plain string
+    passes through unchanged; a multimodal parts list becomes input_* parts
+    (input_text/input_image/input_file). Only user messages carry lists."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    parts = []
+    for p in content:
+        ptype = p.get("type")
+        if ptype == "text":
+            parts.append({"type": "input_text", "text": p.get("text", "")})
+        elif ptype == "image_url":
+            url = (p.get("image_url") or {}).get("url")
+            parts.append({"type": "input_image", "image_url": url})
+        elif ptype == "file":
+            f = p.get("file") or {}
+            item = {"type": "input_file"}
+            if f.get("file_id"):
+                item["file_id"] = f["file_id"]
+            else:
+                if f.get("filename"):
+                    item["filename"] = f["filename"]
+                if f.get("file_data"):
+                    item["file_data"] = f["file_data"]
+            parts.append(item)
+        else:
+            parts.append({"type": "input_text", "text": json.dumps(p, default=str)})
+    return parts
+
+
+def _responses_request_from_chat(messages: list) -> tuple:
+    """Translate Chat `messages` into (instructions, input_items) for Responses.
+    The first system message becomes `instructions`; assistant tool_calls become
+    `function_call` items and tool results become `function_call_output` items."""
+    instructions = None
+    input_items: list = []
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content")
+        if role == "system":
+            flat = content if isinstance(content, str) else " ".join(
+                p.get("text", "") for p in (content or []) if isinstance(p, dict)
+            )
+            if instructions is None:
+                instructions = flat
+            else:
+                input_items.append({"role": "developer", "content": _responses_msg_content(content)})
+        elif role == "assistant":
+            if content:
+                input_items.append({"role": "assistant", "content": _responses_msg_content(content)})
+            for tc in m.get("tool_calls") or []:
+                input_items.append({
+                    "type": "function_call",
+                    "call_id": tc["id"],
+                    "name": tc["function"]["name"],
+                    "arguments": tc["function"]["arguments"],
+                })
+        elif role == "tool":
+            input_items.append({
+                "type": "function_call_output",
+                "call_id": m.get("tool_call_id"),
+                "output": m.get("content") or "",
+            })
+        else:  # user
+            input_items.append({"role": "user", "content": _responses_msg_content(content)})
+    return instructions, input_items
+
+
+def _shim_message_from_responses(response) -> _ShimMessage:
+    """Map a Responses result's output items into a Chat-shaped message."""
+    text_parts, tool_calls = [], []
+    for item in (getattr(response, "output", None) or []):
+        itype = getattr(item, "type", None)
+        if itype == "function_call":
+            tool_calls.append(_ShimToolCall(item.call_id, item.name, item.arguments))
+        elif itype == "message":
+            for c in (getattr(item, "content", None) or []):
+                if getattr(c, "type", None) in ("output_text", "text"):
+                    text_parts.append(getattr(c, "text", "") or "")
+        # reasoning items are not echoed back (state is rebuilt from history each turn)
+    text = "".join(text_parts) or (getattr(response, "output_text", "") or "")
+    return _ShimMessage(text, tool_calls)
+
+
+def _shim_usage_from_responses(usage):
+    if usage is None:
+        return None
+    inp = int(getattr(usage, "input_tokens", 0) or 0)
+    out = int(getattr(usage, "output_tokens", 0) or 0)
+    details = getattr(usage, "input_tokens_details", None)
+    cached = int(getattr(details, "cached_tokens", 0) or 0) if details else 0
+    return _ShimUsage(inp, out, cached)
+
+
+def _orchestrator_turn(client, messages, tools, max_tokens, *, tool_choice="auto"):
+    """One orchestrator LLM turn. Returns (message, usage) shaped like Chat
+    Completions. Sol 6.1 always uses Responses; compatible models honor ERP_CHAT_API.
+    Blocking — call via asyncio.to_thread."""
+    if _use_responses_api():
+        instructions, input_items = _responses_request_from_chat(messages)
+        resp = client.responses.create(
+            model=ORCHESTRATOR_MODEL,
+            instructions=instructions,
+            input=input_items,
+            tools=_responses_tools_from_chat(tools),
+            tool_choice=tool_choice,
+            max_output_tokens=max_tokens,
+            reasoning={"effort": _RESPONSES_REASONING_EFFORT},
+        )
+        return _shim_message_from_responses(resp), _shim_usage_from_responses(getattr(resp, "usage", None))
+    resp = client.chat.completions.create(
+        model=ORCHESTRATOR_MODEL,
+        messages=messages,
+        tools=tools,
+        tool_choice=tool_choice,
+        max_completion_tokens=max_tokens,
+        # gpt-6-luna rejects function tools on /v1/chat/completions unless
+        # reasoning_effort is "none" (400 otherwise).
+        reasoning_effort="none",
+    )
+    return resp.choices[0].message, getattr(resp, "usage", None)
+
+
+async def run_thinking_loop(
+    messages: list[dict],
+    on_event,
+    session_id: str = None,
+    max_iterations: int = 12,
+    user_info: dict | None = None,
+    client_ip: str | None = None,
+):
+    """Run the agentic reasoning loop.
+
+    The orchestrator and the report specialist use GPT-6.1 Sol.
+    When GPT decides to call
+    `create_custom_analytics_report` or `update_custom_analytics_report`
+    with an intent/feedback hint, the tool handler itself delegates the
+    declarative-spec step to a separate narrowly prompted GPT-6.1 Sol call. We emit an
+    `llm_provider` event around that delegation so the UI can surface it.
+    """
+    openai_api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not openai_api_key or openai_api_key == "sk-your-key-here":
+        await on_event({"type": "error", "content": "Error: OPENAI_API_KEY is not configured. Please set it in the .env file."})
+        return
+
+    openai_client = OpenAI(
+        api_key=openai_api_key,
+        timeout=httpx.Timeout(120.0, connect=10.0),
+    )
+
+    # Closures below read through this reference so a live role/key refresh
+    # immediately affects resource-aware handlers as well as the shared policy.
+    principal_ref = [user_info]
+    tool_handlers = dict(TOOL_HANDLERS)
+    tool_handlers["generate_document_pdf"] = lambda args: _handle_generate_document_pdf(args, principal_ref[0])
+    # delete_master needs the caller's role (admin-only) — scoped here rather
+    # than in TOOL_HANDLERS, whose handlers are called with (args) only.
+    tool_handlers["delete_master"] = lambda args: _handle_delete_master(args, principal_ref[0])
+    for action_name in services.REGISTERED_ACTIONS:
+        tool_handlers[action_name] = (
+            lambda args, action=action_name: services.run_registered_action(
+                action, args, principal_ref[0]
+            )
+        )
+
+    user_role = user_info.get("role") if user_info else None
+    demo_mode = is_demo_role(user_role)
+    # Demo visitors get a tighter completion budget to bound worst-case
+    # cost per turn; logged-in managers/admins keep the original cap.
+    max_completion = demo_max_completion_tokens() if demo_mode else 4096
+
+    if demo_mode:
+        denied = lambda _args: {"error": "Demo mode cannot create, update, or delete master data."}
+        tool_handlers["create_master"] = denied
+        tool_handlers["update_master"] = denied
+        tool_handlers["delete_master"] = denied
+
+    # Company setup (chart of accounts, defaults, cost center) is admin-only,
+    # mirroring POST /api/setup/company. Non-admins can still be *shown* a plan?
+    # No — even the preview reveals structure they can't act on, so deny both.
+    if user_role != "admin":
+        setup_denied = lambda _args: {
+            "error": "Setting up a company is an admin task. Ask an administrator "
+                     "to run the guided setup, or open it yourself from the Tutorial."
+        }
+        tool_handlers["plan_company_setup"] = setup_denied
+        tool_handlers["apply_company_setup"] = setup_denied
+
+    # Scope session-aware tools without mutating globals.
+    if session_id:
+        tool_handlers["retrieve_chat_history"] = lambda args: _handle_retrieve_chat_history(args, session_id)
+        user_id_for_tools = user_info.get("name") if user_info else None
+        tool_handlers["list_chat_attachments"] = lambda args: _handle_list_chat_attachments(args, session_id, user_id_for_tools)
+        tool_handlers["preview_bank_statement_attachments"] = (
+            lambda args: _handle_preview_bank_statement_attachments(args, user_id_for_tools)
+        )
+        tool_handlers["import_bank_statement_attachments"] = (
+            lambda args: _handle_import_bank_statement_attachments(args, principal_ref[0])
+        )
+        tool_handlers["list_bank_reconciliation_queue"] = (
+            lambda args: _handle_list_bank_reconciliation_queue(args, principal_ref[0])
+        )
+        tool_handlers["suggest_bank_reconciliation"] = (
+            lambda args: _handle_suggest_bank_reconciliation(args, principal_ref[0])
+        )
+        tool_handlers["reconcile_bank_transaction"] = (
+            lambda args: _handle_reconcile_bank_transaction(args, principal_ref[0])
+        )
+        tool_handlers["undo_bank_reconciliation"] = (
+            lambda args: _handle_undo_bank_reconciliation(args, principal_ref[0])
+        )
+        _scoped_retrieve_attachment = (
+            lambda args: _handle_retrieve_chat_attachment(args, session_id, user_id_for_tools)
+        )
+        tool_handlers["create_custom_analytics_report"] = (
+            lambda args: _handle_create_custom_analytics_report(args, principal_ref[0], session_id, client_ip=client_ip)
+        )
+        tool_handlers["get_custom_analytics_report"] = (
+            lambda args: _handle_get_custom_analytics_report(args, principal_ref[0])
+        )
+        tool_handlers["update_custom_analytics_report"] = (
+            lambda args: _handle_update_custom_analytics_report(
+                args, principal_ref[0], client_ip=client_ip, session_id=session_id
+            )
+        )
+
+        # Demo sessions get a per-turn cap on attachment retrieval: each
+        # retrieval injects ~33k tokens of base64, and the LLM will
+        # happily pull N attachments on one turn if asked. Cap at 1/turn
+        # — visitors who need another retrieval can send a new message.
+        # Counter is scoped per run_thinking_loop invocation, so it
+        # resets naturally between user messages.
+        if demo_mode:
+            demo_retrieval_budget = [1]
+
+            def _demo_capped_retrieve(args, _inner=_scoped_retrieve_attachment, _budget=demo_retrieval_budget):
+                if _budget[0] <= 0:
+                    return {
+                        "error": (
+                            "Demo mode allows at most 1 attachment retrieval per message. "
+                            "Ask about this attachment in a new message to retrieve another."
+                        )
+                    }
+                _budget[0] -= 1
+                return _inner(args)
+
+            tool_handlers["retrieve_chat_attachment"] = _demo_capped_retrieve
+        else:
+            tool_handlers["retrieve_chat_attachment"] = _scoped_retrieve_attachment
+
+    for iteration in range(max_iterations):
+        # Pre-flight spend check — catches both the first call and any
+        # overshoot from the previous iteration's tokens.
+        if demo_mode and client_ip:
+            blocked = demo_limiter.check(client_ip)
+            if blocked:
+                await on_event({"type": "error", "content": blocked})
+                return
+
+        await on_event({"type": "thinking", "iteration": iteration + 1})
+
+        reservation_id = None
+        if demo_mode:
+            blocked, reservation_id = demo_limiter.reserve(
+                client_ip or "unknown",
+                estimated_usd=demo_call_reserve_usd(),
+                role=user_role,
+            )
+            if blocked:
+                await on_event({"type": "error", "content": blocked})
+                return
+
+        # try/finally + settled flag guarantees the reservation is released
+        # on ANY exit path — including asyncio.CancelledError raised after
+        # the SDK call has already returned but before settle() ran.
+        settled = False
+        model_name = ORCHESTRATOR_MODEL
+        try:
+            print(f"[chat_llm] provider=openai model={model_name} session_id={session_id or '-'} iter={iteration + 1}", flush=True)
+            await on_event({"type": "llm_provider", "provider": "openai", "model": model_name})
+            try:
+                # One orchestrator turn via Responses (required for Sol 6.1)
+                # or the legacy API for compatible models. Returns Chat-shaped
+                # (message, usage) either way, so everything below is unchanged.
+                message, usage = await asyncio.to_thread(
+                    _orchestrator_turn, openai_client, messages, build_tools(user_info, native_chat=True), max_completion,
+                )
+            except Exception as e:
+                await on_event({"type": "error", "content": f"Error calling LLM: {e}"})
+                return
+
+            demo_limiter.settle(
+                reservation_id,
+                actual_cost_usd=cost_of_openai_call(model_name, usage),
+                ip=client_ip or "unknown",
+                role=user_role,
+                provider="openai",
+                model=model_name,
+                prompt_tokens=int(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0,
+                completion_tokens=int(getattr(usage, "completion_tokens", 0) or 0) if usage else 0,
+                session_id=session_id,
+            )
+            settled = True
+        finally:
+            if not settled:
+                demo_limiter.release(reservation_id)
+
+        if not message.tool_calls:
+            content = message.content or ""
+            messages.append({"role": "assistant", "content": content})
+            await on_event({"type": "complete", "content": content})
+            return
+
+        messages.append({
+            "role": "assistant",
+            "content": message.content or "",
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+                for tc in message.tool_calls
+            ],
+        })
+        tool_calls = message.tool_calls
+
+        pending_multimodal: list = []
+        for tc in tool_calls:
+            fn_name = tc.function.name
+            try:
+                fn_args = json.loads(tc.function.arguments)
+            except json.JSONDecodeError:
+                fn_args = {}
+            tool_call_id = tc.id
+
+            await on_event({"type": "tool_call", "tool": fn_name, "args": fn_args})
+            if session_id:
+                _save_tool_trace(session_id, "tool_call", {"tool": fn_name, "args": fn_args})
+
+            # LLM turns can run for many seconds. Re-resolve the principal at
+            # the actual execution boundary so a demotion, disable, or key
+            # revocation that happened after the prompt was built wins.
+            principal_ref[0] = refresh_auth_principal(principal_ref[0])
+            live_role = principal_ref[0].get("role") if principal_ref[0] else None
+
+            # If the orchestrator is delegating report-spec generation to GPT-6.1 Sol,
+            # surface the handoff in the UI.
+            will_delegate_to_report_specialist = (
+                tool_allowed(fn_name, live_role)
+                and fn_name in ("create_custom_analytics_report", "update_custom_analytics_report")
+                and not fn_args.get("report")
+                and not fn_args.get("data_requests")
+            )
+            if will_delegate_to_report_specialist:
+                await on_event({
+                    "type": "llm_provider",
+                    "provider": "openai",
+                    "model": _report_specialist_model(),
+                    "role": "report_specialist",
+                })
+
+            handler = tool_handlers.get(fn_name)
+            # The model's tool list and prompt are not authorization controls.
+            # Check the caller at execution even for invented or replayed calls.
+            if not tool_allowed(fn_name, live_role):
+                result = tool_permission_error(fn_name, live_role)
+                success = False
+            elif not handler:
+                result = {"error": f"Unknown tool: {fn_name}"}
+                success = False
+            else:
+                try:
+                    result = await asyncio.to_thread(handler, fn_args)
+                    success = not (isinstance(result, dict) and ("error" in result or result.get("ok") is False or result.get("failed", 0)))
+                except Exception as e:
+                    result = {"error": str(e)}
+                    success = False
+
+            # Pull any multimodal content out of the tool result before serializing.
+            # retrieve_chat_attachment returns a {"_multimodal_content": {...}} block
+            # which we inject as a fresh user message so the LLM can "see" the file.
+            multimodal_block = None
+            if isinstance(result, dict):
+                multimodal_block = result.pop("_multimodal_content", None)
+
+            result_str = json.dumps(result, default=str)
+            summary = result_str[:500] + "..." if len(result_str) > 500 else result_str
+
+            event_payload: dict = {
+                "type": "tool_result",
+                "tool": fn_name,
+                "success": success,
+                "summary": summary,
+            }
+            if isinstance(result, dict):
+                event_payload["warnings"] = (result.get("_validation") or {}).get("warnings", [])
+                if not success:
+                    event_payload["error"] = result.get("error") or "One or more operations failed; inspect the tool result."
+            # Surface the report id so the sidebar can flash the specific draft.
+            if (
+                success
+                and fn_name in ("create_custom_analytics_report", "update_custom_analytics_report")
+                and isinstance(result, dict)
+                and result.get("id")
+            ):
+                event_payload["report_id"] = result["id"]
+            if fn_name == "generate_document_pdf":
+                event_payload["document_request"] = {key: fn_args.get(key) for key in ("doctype", "name")}
+            if success and fn_name == "generate_document_pdf" and isinstance(result, dict) and result.get("artifact_id"):
+                event_payload["document"] = result
+            if session_id:
+                _save_tool_trace(session_id, "tool_result", {**event_payload, "result": result})
+            await on_event(event_payload)
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": result_str[:50000],
+            })
+
+            if multimodal_block:
+                pending_multimodal.append(multimodal_block)
+
+        # After this batch of tool calls, inject any retrieved attachments as
+        # a new user message so the LLM can actually see them on the next turn.
+        if pending_multimodal:
+            messages.append({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Here are the attachments you requested:"},
+                    *pending_multimodal,
+                ],
+            })
+
+    # Step cap reached. The canned "check the results above" is a dead end on the
+    # API channel — the REST surface returns only this final text, so there is no
+    # "above" for a headless orchestrator. Ask the model for ONE tool-free wrap-up
+    # that states concretely what was and wasn't changed, so the caller can react.
+    # Demo visitors keep the canned text (no spend outside the per-iteration
+    # reservations); any failure falls back to the canned text.
+    content = "I've reached the maximum number of reasoning steps. Here's what I've done so far — please check the results above."
+    if not demo_mode:
+        try:
+            wrap, usage = await asyncio.to_thread(
+                _orchestrator_turn,
+                openai_client,
+                messages + [{
+                    "role": "user",
+                    "content": (
+                        "You hit the step limit before finishing. In the user's language, state "
+                        "concretely: (1) what you changed (which documents/records, with amounts), "
+                        "(2) what you did NOT get done and why, (3) the current state of the affected "
+                        "record(s) as far as you know it. Be specific — names and numbers. This text "
+                        "stands alone: do NOT refer to 'the results above' or to earlier messages."
+                    ),
+                }],
+                build_tools(user_info, native_chat=True),
+                2048,
+                tool_choice="none",
+            )
+            demo_limiter.settle(
+                None, actual_cost_usd=cost_of_openai_call(ORCHESTRATOR_MODEL, usage),
+                ip=client_ip or "unknown", role=user_role, provider="openai",
+                model=ORCHESTRATOR_MODEL,
+                prompt_tokens=int(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0,
+                completion_tokens=int(getattr(usage, "completion_tokens", 0) or 0) if usage else 0,
+                session_id=session_id,
+            )
+            wrap_text = (wrap.content or "").strip()
+            if wrap_text:
+                content = wrap_text
+        except Exception:
+            pass
+    messages.append({"role": "assistant", "content": content})
+    await on_event({"type": "complete", "content": content})
+
+
+# ---------------------------------------------------------------------------
+# Speech-to-text (voice → text)
+# ---------------------------------------------------------------------------
+
+# Domain-vocabulary biasing for the transcription `prompt`. A bare term list,
+# NO language constraint — the spoken language is auto-detected, and a
+# locale-derived hint would mis-transcribe users who speak another language
+# than their UI. Swiss German transcribes to Standard German on its own, which
+# is what the thinking loop wants. These are the ERP terms short utterances
+# otherwise mangle.
+VOICE_TRANSCRIBE_PROMPT = (
+    "Lambda, ERP, Offerte, Angebot, Auftrag, Rechnung, Gutschrift, Beleg, "
+    "Lieferschein, Bestellung, Zahlung, Buchung, Kunde, Lieferant, Artikel, "
+    "Lager, Konto, Kostenstelle, quotation, sales order, invoice, credit note, "
+    "purchase order, payment, journal entry, customer, supplier, item, warehouse"
+)
+
+# Below this the API rejects the clip as "too short"; we treat it as a no-op
+# (the user tapped the mic by accident) rather than an error.
+_MIN_TRANSCRIBE_BYTES = 1500  # ~1s of webm/opus at the ~1.5 KB/s we assume below
+
+
+def transcribe_audio(audio_bytes: bytes, audio_format: str, api_key: str) -> str:
+    """Transcribe audio to text via OpenAI gpt-4o-transcribe.
+
+    Returns the transcript, or "" when the model detects silence/near-silence
+    (empty result or a prompt-echo hallucination on a near-silent clip).
+    Raises on an actual API error so the caller can surface it.
+    """
+    client = OpenAI(api_key=api_key, timeout=httpx.Timeout(60.0, connect=10.0))
+
+    audio_file = io.BytesIO(audio_bytes)
+    audio_file.name = f"voice.{audio_format or 'webm'}"
+
+    transcription = client.audio.transcriptions.create(
+        model="gpt-4o-transcribe",
+        file=audio_file,
+        response_format="json",
+        prompt=VOICE_TRANSCRIBE_PROMPT,
+    )
+
+    text = (getattr(transcription, "text", "") or "").strip()
+    if len(text) < 2:
+        return ""
+
+    # Prompt-echo guard: on silent/noise audio, prompt-biased transcription
+    # tends to hallucinate the biasing vocabulary back. If (nearly) every word
+    # of the transcript is drawn from the prompt itself, it's an echo, not
+    # speech — real utterances carry verbs/objects outside the glossary.
+    prompt_tokens = set(re.findall(r"[\w'-]+", VOICE_TRANSCRIBE_PROMPT.lower()))
+    text_tokens = re.findall(r"[\w'-]+", text.lower())
+    if text_tokens:
+        coverage = sum(1 for tok in text_tokens if tok in prompt_tokens) / len(text_tokens)
+        if coverage >= 0.8:
+            return ""
+
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Shared agent-turn driver (used by both the WebSocket chat and the REST API)
+# ---------------------------------------------------------------------------
+
+
+async def run_session_turn(
+    session_id: str,
+    user_content: str,
+    user_info: dict | None,
+    on_event,
+    *,
+    attachment_ids: list | None = None,
+    attachments_user_id: str | None = None,
+    client_ip: str | None = None,
+    replay_history: bool = True,
+    channel: str = "web",
+    on_assistant_message=None,
+    on_title=None,
+) -> str | None:
+    """Run one agent turn for a session; return the assistant's reply text.
+
+    Wraps the transport-agnostic ``run_thinking_loop`` with message building,
+    persistence, and first-reply title generation, so the WebSocket chat and the
+    REST chat API share one code path.
+
+    ``replay_history`` is the single statefulness knob:
+      - True  -> LLM context is the session's recent history (normal chat).
+      - False -> context is ONLY the current user message; prior turns are not
+        replayed (stateless REST default). The turn is still persisted by the
+        caller for audit — it just isn't fed back to the model.
+
+    ``channel`` selects the link/formatting guidance in the system prompt:
+      - "web" (default) -> the reader is a browser inside the ERP; clickable
+        web-relative links (`/app/…`, `/masters/…`) are used.
+      - "api"           -> the reply is relayed to an external app (the chat API);
+        the agent names records in plain text and only emits the canonical PDF
+        reference the caller re-delivers as an attachment.
+
+    Hooks (all optional, async):
+      - ``on_event(event)``            streamed loop events (WS -> socket; REST -> no-op)
+      - ``on_assistant_message(sid, content)``  fired after the reply is persisted
+      - ``on_title(sid, title)``       fired after a first-reply title is generated
+    """
+    is_first_reply = count_assistant_messages(session_id) == 0
+
+    messages = [{"role": "system", "content": build_system_prompt(user_info, channel=channel)}]
+
+    if replay_history:
+        conversation = build_conversation(session_id, limit=20)
+    else:
+        # Stateless: only the current user message, no prior turns replayed.
+        conversation = [{"role": "user", "content": user_content}]
+
+    # Multimodal attachments: replace the last user message with a content array
+    # (image/PDF inline, Office via Files-API file_id) so the LLM can see them.
+    # build_multimodal_content may upload an Office file to the Files API, so run
+    # the whole build off the event loop in a worker thread.
+    if attachment_ids and attachments_user_id:
+        from api.attachments import get_attachments_by_ids, build_multimodal_content
+        atts = get_attachments_by_ids(attachment_ids, attachments_user_id)
+        if atts and conversation and conversation[-1].get("role") == "user":
+            text = conversation[-1].get("content") or ""
+
+            def _build_attachment_parts():
+                parts = []
+                if text:
+                    parts.append({"type": "text", "text": text})
+                for att in atts:
+                    parts.append(build_multimodal_content(att))
+                return parts
+
+            conversation[-1] = {"role": "user", "content": await asyncio.to_thread(_build_attachment_parts)}
+
+    messages.extend(conversation)
+
+    generated_files = []
+
+    async def pdf_events(event):
+        if event.get('type') == 'tool_result' and event.get('tool') == 'generate_document_pdf' and event.get('success') and event.get('document'):
+            generated_files.append(event['document'])
+        await on_event(event)
+
+    await run_thinking_loop(
+        messages, pdf_events,
+        session_id=session_id,
+        user_info=user_info,
+        client_ip=client_ip,
+    )
+
+    assistant_content = None
+    for msg in reversed(messages):
+        if msg.get("role") == "assistant" and msg.get("content"):
+            assistant_content = msg["content"]
+            allowed_urls = {d[key] for d in generated_files for key in ('download_url', 'pdf_url')}
+            pdf_pattern = r"/api/(?:v1/)?documents/[^\s`<>)]*/pdf(?:\?[^\s`<>)]*)?"
+            ungenerated = []
+            def verified_link(match):
+                if match.group(0) in allowed_urls:
+                    return match.group(0)
+                ungenerated.append(match.group(0))
+                return '[PDF not generated]'
+            assistant_content = re.sub(pdf_pattern, verified_link, assistant_content)
+            if ungenerated:
+                event = {'type': 'tool_result', 'tool': 'generate_document_pdf', 'success': False,
+                         'error': 'The reply referenced a PDF that was not generated. Generate the file before offering it.', 'warnings': [], 'document_request': {'doctype': None, 'name': None}}
+                await on_event(event)
+                _save_tool_trace(session_id, 'tool_result', event)
+            save_chat_message(session_id, "assistant", assistant_content)
+            if on_assistant_message:
+                await on_assistant_message(session_id, assistant_content)
+            break
+
+    if is_first_reply and assistant_content:
+        async def _gen_and_notify():
+            await generate_title(
+                session_id,
+                user_content,
+                assistant_content,
+                client_ip=client_ip,
+                user_role=(user_info or {}).get("role"),
+            )
+            if on_title:
+                session = get_session(session_id)
+                if session:
+                    await on_title(session_id, session["title"])
+        asyncio.create_task(_gen_and_notify())
+
+    return assistant_content
+
+
+# ---------------------------------------------------------------------------
+# WebSocket endpoint
+# ---------------------------------------------------------------------------
+
+
+async def chat_websocket(
+    websocket: WebSocket,
+    user_info: dict | None = None,
+    client_ip: str | None = None,
+):
+    """Handle a shared WebSocket chat connection across sessions."""
+    await websocket.accept()
+    ws_user_id = user_info.get("name") if user_info else None
+    ws_user_role = user_info.get("role") if user_info else None
+
+    session_tasks: dict[str, asyncio.Task] = {}
+    demo_typing_waiters: dict[str, tuple[int, asyncio.Future]] = {}
+    send_lock = asyncio.Lock()
+
+    async def send_event(event_type: str, request_id: str | None = None, **payload):
+        event = {"type": event_type, **payload}
+        if request_id:
+            event["request_id"] = request_id
+        try:
+            async with send_lock:
+                await websocket.send_json(event)
+        except Exception:
+            pass
+
+    async def send_error(content: str, request_id: str | None = None, session_id: str | None = None):
+        payload = {"content": content}
+        if session_id:
+            payload["session_id"] = session_id
+        await send_event("error", request_id=request_id, **payload)
+
+    async def send_message_added(
+        session_id: str,
+        role: str,
+        content: str,
+        created_at: str | None = None,
+        attachments: list | None = None,
+    ):
+        await send_event(
+            "message_added",
+            session_id=session_id,
+            message=serialize_chat_message(role, content, created_at, attachments),
+        )
+
+    async def replay_demo_session(target_session_id: str):
+        try:
+            demo_script = load_demo_script()
+            demo_messages = load_demo_history(target_session_id)
+            message_idx = 0
+
+            for entry in demo_script:
+                role = entry.get("role")
+                content = str(entry.get("content", ""))
+                stored_message = demo_messages[message_idx] if message_idx < len(demo_messages) else None
+                created_at = stored_message.get("created_at") if stored_message else None
+                rendered_content = stored_message.get("content", content) if stored_message else content
+
+                if role == "user":
+                    typing_ms = min(DEMO_TYPE_INITIAL_MS + len(rendered_content) * DEMO_TYPE_MS_PER_CHAR, 6000)
+                    typing_seq = uuid.uuid4().int & 0x7FFFFFFF
+                    typing_waiter = asyncio.get_running_loop().create_future()
+                    demo_typing_waiters[target_session_id] = (typing_seq, typing_waiter)
+                    await send_event(
+                        "demo_typing",
+                        session_id=target_session_id,
+                        role=role,
+                        content=rendered_content,
+                        typing_ms=typing_ms,
+                        seq=typing_seq,
+                    )
+                    try:
+                        await asyncio.wait_for(typing_waiter, timeout=(typing_ms + 4000) / 1000)
+                    except asyncio.TimeoutError:
+                        pass
+                    finally:
+                        if demo_typing_waiters.get(target_session_id, (None,))[0] == typing_seq:
+                            demo_typing_waiters.pop(target_session_id, None)
+                    await asyncio.sleep(DEMO_AFTER_TYPED_USER_MS / 1000)
+                else:
+                    await asyncio.sleep(0.6)
+
+                await send_message_added(target_session_id, role, rendered_content, created_at)
+                message_idx += 1
+
+                flash = entry.get("flash")
+                if isinstance(flash, dict):
+                    group = str(flash.get("group", "")).strip()
+                    item = str(flash.get("item", "")).strip()
+                    if group:
+                        payload = {"group": group}
+                        if item:
+                            payload["item"] = item
+                        await send_event("navigation_flash", session_id=target_session_id, **payload)
+
+                await asyncio.sleep(0.35 if role == "user" else 0.75)
+
+            await send_event("demo_replay_complete", session_id=target_session_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            await send_error(str(e), session_id=target_session_id)
+        finally:
+            session_tasks.pop(target_session_id, None)
+
+    async def process_session_message(target_session_id: str, user_content: str, attachment_ids: list | None = None):
+        try:
+            async def on_event(event: dict):
+                await send_event(event["type"], session_id=target_session_id, **{
+                    key: value for key, value in event.items() if key != "type"
+                })
+
+            async def on_assistant_message(sid: str, content: str):
+                await send_message_added(sid, "assistant", content)
+
+            async def on_title(sid: str, title: str):
+                await send_event("session_title_updated", session_id=sid, title=title)
+
+            await run_session_turn(
+                target_session_id, user_content, user_info, on_event,
+                attachment_ids=attachment_ids,
+                attachments_user_id=ws_user_id,
+                client_ip=client_ip,
+                replay_history=True,
+                on_assistant_message=on_assistant_message,
+                on_title=on_title,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            await send_error(str(e), session_id=target_session_id)
+        finally:
+            session_tasks.pop(target_session_id, None)
+
+    try:
+        await send_event("sessions_list", sessions=list_sessions(user_id=ws_user_id, role=ws_user_role))
+
+        while True:
+            raw = await websocket.receive_text()
+            live_principal = refresh_auth_principal(user_info)
+            if not live_principal:
+                await send_error("Your account is no longer active. Please sign in again.")
+                await websocket.close(code=4001, reason="Authentication no longer valid")
+                return
+            user_info = live_principal
+            ws_user_role = live_principal.get("role")
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                await send_error("Invalid JSON")
+                continue
+
+            msg_type = data.get("type")
+            request_id = data.get("request_id")
+
+            if msg_type == "list_sessions":
+                await send_event("sessions_list", request_id=request_id, sessions=list_sessions(user_id=ws_user_id, role=ws_user_role))
+                continue
+
+            if msg_type == "create_session":
+                session = create_session(user_id=ws_user_id)
+                await send_event("session_created", request_id=request_id, session=session)
+                continue
+
+            if msg_type in ("load_history", "join_session"):
+                session_id = data.get("session_id")
+                if not session_id:
+                    await send_error("No session_id provided", request_id=request_id)
+                    continue
+
+                session = get_session(session_id)
+                if not can_access_session(session, user_info):
+                    await send_error(f"Session {session_id} not found", request_id=request_id, session_id=session_id)
+                    continue
+
+                # Pagination: "before_id" for loading older messages; default page size 20.
+                before_id = data.get("before_id")
+                page_size = int(data.get("limit") or 20)
+                page = load_serialized_chat_history(session_id, limit=page_size, before_id=before_id)
+
+                await send_event(
+                    "history_loaded",
+                    request_id=request_id,
+                    session_id=session_id,
+                    title=session["title"],
+                    messages=page["messages"],
+                    has_more=page["has_more"],
+                    oldest_id=page["oldest_id"],
+                    before_id=before_id,
+                )
+                continue
+
+            if msg_type == "delete_session":
+                session_id = data.get("session_id")
+                if not session_id:
+                    await send_error("No session_id provided", request_id=request_id)
+                    continue
+                session = get_session(session_id)
+                if not can_access_session(session, user_info):
+                    await send_error("Session not found", request_id=request_id, session_id=session_id)
+                    continue
+
+                active_task = session_tasks.get(session_id)
+                if active_task and not active_task.done():
+                    await send_error(
+                        "Wait for the current response to finish before deleting this chat.",
+                        request_id=request_id,
+                        session_id=session_id,
+                    )
+                    continue
+
+                delete_session(session_id)
+                await send_event("session_deleted", request_id=request_id, session_id=session_id)
+                continue
+
+            if msg_type == "clear_history":
+                session_id = data.get("session_id")
+                if not session_id:
+                    await send_error("No session_id provided", request_id=request_id)
+                    continue
+                session = get_session(session_id)
+                if not can_access_session(session, user_info):
+                    await send_error("Session not found", request_id=request_id, session_id=session_id)
+                    continue
+
+                active_task = session_tasks.get(session_id)
+                if active_task and not active_task.done():
+                    await send_error(
+                        "Wait for the current response to finish before clearing this chat.",
+                        request_id=request_id,
+                        session_id=session_id,
+                    )
+                    continue
+
+                clear_chat_history(session_id)
+                await send_event("history_cleared", request_id=request_id, session_id=session_id)
+                continue
+
+            if msg_type == "demo_typing_done":
+                session_id = data.get("session_id")
+                seq = data.get("seq")
+                if not session_id or not isinstance(seq, int):
+                    await send_error("Invalid demo typing completion event", request_id=request_id, session_id=session_id)
+                    continue
+
+                waiter_info = demo_typing_waiters.get(session_id)
+                if waiter_info and waiter_info[0] == seq and not waiter_info[1].done():
+                    waiter_info[1].set_result(True)
+                continue
+
+            if msg_type == "start_demo":
+                session_id = data.get("session_id")
+                if not session_id:
+                    await send_error("No session_id provided", request_id=request_id)
+                    continue
+
+                if not user_info or user_info.get("role") != "public_manager":
+                    await send_error("Demo replay is only available in public demo mode.", request_id=request_id, session_id=session_id)
+                    continue
+
+                session = get_session(session_id)
+                if not session:
+                    await send_error(f"Session {session_id} not found", request_id=request_id, session_id=session_id)
+                    continue
+
+                if session.get("user_id") != ws_user_id:
+                    await send_error("Session not found", request_id=request_id, session_id=session_id)
+                    continue
+
+                active_task = session_tasks.get(session_id)
+                if active_task and not active_task.done():
+                    await send_error(
+                        "Wait for the current response to finish before starting the demo.",
+                        request_id=request_id,
+                        session_id=session_id,
+                    )
+                    continue
+
+                # Refuse to overwrite a session that already contains real
+                # (non-demo) user/assistant messages.
+                non_demo_rows = get_db().sql(
+                    'SELECT COUNT(*) as cnt FROM "Chat Message" '
+                    'WHERE session_id = ? AND message_type != \'demo\'',
+                    [session_id],
+                )
+                if non_demo_rows and non_demo_rows[0]["cnt"] > 0:
+                    await send_error(
+                        "This chat already contains non-demo messages.",
+                        request_id=request_id,
+                        session_id=session_id,
+                    )
+                    continue
+
+
+                # Always re-seed the demo messages so template or Settings
+                # updates show up on the next replay. Without this, stale
+                # placeholder values (e.g. empty customer names from an older
+                # bootstrap) would be baked into the DB forever.
+                db = get_db()
+                db.sql(
+                    'DELETE FROM "Chat Message" '
+                    'WHERE session_id = ? AND message_type = \'demo\'',
+                    [session_id],
+                )
+                db.conn.commit()
+                for message in load_demo_script():
+                    save_chat_message(session_id, message["role"], message["content"], message_type="demo")
+
+                session = get_session(session_id)
+                await send_event("demo_started", request_id=request_id, session_id=session_id, title=session["title"] if session else "New Chat")
+                session_tasks[session_id] = asyncio.create_task(replay_demo_session(session_id))
+                continue
+
+            if msg_type == "transcribe":
+                # Voice → text: transcribe a recorded clip and return the text
+                # for the composer. No LLM turn here — the user reviews/edits
+                # the text and sends it like any typed message.
+                openai_api_key = os.environ.get("OPENAI_API_KEY", "")
+                if not openai_api_key or openai_api_key == "sk-your-key-here":
+                    await send_event(
+                        "transcription_result", request_id=request_id,
+                        success=False, error="Speech-to-text is not available (OPENAI_API_KEY not configured).",
+                    )
+                    continue
+
+                # Demo visitors are rate-limited the same way as LLM turns — a
+                # paid OpenAI call still costs money. Block before transcribing.
+                if is_demo_role(ws_user_role) and client_ip:
+                    blocked = demo_limiter.check(client_ip)
+                    if blocked:
+                        await send_event(
+                            "transcription_result", request_id=request_id,
+                            success=False, error=blocked,
+                        )
+                        continue
+
+                audio_b64 = data.get("audio_data") or ""
+                audio_format = (data.get("audio_format") or "webm").lower()
+                try:
+                    audio_bytes = base64.b64decode(audio_b64) if audio_b64 else b""
+                except Exception:
+                    audio_bytes = b""
+
+                if len(audio_bytes) < _MIN_TRANSCRIBE_BYTES:
+                    # Too short to be speech (accidental tap) — treat as empty,
+                    # no API call, no cost.
+                    await send_event(
+                        "transcription_result", request_id=request_id,
+                        success=True, text="",
+                    )
+                    continue
+
+                try:
+                    text = await asyncio.to_thread(
+                        transcribe_audio, audio_bytes, audio_format, openai_api_key,
+                    )
+                except Exception as e:
+                    logger.warning("Transcription failed: %s", e)
+                    await send_event(
+                        "transcription_result", request_id=request_id,
+                        success=False, error="Transcription failed. Please try again.",
+                    )
+                    continue
+
+                # Track the spend. Audio duration is estimated from byte size
+                # (~1.5 KB/s for webm/opus); the Demo Spend Log records every
+                # role for the admin dashboard, and counts public_manager rows
+                # against the hourly cap.
+                estimated_seconds = len(audio_bytes) / 1500
+                demo_limiter.record(
+                    client_ip or "unknown",
+                    cost_of_transcription("gpt-4o-transcribe", estimated_seconds),
+                    role=ws_user_role,
+                    provider="openai",
+                    model="gpt-4o-transcribe",
+                    session_id=data.get("session_id"),
+                )
+
+                await send_event(
+                    "transcription_result", request_id=request_id,
+                    success=True, text=text,
+                )
+                continue
+
+            if msg_type != "send_message":
+                await send_error(f"Unknown message type: {msg_type}", request_id=request_id)
+                continue
+
+            session_id = data.get("session_id")
+            if not session_id:
+                await send_error("No session_id provided", request_id=request_id)
+                continue
+
+            session = get_session(session_id)
+            if not can_access_session(session, user_info):
+                await send_error(f"Session {session_id} not found", request_id=request_id, session_id=session_id)
+                continue
+
+            active_task = session_tasks.get(session_id)
+            if active_task and not active_task.done():
+                await send_error(
+                    "Wait for the current response to finish before sending another message.",
+                    request_id=request_id,
+                    session_id=session_id,
+                )
+                continue
+
+            user_content = data.get("content", "").strip()
+            attachment_ids = data.get("attachment_ids") or []
+            if not isinstance(attachment_ids, list):
+                attachment_ids = []
+            # Cap attachments at 5 per message
+            attachment_ids = [str(a) for a in attachment_ids[:5]]
+            if is_demo_role(ws_user_role) and len(attachment_ids) > 1:
+                await send_error(
+                    "Demo mode allows at most 1 attachment per message.",
+                    request_id=request_id,
+                    session_id=session_id,
+                )
+                continue
+
+            if not user_content and not attachment_ids:
+                await send_error("Message content cannot be empty.", request_id=request_id, session_id=session_id)
+                continue
+
+            # Demo-only: cap raw message length BEFORE the LLM sees it.
+            # The per-call `max_completion_tokens` already bounds output
+            # cost, but input tokens are uncapped — a pasted 100k-char
+            # wall would otherwise burn the global hourly budget in a
+            # single turn. Reject rather than truncate so the visitor
+            # knows what happened.
+            if is_demo_role(ws_user_role):
+                max_chars = demo_max_message_chars()
+                if len(user_content) > max_chars:
+                    await send_error(
+                        f"Demo messages are limited to {max_chars} characters "
+                        f"(your message is {len(user_content):,}). Please shorten it and try again.",
+                        request_id=request_id,
+                        session_id=session_id,
+                    )
+                    continue
+
+            # Short-circuit rate-limited demo visitors before we persist
+            # the user message and kick off the LLM task. `run_thinking_loop`
+            # re-checks on every iteration — this is just the friendly UX path.
+            if is_demo_role(ws_user_role) and client_ip:
+                blocked = demo_limiter.check(client_ip)
+                if blocked:
+                    await send_error(blocked, request_id=request_id, session_id=session_id)
+                    continue
+
+            # Resolve attachment metadata for persistence + display
+            from api.attachments import list_session_attachments
+            session_attachments = {
+                a["id"]: a for a in list_session_attachments(session_id, ws_user_id or "")
+            } if ws_user_id else {}
+            attached_meta = [
+                {
+                    "id": aid,
+                    "filename": session_attachments[aid]["filename"],
+                    "mime_type": session_attachments[aid]["mime_type"],
+                }
+                for aid in attachment_ids
+                if aid in session_attachments
+            ]
+
+            save_chat_message(
+                session_id, "user", user_content or "",
+                metadata={"attachments": attached_meta} if attached_meta else None,
+            )
+            await send_message_added(
+                session_id, "user", user_content or "",
+                attachments=attached_meta if attached_meta else None,
+            )
+
+            # Emit the thinking indicator eagerly. The async task below still
+            # has to read history, build the system prompt, and call the LLM
+            # before run_thinking_loop fires its own "thinking" event, and on
+            # a freshly-seeded 3-year DB that gap is visibly long. Sending it
+            # up-front gives the user immediate UI feedback.
+            await send_event("thinking", session_id=session_id, iteration=1)
+
+            session_tasks[session_id] = asyncio.create_task(
+                process_session_message(session_id, user_content, attachment_ids)
+            )
+
+    except WebSocketDisconnect:
+        for task in session_tasks.values():
+            task.cancel()
+    except Exception as e:
+        await send_error(str(e))

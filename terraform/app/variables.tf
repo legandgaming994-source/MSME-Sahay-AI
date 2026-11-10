@@ -1,0 +1,173 @@
+variable "subscription_id" {
+  description = "Azure subscription ID"
+  type        = string
+}
+
+variable "location" {
+  description = "Azure region. northeurope (Dublin) balances EU + US-East latency well."
+  type        = string
+  default     = "northeurope"
+}
+
+variable "project_name" {
+  description = "Base name/prefix for resources"
+  type        = string
+  default     = "lambda-erp-demo"
+}
+
+# --------------------------------------------------------------------------
+# Container Apps
+# --------------------------------------------------------------------------
+
+variable "acr_repo" {
+  description = "ACR repository (image name) for the FastAPI + frontend container. The GitHub Actions workflow pushes here as `<repo>:<git-sha>` on every deploy."
+  type        = string
+  default     = "lambda-erp"
+}
+
+# Chicken-and-egg: on the very first `terraform apply`, ACR exists but no
+# image has been pushed yet, so the container app can't start. Use a
+# public Microsoft quickstart image as the bootstrap placeholder. The
+# container_app resource's `ignore_changes = [template.0.container.0.image]`
+# means terraform sets this once at creation and never fights CI after
+# that. GitHub Actions then rolls the real image on the first push to
+# master via `az containerapp update --image <sha>`.
+variable "initial_bootstrap_image" {
+  description = "Image used on first terraform apply, before CI has pushed anything to ACR. Azure's own quickstart image is ~10 MB and pulls from a public registry."
+  type        = string
+  default     = "mcr.microsoft.com/k8se/quickstart:latest"
+}
+
+variable "cpu" {
+  description = "vCPU per replica (ACA Consumption supports 0.25 / 0.5 / 0.75 / 1.0 / ...)"
+  type        = number
+  default     = 1.0
+}
+
+variable "memory" {
+  description = "Memory per replica (must match CPU ratio — e.g. 1.0 CPU → 2Gi)"
+  type        = string
+  default     = "2Gi"
+}
+
+variable "target_port" {
+  description = "Port that uvicorn/FastAPI listens on inside the container"
+  type        = number
+  default     = 8000
+}
+
+variable "health_probe_path" {
+  description = "HTTP path used by startup/liveness probes. /api/auth/setup-status is public and cheap."
+  type        = string
+  default     = "/api/auth/setup-status"
+}
+
+# --------------------------------------------------------------------------
+# App secrets — GitHub Actions rewrites the placeholder values after apply.
+# --------------------------------------------------------------------------
+
+variable "openai_api_key" {
+  description = "OpenAI API key used by the chat tool-calling loop"
+  type        = string
+  sensitive   = true
+  default     = "placeholder-will-be-set-by-github-actions"
+}
+
+variable "report_specialist_model" {
+  description = "OpenAI model used by the custom-report specialist"
+  type        = string
+  default     = "gpt-5.6-terra"
+}
+
+variable "jwt_secret_key" {
+  description = "Secret key used to sign JWT cookies"
+  type        = string
+  sensitive   = true
+  default     = "placeholder-will-be-set-by-github-actions"
+}
+
+variable "admin_email" {
+  description = "Email of the admin account seeded at boot (LAMBDA_ERP_ADMIN_EMAIL). Not secret, but set via GitHub Actions alongside the password."
+  type        = string
+  default     = "placeholder-will-be-set-by-github-actions"
+}
+
+variable "admin_password" {
+  description = "Password for the boot-seeded admin account (LAMBDA_ERP_ADMIN_PASSWORD). Sourced from a GitHub Secret."
+  type        = string
+  sensitive   = true
+  default     = "placeholder-will-be-set-by-github-actions"
+}
+
+# --------------------------------------------------------------------------
+# Demo spend guardrails
+#
+# The public demo is backed by our OpenAI key, so visitor
+# traffic costs us real money. Two sliding 1-hour windows inside the app
+# cap spend: a global bucket across all visitors, and a per-IP bucket.
+# Defaults: $10/hr global ($240/day cap), with per-IP pinned at the
+# previous absolute cap (~$0.52/hr) so a single actor can't monopolize
+# the larger global budget.
+# --------------------------------------------------------------------------
+
+variable "demo_global_hourly_usd" {
+  description = "Global demo spend cap per hour in USD (sliding window). Default = $10/hr ($240/day)."
+  type        = number
+  default     = 10.0
+}
+
+variable "demo_per_ip_hourly_usd" {
+  description = "Per-IP demo spend cap per hour in USD (sliding window). Default = ~$0.52/hr (the previous absolute cap)."
+  type        = number
+  default     = 0.5208
+}
+
+variable "demo_max_completion_tokens" {
+  description = "Cap on `max_completion_tokens` for each LLM call made by a public_manager (demo) session. Lower = tighter upper bound on per-turn cost."
+  type        = number
+  default     = 1024
+}
+
+variable "demo_max_message_chars" {
+  description = "Reject chat messages from public_manager sessions longer than this many characters. Guards against a pasted wall of text exhausting the hourly budget in a single call."
+  type        = number
+  default     = 300
+}
+
+variable "demo_max_attachment_bytes" {
+  description = "Reject chat-attachment uploads from public_manager sessions larger than this many bytes. Defaults to 100 KiB; attachments are base64-expanded into prompt tokens, so even a few MB can blow the hourly budget on a single message."
+  type        = number
+  default     = 102400
+}
+
+# --------------------------------------------------------------------------
+# Custom domain (optional — set to null to skip)
+# --------------------------------------------------------------------------
+
+variable "custom_domain" {
+  description = "Custom domain for the demo (e.g. erp-demo.lambda.dev). Set null to skip binding."
+  type        = string
+  default     = null
+}
+
+# --------------------------------------------------------------------------
+# GitHub OIDC — lets CI deploy without long-lived secrets
+# --------------------------------------------------------------------------
+
+variable "github_org" {
+  description = "GitHub organization or username that owns the lambda-erp repo"
+  type        = string
+  default     = "lambdadevelopment"
+}
+
+variable "github_repo" {
+  description = "GitHub repository name"
+  type        = string
+  default     = "lambda-erp"
+}
+
+variable "github_branches" {
+  description = "Branches that may deploy via OIDC federation"
+  type        = list(string)
+  default     = ["master"]
+}

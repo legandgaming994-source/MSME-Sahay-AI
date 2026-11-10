@@ -1,0 +1,41 @@
+{
+  "source": "INTERNAL_GUIDANCE",
+  "notice": "Preparation prompts written for this platform. They are NOT an official list of requirements for any return; confirm against the current GST portal instructions.",
+  "forms": {
+    "GSTR-1": [
+      {"key": "outward_register", "label": "Outward supplies reconciled to approved sales invoices", "required": true},
+      {"key": "buyer_gstin", "label": "Buyer GSTINs on B2B invoices checked", "required": true},
+      {"key": "credit_debit_notes", "label": "Credit and debit notes for the period reviewed", "required": true},
+      {"key": "hsn_summary", "label": "HSN/SAC summary prepared where applicable", "required": false}
+    ],
+    "IFF": [
+      {"key": "outward_register", "label": "B2B outward supplies for the month reviewed", "required": true}
+    ],
+    "GSTR-3B": [
+      {"key": "outward_tax", "label": "Outward taxable value and tax reviewed against approved invoices", "required": true},
+      {"key": "inward_itc", "label": "Input tax credit reviewed against supplier invoices", "required": true},
+      {"key": "itc_eligibility", "label": "ITC eligibility and blocked credits assessed by a responsible person", "required": true},
+      {"key": "tax_payment", "label": "Tax payable and payment method decided", "required": true},
+      {"key": "reverse_charge", "label": "Reverse-charge supplies considered", "required": false}
+    ],
+    "PMT-06": [
+      {"key": "tax_payment", "label": "Challan amount decided and payment prepared", "required": true}
+    ],
+    "CMP-08": [
+      {"key": "turnover", "label": "Quarter turnover and tax computed", "required": true},
+      {"key": "tax_payment", "label": "Payment prepared", "required": true}
+    ],
+    "GSTR-4": [
+      {"key": "annual_turnover", "label": "Annual turnover and tax paid reconciled", "required": true},
+      {"key": "inward_summary", "label": "Inward supplies summary prepared", "required": true}
+    ],
+    "GSTR-9": [
+      {"key": "books_reconciled", "label": "Year's returns reconciled to books", "required": true},
+      {"key": "itc_reconciled", "label": "ITC reconciled to supplier data", "required": true},
+      {"key": "differences", "label": "Differences explained", "required": true}
+    ]
+  },
+  "default": [
+    {"key": "prepared", "label": "Preparation completed", "required": true}
+  ]
+}

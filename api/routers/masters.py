@@ -1,0 +1,811 @@
+"""Master data CRUD: Customer, Supplier, Item, Warehouse, Account, Company."""
+
+import re
+import secrets
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from lambda_erp.database import get_db
+from lambda_erp.utils import _dict, now
+# The per-type registries live in api.services so `register_master` can extend
+# them; imported here (not moved) so existing `from api.routers.masters import
+# MASTER_IDENTITY_ALIAS`-style imports keep working.
+from api.services import (
+    MASTER_TABLES, MASTER_NAME_PREFIXES, MASTER_NAME_DIGITS, MASTER_RANDOM_NAME_TYPES,
+    MASTER_IDENTITY_ALIAS,
+    MASTER_REFERENCE_CHECKS,
+    _filter_atom, _search_clause, _where_from_filters,
+    list_master_records, master_search_columns, parse_list_filter, master_field_aliases,
+)
+from api.auth import require_role, require_non_public_manager
+from api.list_values import distinct_list_values
+from api.time_filters import request_time_filter, resolve_time_filter, time_predicate
+from lambda_erp.exceptions import ValidationError
+from lambda_erp.validation import missing
+
+router = APIRouter(prefix="/masters", tags=["masters"])
+
+_viewer = Depends(require_role("viewer"))
+_manager = Depends(require_non_public_manager)
+_admin = Depends(require_role("admin"))
+
+
+def _echo_identity_alias(master_type: str, row):
+    """Mirror the master's `name` back under its intuitive alias (item_code)."""
+    if isinstance(row, dict):
+        for alias, column in master_field_aliases(master_type).items():
+            if row.get(column) is not None:
+                row[alias] = row[column]
+    return row
+
+DELETE_REFERENCE_CHECKS = {
+    "company": [
+        ('SELECT 1 FROM "Account" WHERE company = ? LIMIT 1', "account"),
+        ('SELECT 1 FROM "Cost Center" WHERE company = ? LIMIT 1', "cost center"),
+        ('SELECT 1 FROM "Warehouse" WHERE company = ? LIMIT 1', "warehouse"),
+        ('SELECT 1 FROM "Fiscal Year" WHERE company = ? LIMIT 1', "fiscal year"),
+        ('SELECT 1 FROM "Tax Template" WHERE company = ? LIMIT 1', "tax template"),
+        ('SELECT 1 FROM "GL Entry" WHERE company = ? LIMIT 1', "GL entry"),
+        ('SELECT 1 FROM "Quotation" WHERE company = ? LIMIT 1', "quotation"),
+        ('SELECT 1 FROM "Sales Order" WHERE company = ? LIMIT 1', "sales order"),
+        ('SELECT 1 FROM "Purchase Order" WHERE company = ? LIMIT 1', "purchase order"),
+        ('SELECT 1 FROM "Sales Invoice" WHERE company = ? LIMIT 1', "sales invoice"),
+        ('SELECT 1 FROM "Purchase Invoice" WHERE company = ? LIMIT 1', "purchase invoice"),
+        ('SELECT 1 FROM "Payment Entry" WHERE company = ? LIMIT 1', "payment entry"),
+        ('SELECT 1 FROM "Journal Entry" WHERE company = ? LIMIT 1', "journal entry"),
+        ('SELECT 1 FROM "Stock Entry" WHERE company = ? LIMIT 1', "stock entry"),
+        ('SELECT 1 FROM "Delivery Note" WHERE company = ? LIMIT 1', "delivery note"),
+        ('SELECT 1 FROM "Purchase Receipt" WHERE company = ? LIMIT 1', "purchase receipt"),
+        ('SELECT 1 FROM "POS Invoice" WHERE company = ? LIMIT 1', "POS invoice"),
+        ('SELECT 1 FROM "Budget" WHERE company = ? LIMIT 1', "budget"),
+        ('SELECT 1 FROM "Subscription" WHERE company = ? LIMIT 1', "subscription"),
+        ('SELECT 1 FROM "Bank Transaction" t JOIN "Bank Account" a ON a.name = t.bank_account WHERE a.company = ? LIMIT 1', "bank transaction"),
+    ],
+    "customer": [
+        ('SELECT 1 FROM "Quotation" WHERE customer = ? LIMIT 1', "quotation"),
+        ('SELECT 1 FROM "Sales Order" WHERE customer = ? LIMIT 1', "sales order"),
+        ('SELECT 1 FROM "Sales Invoice" WHERE customer = ? LIMIT 1', "sales invoice"),
+        ('SELECT 1 FROM "Delivery Note" WHERE customer = ? LIMIT 1', "delivery note"),
+        ('SELECT 1 FROM "POS Invoice" WHERE customer = ? LIMIT 1', "POS invoice"),
+        ('SELECT 1 FROM "Payment Entry" WHERE party_type = \'Customer\' AND party = ? LIMIT 1', "payment entry"),
+        ('SELECT 1 FROM "Subscription" WHERE party_type = \'Customer\' AND party = ? LIMIT 1', "subscription"),
+        ('SELECT 1 FROM "Item Price" WHERE customer = ? LIMIT 1', "item price"),
+        ('SELECT 1 FROM "Pricing Rule" WHERE customer = ? LIMIT 1', "pricing rule"),
+    ],
+    "supplier": [
+        ('SELECT 1 FROM "Purchase Order" WHERE supplier = ? LIMIT 1', "purchase order"),
+        ('SELECT 1 FROM "Purchase Invoice" WHERE supplier = ? LIMIT 1', "purchase invoice"),
+        ('SELECT 1 FROM "Purchase Receipt" WHERE supplier = ? LIMIT 1', "purchase receipt"),
+        ('SELECT 1 FROM "Payment Entry" WHERE party_type = \'Supplier\' AND party = ? LIMIT 1', "payment entry"),
+        ('SELECT 1 FROM "Subscription" WHERE party_type = \'Supplier\' AND party = ? LIMIT 1', "subscription"),
+    ],
+    "item": [
+        ('SELECT 1 FROM "Quotation Item" WHERE item_code = ? LIMIT 1', "quotation item"),
+        ('SELECT 1 FROM "Sales Order Item" WHERE item_code = ? LIMIT 1', "sales order item"),
+        ('SELECT 1 FROM "Purchase Order Item" WHERE item_code = ? LIMIT 1', "purchase order item"),
+        ('SELECT 1 FROM "Delivery Note Item" WHERE item_code = ? LIMIT 1', "delivery note item"),
+        ('SELECT 1 FROM "Purchase Receipt Item" WHERE item_code = ? LIMIT 1', "purchase receipt item"),
+        ('SELECT 1 FROM "Sales Invoice Item" WHERE item_code = ? LIMIT 1', "sales invoice item"),
+        ('SELECT 1 FROM "Purchase Invoice Item" WHERE item_code = ? LIMIT 1', "purchase invoice item"),
+        ('SELECT 1 FROM "POS Invoice Item" WHERE item_code = ? LIMIT 1', "POS invoice item"),
+        ('SELECT 1 FROM "Stock Entry Detail" WHERE item_code = ? LIMIT 1', "stock entry item"),
+        ('SELECT 1 FROM "Stock Ledger Entry" WHERE item_code = ? LIMIT 1', "stock ledger entry"),
+        ('SELECT 1 FROM "Bin" WHERE item_code = ? LIMIT 1', "bin"),
+        ('SELECT 1 FROM "Pricing Rule" WHERE item_code = ? LIMIT 1', "pricing rule"),
+        ('SELECT 1 FROM "Item Price" WHERE item_code = ? LIMIT 1', "item price"),
+        ('SELECT 1 FROM "Subscription Plan" WHERE item_code = ? LIMIT 1', "subscription plan"),
+        ('SELECT 1 FROM "Asset" WHERE item_code = ? LIMIT 1', "asset"),
+        ('SELECT 1 FROM "Reservation" WHERE item_code = ? LIMIT 1', "reservation"),
+    ],
+    "warehouse": [
+        ('SELECT 1 FROM "Item" WHERE default_warehouse = ? LIMIT 1', "item"),
+        ('SELECT 1 FROM "Warehouse" WHERE parent_warehouse = ? LIMIT 1', "child warehouse"),
+        ('SELECT 1 FROM "Quotation Item" WHERE warehouse = ? LIMIT 1', "quotation item"),
+        ('SELECT 1 FROM "Sales Order Item" WHERE warehouse = ? LIMIT 1', "sales order item"),
+        ('SELECT 1 FROM "Purchase Order Item" WHERE warehouse = ? LIMIT 1', "purchase order item"),
+        ('SELECT 1 FROM "Delivery Note Item" WHERE warehouse = ? LIMIT 1', "delivery note item"),
+        ('SELECT 1 FROM "Purchase Receipt Item" WHERE warehouse = ? LIMIT 1', "purchase receipt item"),
+        ('SELECT 1 FROM "Sales Invoice Item" WHERE warehouse = ? LIMIT 1', "sales invoice item"),
+        ('SELECT 1 FROM "Purchase Invoice Item" WHERE warehouse = ? LIMIT 1', "purchase invoice item"),
+        ('SELECT 1 FROM "POS Invoice Item" WHERE warehouse = ? LIMIT 1', "POS invoice item"),
+        ('SELECT 1 FROM "Stock Entry" WHERE from_warehouse = ? OR to_warehouse = ? LIMIT 1', "stock entry"),
+        ('SELECT 1 FROM "Stock Entry Detail" WHERE s_warehouse = ? OR t_warehouse = ? LIMIT 1', "stock entry item"),
+        ('SELECT 1 FROM "Stock Ledger Entry" WHERE warehouse = ? LIMIT 1', "stock ledger entry"),
+        ('SELECT 1 FROM "Bin" WHERE warehouse = ? LIMIT 1', "bin"),
+        ('SELECT 1 FROM "Asset" WHERE warehouse = ? LIMIT 1', "asset"),
+        ('SELECT 1 FROM "Reservation" WHERE warehouse = ? LIMIT 1', "reservation"),
+    ],
+    "account": [
+        ('SELECT 1 FROM "Account" WHERE parent_account = ? LIMIT 1', "child account"),
+        ('SELECT 1 FROM "Cost Center" WHERE parent_cost_center = ? LIMIT 1', "cost center"),  # defensive, should not match normally
+        ('SELECT 1 FROM "GL Entry" WHERE account = ? LIMIT 1', "GL entry"),
+        ('SELECT 1 FROM "Journal Entry Account" WHERE account = ? LIMIT 1', "journal entry account"),
+        ('SELECT 1 FROM "Payment Entry" WHERE paid_from = ? OR paid_to = ? LIMIT 1', "payment entry"),
+        ('SELECT 1 FROM "Sales Taxes and Charges" WHERE account_head = ? LIMIT 1', "tax row"),
+        ('SELECT 1 FROM "Tax Template Detail" WHERE account_head = ? LIMIT 1', "tax template detail"),
+        ('SELECT 1 FROM "Company" WHERE round_off_account = ? OR default_receivable_account = ? OR default_payable_account = ? OR default_income_account = ? OR default_expense_account = ? OR stock_received_but_not_billed = ? OR stock_adjustment_account = ? OR accumulated_depreciation_account = ? OR depreciation_expense_account = ? LIMIT 1', "company"),
+        ('SELECT 1 FROM "Warehouse" WHERE account = ? LIMIT 1', "warehouse"),
+        ('SELECT 1 FROM "Budget" WHERE account = ? LIMIT 1', "budget"),
+        ('SELECT 1 FROM "Bank Transaction" WHERE bank_account = ? LIMIT 1', "bank transaction"),
+    ],
+    "cost-center": [
+        ('SELECT 1 FROM "Cost Center" WHERE parent_cost_center = ? LIMIT 1', "child cost center"),
+        ('SELECT 1 FROM "GL Entry" WHERE cost_center = ? LIMIT 1', "GL entry"),
+        ('SELECT 1 FROM "Journal Entry Account" WHERE cost_center = ? LIMIT 1', "journal entry account"),
+        ('SELECT 1 FROM "Sales Invoice Item" WHERE cost_center = ? LIMIT 1', "sales invoice item"),
+        ('SELECT 1 FROM "Purchase Invoice Item" WHERE cost_center = ? LIMIT 1', "purchase invoice item"),
+        ('SELECT 1 FROM "POS Invoice Item" WHERE cost_center = ? LIMIT 1', "POS invoice item"),
+        ('SELECT 1 FROM "Company" WHERE default_cost_center = ? OR round_off_cost_center = ? LIMIT 1', "company"),
+        ('SELECT 1 FROM "Budget" WHERE cost_center = ? LIMIT 1', "budget"),
+    ],
+}
+
+
+def _get_table(master_type: str):
+    entry = MASTER_TABLES.get(master_type)
+    if not entry:
+        return None, None
+    return entry  # (doctype, name_field)
+
+
+def _with_active_filter(db, doctype: str, filters: dict | None = None) -> dict | None:
+    effective = dict(filters or {})
+    if "disabled" in db._get_table_columns(doctype) and "disabled" not in effective:
+        effective["disabled"] = 0
+    return effective or None
+
+
+def _find_reference(master_type: str, name: str) -> str | None:
+    db = get_db()
+    checks = [
+        *DELETE_REFERENCE_CHECKS.get(master_type, []),
+        *MASTER_REFERENCE_CHECKS.get(master_type, []),
+    ]
+    for query, label in checks:
+        params = [name] if query.count("?") == 1 else [name] * query.count("?")
+        try:
+            if db.sql(query, params):
+                return label
+        except Exception:
+            continue
+    return None
+
+
+def _generate_master_name(db, doctype: str, prefix: str, digits: int = 3) -> str:
+    # Take the highest numeric suffix among strict "PREFIX-<digits>" names.
+    # Names with a non-numeric tail (e.g. a custom "ITEM-COST-TEST") are ignored
+    # rather than parsed — string-sorting them to the top used to reset the
+    # counter to 001 and collide with an existing record.
+    rows = db.sql(
+        f'SELECT name FROM "{doctype}" WHERE name LIKE ?',
+        [f"{prefix}-%"],
+    )
+    pattern = re.compile(rf"^{re.escape(prefix)}-(\d+)$")
+    max_number = 0
+    for row in rows:
+        match = pattern.match(row["name"] or "")
+        if match:
+            max_number = max(max_number, int(match.group(1)))
+
+    # Skip any number already taken by a non-standard name so we never collide.
+    number = max_number + 1
+    while db.exists(doctype, f"{prefix}-{number:0{digits}d}"):
+        number += 1
+    return f"{prefix}-{number:0{digits}d}"
+
+
+def _generate_random_master_name(db, doctype: str, prefix: str) -> str:
+    """Opaque, index-scale id for high-volume registered masters."""
+    while True:
+        name = f"{prefix}-{secrets.token_hex(8).upper()}"
+        if not db.exists(doctype, name):
+            return name
+
+
+def _normalize_master_data(data: dict) -> dict:
+    normalized = _dict(data)
+    for key, value in list(normalized.items()):
+        # Flag columns (disabled, is_group, …) are INTEGER, not boolean. The chat
+        # may send a JSON bool; coerce true/false -> 1/0 so e.g. re-enabling an
+        # account with {"disabled": false} actually persists (on Postgres a bool
+        # into an INTEGER column errors, which then gets narrated as "done"). Check
+        # bool BEFORE int — in Python bool is a subclass of int.
+        if isinstance(value, bool):
+            normalized[key] = int(value)
+        elif isinstance(value, str) and value.strip() == "":
+            normalized[key] = None
+    return normalized
+
+
+MASTER_LINK_FIELDS = {
+    'customer': {'default_price_list': 'Price List'},
+    'company': {'default_price_list': 'Price List'},
+    'item': {'default_warehouse': 'Warehouse'},
+    'warehouse': {'company': 'Company', 'account': 'Account', 'parent_warehouse': 'Warehouse'},
+    'account': {'company': 'Company', 'parent_account': 'Account'},
+    'cost-center': {'company': 'Company', 'parent_cost_center': 'Cost Center'},
+}
+
+
+def master_requirements(master_type):
+    from api import services
+    doctype, display = _get_table(master_type)
+    if doctype in services.DOCUMENT_CLASSES:
+        from lambda_erp.validation import document_requirements
+        return document_requirements(services.DOCUMENT_CLASSES[doctype])
+    from lambda_erp.master_integrity import structure_requirements, STRUCTURAL_FIELDS
+    return {'required': [display], 'conditional': ['Unknown input fields are rejected; supplied links must exist.'] + structure_requirements(master_type), 'children': {},
+            'structural_fields': list(STRUCTURAL_FIELDS.get(master_type, ()))}
+
+
+def _structural_reference(master_type, doctype, name):
+    """Check declared links too; new document types inherit reference protection.
+
+    Unlike best-effort delete diagnostics, validation must not swallow SQL
+    failures and then approve a structural change.
+    """
+    from api import services
+    db = get_db()
+    links = set()
+    for cls in services.DOCUMENT_CLASSES.values():
+        links.update((cls.DOCTYPE, field) for field, target in cls.LINK_FIELDS.items() if target == doctype)
+        for key, fields in cls.CHILD_LINK_FIELDS.items():
+            links.update((cls.CHILD_TABLES[key][0], field) for field, target in fields.items() if target == doctype)
+    for kind, fields in MASTER_LINK_FIELDS.items():
+        table, _ = _get_table(kind)
+        links.update((table, field) for field, target in fields.items() if target == doctype)
+    for table, field in sorted(links):
+        # Some declarations validate transient/defaulted inputs. Only stored
+        # columns can carry a persistent reference (SQLite masks missing ones).
+        if field not in db._get_table_columns(table):
+            continue
+        if db.sql(f'SELECT name FROM "{table}" WHERE "{field}" = ? LIMIT 1', [name]):
+            return f'{table}.{field}'
+    for query, label in [*DELETE_REFERENCE_CHECKS.get(master_type, []), *MASTER_REFERENCE_CHECKS.get(master_type, [])]:
+        if db.sql(query, [name] * query.count('?')):
+            return label
+    return None
+
+
+def _validate_master_input(master_type, doctype, data, name=None):
+    db = get_db()
+    allowed = db._get_table_columns(doctype)
+    unknown = set(data) - allowed
+    if unknown:
+        raise ValidationError(f'{doctype}: Unknown field(s): {", ".join(sorted(unknown))}. Use get_master_fields.')
+    if name and data.get('name') not in (None, name):
+        raise ValidationError('Cannot change master identity; create a new record instead')
+    merged = dict(db.get_value(doctype, name, list(allowed)) or {}) if name else {}
+    merged.update(data)
+    for field in master_requirements(master_type)['required']:
+        if missing(merged.get(field)):
+            raise ValidationError(f'{doctype}: {field} is required')
+    for field, table in MASTER_LINK_FIELDS.get(master_type, {}).items():
+        if merged.get(field) and not db.exists(table, merged[field]):
+            raise ValidationError(f'{doctype}: {field} must reference an existing {table}')
+    if master_type == 'company' and data.get('default_sales_tax_template'):
+        template = db.get_value('Tax Template', data['default_sales_tax_template'], ['company', 'tax_type'])
+        if not template or template['company'] != (name or data.get('name')) or template['tax_type'] != 'Sales':
+            raise ValidationError('Default sales tax template must be a Sales template belonging to this Company')
+
+
+@router.get('/company/{name}/sales-tax-templates')
+def company_sales_tax_templates(name: str, _user: dict = _viewer):
+    """Choices for the company default, using existing tax templates only."""
+    db = get_db()
+    if not db.exists('Company', name):
+        raise HTTPException(status_code=404, detail='Company not found')
+    return db.get_all('Tax Template', filters={'company': name, 'tax_type': 'Sales'},
+                      fields=['name', 'title'], order_by='title, name')
+
+
+def create_master_record(master_type: str, data: dict) -> dict:
+    with get_db().atomic():
+        return _create_master_record(master_type, data)
+
+
+def _create_master_record(master_type: str, data: dict) -> dict:
+    doctype, _ = _get_table(master_type)
+    if not doctype:
+        raise HTTPException(status_code=404, detail=f"Unknown master type: {master_type}")
+
+    db = get_db()
+    doc = _normalize_master_data(data)
+    doc.pop("creation", None)
+    doc.pop("modified", None)
+
+    # Let callers set the code under its intuitive alias (item_code -> name).
+    # Conflicting identities must never silently select one of the records.
+    for alias in master_field_aliases(master_type):
+        alias_val = doc.pop(alias, None)
+        if alias_val and doc.get("name") and alias_val != doc["name"]:
+            raise ValidationError(f"Conflicting name and {alias}; both must identify the same {master_type}")
+        if alias_val and not doc.get("name"):
+            doc["name"] = alias_val
+
+    if not doc.get("name"):
+        prefix = MASTER_NAME_PREFIXES.get(master_type)
+        if prefix:
+            if master_type in MASTER_RANDOM_NAME_TYPES:
+                doc["name"] = _generate_random_master_name(db, doctype, prefix)
+            else:
+                doc["name"] = _generate_master_name(
+                    db, doctype, prefix, MASTER_NAME_DIGITS.get(master_type, 3)
+                )
+        elif master_type == "company" and doc.get("company_name"):
+            # A company's id is conventionally its name (mirrors /setup/company).
+            doc["name"] = doc["company_name"]
+        else:
+            raise HTTPException(status_code=422, detail="Name is required")
+
+    if db.exists(doctype, doc["name"]):
+        raise HTTPException(status_code=409, detail=f"{doctype} {doc['name']} already exists")
+
+    from api import services
+    if doctype in services.DOCUMENT_CLASSES:
+        return _echo_identity_alias(master_type, services.create_document(services.DOCTYPE_TO_SLUG[doctype], doc))
+
+    _validate_master_input(master_type, doctype, doc)
+
+    columns = db._get_table_columns(doctype)
+    stamp = now()
+    if "creation" in columns and not doc.get("creation"):
+        doc["creation"] = stamp
+    if "modified" in columns and not doc.get("modified"):
+        doc["modified"] = stamp
+
+    # Party masters inherit the company's base currency when none is specified.
+    # Otherwise the Customer/Supplier default_currency column default ('USD')
+    # wins, so a non-USD company (e.g. CHF) gets USD customers that then force
+    # every sales/purchase document to USD (and fail with no USD->base rate).
+    if master_type in ("customer", "supplier") and not doc.get("default_currency"):
+        companies = db.get_all("Company", fields=["name", "default_currency"], limit=1)
+        if companies:
+            doc["default_currency"] = companies[0].get("default_currency") or "USD"
+
+    db.insert(doctype, doc)
+    row = db.get_all(doctype, filters={"name": doc["name"]}, fields=["*"])[0]
+    return _echo_identity_alias(master_type, row)
+
+
+def update_master_record(master_type: str, name: str, data: dict) -> dict:
+    from lambda_erp.master_integrity import STRUCTURAL_FIELDS
+    exclusive = bool(set(data) & set(STRUCTURAL_FIELDS.get(master_type, ())))
+    with get_db().atomic(exclusive_master_edit=exclusive):
+        return _update_master_record(master_type, name, data)
+
+
+def _update_master_record(master_type: str, name: str, data: dict) -> dict:
+    doctype, _ = _get_table(master_type)
+    if not doctype:
+        raise HTTPException(status_code=404, detail=f"Unknown master type: {master_type}")
+
+    db = get_db()
+    normalized = _normalize_master_data(data)
+    normalized.pop("creation", None)
+    normalized.pop("modified", None)
+
+    # The alias (item_code) is the identity, not a mutable column. Allow it as a
+    # no-op when it matches the record being updated, but reject a rename — the
+    # code is a primary key referenced across every transaction.
+    for alias in master_field_aliases(master_type):
+        alias_val = normalized.pop(alias, None)
+        if alias_val and alias_val != name:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Cannot change a {master_type}'s {alias} ('{name}' -> '{alias_val}') — "
+                    f"it is the record's identity. Create a new {master_type} with the desired code instead."
+                ),
+            )
+
+    if normalized.get('name') not in (None, name):
+        raise ValidationError('Cannot change master identity; create a new record instead')
+    from api import services
+    if doctype in services.DOCUMENT_CLASSES:
+        return _echo_identity_alias(master_type, services.update_document(services.DOCTYPE_TO_SLUG[doctype], name, normalized))
+
+    update_fields = {k: v for k, v in normalized.items() if k != "name"}
+    if not db.exists(doctype, name):
+        raise HTTPException(status_code=404, detail=f"{doctype} {name} not found")
+    _validate_master_input(master_type, doctype, normalized, name)
+    from lambda_erp.master_integrity import structural_changes
+    stored = db.get_value(doctype, name, list(db._get_table_columns(doctype)))
+    changed = structural_changes(master_type, stored, normalized)
+    if changed:
+        reference = _structural_reference(master_type, doctype, name)
+        if reference:
+            raise ValidationError(f'{doctype} {name}: cannot change structural fields {", ".join(changed)}; referenced by {reference}. Use a new master or a deliberate migration.')
+    if "modified" in db._get_table_columns(doctype) and "modified" not in update_fields:
+        update_fields["modified"] = now()
+    if update_fields:
+        db.set_value(doctype, name, update_fields)
+
+    rows = db.get_all(doctype, filters={"name": name}, fields=["*"])
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"{doctype} {name} not found")
+    return _echo_identity_alias(master_type, rows[0])
+
+
+# Query params list_masters consumes itself — anything else is treated as an
+# ad-hoc field filter (validated against the master's real columns). Plain keys
+# are exact; text columns additionally support the explicit ``__contains``
+# suffix used by Smart Search.
+_MASTER_LIST_RESERVED = {
+    "limit", "offset", "include_disabled", "search", "search_fields", "fields",
+    "order_by", "order", "time_filter",
+}
+
+
+def _master_list_where(db, doctype: str, master_type: str, request: Request,
+                       include_disabled: bool, search: str | None,
+                       search_fields: str | None) -> tuple[list, list, set]:
+    """Build the validated WHERE clause shared by master list and adjacent.
+
+    Keeping this in one place is what makes detail prev/next follow the exact
+    search and field filters of the list the user opened the record from.
+    """
+    columns = db._get_table_columns(doctype)
+    where_parts: list = []
+    params: list = []
+
+    active = None if include_disabled else _with_active_filter(db, doctype)
+    if active:
+        wp, ps = _where_from_filters(active)
+        where_parts += wp
+        params += ps
+
+    for field, parsed_value in _master_request_filters(db, doctype, request, master_type).items():
+        clause, clause_params = _filter_atom(field, parsed_value)
+        where_parts.append(clause)
+        params.extend(clause_params)
+
+    if search:
+        requested = [f.strip() for f in (search_fields or "").split(",") if f.strip()]
+        aliases = master_field_aliases(master_type)
+        requested = list(dict.fromkeys(aliases.get(f, f) for f in requested))
+        unknown = [f for f in requested if f not in columns]
+        if unknown:
+            raise HTTPException(status_code=400, detail=f"Unknown search field(s): {', '.join(unknown)}")
+        sf = requested or master_search_columns(db, doctype)
+        clause, sp = _search_clause(db, doctype, master_type, search, sf)
+        if clause:
+            where_parts.append(clause)
+            params += sp
+
+    try:
+        window = resolve_time_filter(db, doctype, request_time_filter(request))
+        if window:
+            if window["field"] in _master_request_filters(db, doctype, request, master_type):
+                raise ValueError("Do not combine time_filter with a filter on the same timestamp field")
+            clause, bounds = time_predicate(window)
+            where_parts.append(clause)
+            params.extend(bounds)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return where_parts, params, columns
+
+
+def _master_request_filters(db, doctype: str, request: Request, master_type: str) -> dict:
+    """Parse the REST query-string field filters into the shared internal form."""
+    filters = {}
+    aliases = master_field_aliases(master_type)
+    for key, value in request.query_params.items():
+        if key in _MASTER_LIST_RESERVED:
+            continue
+        try:
+            suffix = "__contains" if key.endswith("__contains") else ""
+            base = key[:-len(suffix)] if suffix else key
+            field, parsed_value = parse_list_filter(db, doctype, aliases.get(base, base) + suffix, value)
+        except KeyError:
+            raise HTTPException(status_code=400, detail=f"Unknown filter field: {key}")
+        except TypeError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Contains filter is only supported for text fields: {key}",
+            )
+        if field in filters and filters[field] != parsed_value:
+            raise HTTPException(status_code=400, detail=f"Conflicting filters for {field} and its alias")
+        filters[field] = parsed_value
+    return filters
+
+
+def _master_order(columns: set, order_by: str | None, order: str) -> tuple[str, str]:
+    if order_by is not None and order_by not in columns:
+        raise HTTPException(status_code=400, detail=f"Unknown order_by field: {order_by}")
+    direction = order.lower()
+    if direction not in ("asc", "desc"):
+        raise HTTPException(status_code=400, detail="order must be 'asc' or 'desc'")
+    # Reference masters retain their historical default: stable ID order.
+    return order_by or "name", direction if order_by else "asc"
+
+
+def _master_order_sql(column: str, direction: str, *, reverse: bool = False, expression: str | None = None) -> str:
+    """Deterministic master ordering with NULL values consistently at the end."""
+    effective = direction
+    nulls = "LAST"
+    if reverse:
+        effective = "desc" if direction == "asc" else "asc"
+        nulls = "FIRST"
+    expression = expression or f'"{column}"'
+    sql = f'{expression} {effective.upper()}'
+    if column != "name":
+        sql += f" NULLS {nulls}, name {effective.upper()}"
+    return sql
+
+
+@router.get("/{master_type}/filter-values")
+def master_filter_values(
+    master_type: str,
+    field: str,
+    q: str = "",
+    limit: int = Query(default=200, ge=1, le=200),
+    _user: dict = _viewer,
+):
+    """Distinct non-empty values of one column — populates a master-list filter
+    dropdown. Capped; the field is validated against real columns."""
+    doctype, _ = _get_table(master_type)
+    if not doctype:
+        raise HTTPException(status_code=404, detail=f"Unknown master type: {master_type}")
+    db = get_db()
+    try:
+        values = distinct_list_values(db, doctype, master_field_aliases(master_type).get(field, field), q, limit)
+    except KeyError:
+        raise HTTPException(status_code=400, detail=f"Unknown field: {field}")
+    return {"values": values}
+
+
+@router.get("/{master_type}")
+def list_masters(
+    master_type: str,
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+    include_disabled: bool = False,
+    search: str | None = None,
+    search_fields: str | None = None,
+    fields: str | None = None,
+    time_filter: str | None = None,
+    order_by: str | None = None,
+    order: str = "asc",
+    _user: dict = _viewer,
+):
+    doctype, _ = _get_table(master_type)
+    if not doctype:
+        return {"detail": f"Unknown master type: {master_type}"}
+    db = get_db()
+    field_filters = _master_request_filters(db, doctype, request, master_type)
+    requested_search_fields = [
+        field.strip() for field in (search_fields or "").split(",") if field.strip()
+    ]
+    requested_fields = [field.strip() for field in (fields or "").split(",") if field.strip()]
+    try:
+        return list_master_records(
+            master_type,
+            filters=field_filters,
+            search=search,
+            search_fields=requested_search_fields or None,
+            include_disabled=include_disabled,
+            order_by=order_by,
+            order=order,
+            limit=limit,
+            offset=offset,
+            fields=requested_fields or None,
+            time_filter=request_time_filter(request),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/{master_type}/search")
+def search_masters(master_type: str, q: str = "", _user: dict = _viewer):
+    doctype, name_field = _get_table(master_type)
+    if not doctype:
+        return []
+    db = get_db()
+    active_prefix = 'disabled = 0 AND ' if "disabled" in db._get_table_columns(doctype) else ""
+    if not q:
+        return db.get_all(doctype, filters=_with_active_filter(db, doctype), fields=["name", name_field], limit=10)
+
+    # Case-INSENSITIVE: on Postgres plain LIKE is case-sensitive, so "plus medica"
+    # would miss "Plus Medica AG". LOWER(...) LIKE LOWER(...) is portable (SQLite
+    # + Postgres) and matches how the document search (_search_clause) works.
+    rows = db.sql(
+        f'SELECT name, "{name_field}" FROM "{doctype}" '
+        f'WHERE {active_prefix}(LOWER(name) LIKE LOWER(?) OR LOWER("{name_field}") LIKE LOWER(?)) LIMIT 10',
+        [f"%{q}%", f"%{q}%"],
+    )
+    return rows
+
+
+@router.get("/{master_type}/{name}/adjacent")
+def adjacent_master(
+    master_type: str,
+    name: str,
+    request: Request,
+    include_disabled: bool = False,
+    search: str | None = None,
+    search_fields: str | None = None,
+    order_by: str | None = None,
+    order: str = "asc",
+    _user: dict = _viewer,
+):
+    """Records immediately before/after ``name`` in the current master list.
+
+    Search, equality filters, disabled visibility, and ordering are shared with
+    ``list_masters``. Keyset predicates keep navigation proportional to one
+    index lookup rather than numbering the entire result set.
+    """
+    doctype, _ = _get_table(master_type)
+    if not doctype:
+        raise HTTPException(status_code=404, detail=f"Unknown master type: {master_type}")
+    db = get_db()
+    where_parts, params, columns = _master_list_where(
+        db, doctype, master_type, request, include_disabled, search, search_fields,
+    )
+    window = resolve_time_filter(db, doctype, request_time_filter(request))
+    order_by = master_field_aliases(master_type).get(order_by, order_by)
+    sort_column, sort_direction = _master_order(columns, order_by or (window["field"] if window else None), order)
+    sort_expression = f'"{sort_column}"'
+    if window and sort_column == window["field"]:
+        sort_expression = f'erp_timestamp_epoch({sort_expression})'
+    base_where = (" AND ".join(where_parts)) if where_parts else "1 = 1"
+    current_rows = db.sql(
+        f'SELECT {sort_expression} AS sort_value FROM "{doctype}" '
+        f"WHERE {base_where} AND name = ? LIMIT 1",
+        [*params, name],
+    )
+    if not current_rows:
+        return {"prev": None, "next": None}
+    current_value = current_rows[0]["sort_value"]
+
+    def neighbor(toward: str):
+        after = toward == "next"
+        same_cmp = ">" if sort_direction == "asc" else "<"
+        primary_cmp = same_cmp
+        if not after:
+            same_cmp = "<" if same_cmp == ">" else ">"
+            primary_cmp = "<" if primary_cmp == ">" else ">"
+
+        if sort_column == "name":
+            keyset = f'name {same_cmp} ?'
+            key_params = [name]
+        elif current_value is None:
+            if after:
+                keyset = f'{sort_expression} IS NULL AND name {same_cmp} ?'
+            else:
+                keyset = (
+                    f'({sort_expression} IS NOT NULL OR '
+                    f'({sort_expression} IS NULL AND name {same_cmp} ?))'
+                )
+            key_params = [name]
+        else:
+            keyset = (
+                f'({sort_expression} {primary_cmp} ? OR '
+                f'({sort_expression} = ? AND name {same_cmp} ?)'
+            )
+            key_params = [current_value, current_value, name]
+            if after:
+                keyset += f' OR {sort_expression} IS NULL'
+            keyset += ")"
+
+        rows = db.sql(
+            f'SELECT name FROM "{doctype}" WHERE {base_where} AND {keyset} '
+            f'ORDER BY {_master_order_sql(sort_column, sort_direction, reverse=not after, expression=sort_expression)} LIMIT 1',
+            [*params, *key_params],
+        )
+        return rows[0]["name"] if rows else None
+
+    return {"prev": neighbor("prev"), "next": neighbor("next")}
+
+
+@router.get("/{master_type}/fields")
+def master_fields(master_type: str, _user: dict = _viewer):
+    if not _get_table(master_type)[0]:
+        raise HTTPException(status_code=404, detail=f"Unknown master type: {master_type}")
+    from api.chat import _handle_get_master_fields
+    return _handle_get_master_fields({'master_type': master_type})
+
+
+@router.get("/{master_type}/{name}")
+def get_master(master_type: str, name: str, _user: dict = _viewer):
+    doctype, _ = _get_table(master_type)
+    if not doctype:
+        return {"detail": f"Unknown master type: {master_type}"}
+    db = get_db()
+    rows = db.get_all(doctype, filters={"name": name}, fields=["*"])
+    if not rows:
+        return {"detail": f"{doctype} {name} not found"}
+    return rows[0]
+
+
+@router.post("/{master_type}")
+def create_master(master_type: str, data: dict, _user: dict = _manager):
+    return create_master_record(master_type, data)
+
+
+@router.put("/{master_type}/{name}")
+def update_master(master_type: str, name: str, data: dict, _user: dict = _manager):
+    return update_master_record(master_type, name, data)
+
+
+def delete_master_record(master_type: str, name: str) -> dict:
+    """Delete a master record with reference protection — the ONLY sanctioned
+    delete path (the tables have no FK constraints, so every caller — the REST
+    route below AND the chat agent's delete_master tool — must go through here).
+
+    Unreferenced record → hard delete. Referenced record → auto-disabled instead
+    (when the doctype has a `disabled` column) with the blocking reference named,
+    else a 409. Raising HTTPException keeps route behavior; the chat handler
+    catches it and surfaces `detail` as the tool error.
+    """
+    doctype, _ = _get_table(master_type)
+    if not doctype:
+        raise HTTPException(status_code=422, detail=f"Unknown master type: {master_type}")
+    db = get_db()
+    if not db.exists(doctype, name):
+        raise HTTPException(status_code=404, detail=f"{doctype} {name} not found")
+
+    from api import services
+    if doctype in services.DOCUMENT_CLASSES and 'discarded' in db._get_table_columns(doctype):
+        services.discard_document(services.DOCTYPE_TO_SLUG[doctype], name)
+        return {'ok': True, 'status': 'discarded'}
+
+    reference = _find_reference(master_type, name)
+    if reference:
+        columns = db._get_table_columns(doctype)
+        if "disabled" in columns:
+            db.set_value(doctype, name, {"disabled": 1})
+            return {"ok": True, "status": "disabled", "reason": f"Referenced by {reference}"}
+        raise HTTPException(status_code=409, detail=f"Cannot delete {doctype} {name}: referenced by {reference}")
+
+    db.delete(doctype, name=name)
+    return {"ok": True, "status": "deleted"}
+
+
+@router.delete("/{master_type}/{name}")
+def delete_master(master_type: str, name: str, _user: dict = _admin):
+    return delete_master_record(master_type, name)
+
+
+@router.get("/account/tree")
+def account_tree(company: str | None = None, include_disabled: bool = False,
+                 _user: dict = _viewer):
+    """Return Chart of Accounts as a nested tree.
+
+    Disabled accounts are hidden by default (they already drop out of account
+    pickers, and a disabled account is one the user retired). Pass
+    ``include_disabled=true`` to show them. A disabled *group* is still shown if
+    it has any enabled descendant, so an active account is never hidden behind a
+    disabled parent. Each node carries a ``disabled`` bool for the UI.
+    """
+    db = get_db()
+    filters = {}
+    if company:
+        filters["company"] = company
+    accounts = db.get_all(
+        "Account",
+        filters=filters if filters else None,
+        fields=["name", "account_name", "parent_account", "root_type",
+                "report_type", "account_type", "is_group", "disabled"],
+    )
+
+    by_parent = {}
+    for acc in accounts:
+        parent = acc.get("parent_account") or "__root__"
+        by_parent.setdefault(parent, []).append(acc)
+
+    def _build(parent_name):
+        children = by_parent.get(parent_name, [])
+        result = []
+        for acc in children:
+            node = dict(acc)
+            node["disabled"] = bool(acc.get("disabled"))
+            node["children"] = _build(acc["name"])
+            # Prune a disabled node only when nothing enabled survives beneath it,
+            # so an enabled child is never dropped along with its disabled parent.
+            if not include_disabled and node["disabled"] and not node["children"]:
+                continue
+            result.append(node)
+        return result
+
+    return _build("__root__") or _build(None)

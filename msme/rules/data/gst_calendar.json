@@ -1,0 +1,35 @@
+{
+  "rule_id": "gst-return-calendar",
+  "description": "Statutory default GST return due dates. Government extensions by notification are NOT included; supply them as overrides.",
+  "qrmp_state_categories": {"X": "GSTR-3B due 22nd", "Y": "GSTR-3B due 24th"},
+  "qrmp_state_category_mapping_status": "NOT_VERIFIED_IN_THIS_PASS: caller must supply the category; the engine never infers it from the state name",
+  "versions": [
+    {
+      "version": "default-2021",
+      "effective_from": "2021-04-01",
+      "effective_from_verified": false,
+      "effective_to": null,
+      "filer_types": {
+        "regular_monthly": [
+          {"form": "GSTR-1",  "kind": "monthly_after_period", "day": 11},
+          {"form": "GSTR-3B", "kind": "monthly_after_period", "day": 20},
+          {"form": "GSTR-9",  "kind": "annual", "month": 12, "day": 31, "years_after_fy_end": 0}
+        ],
+        "qrmp": [
+          {"form": "GSTR-1",  "kind": "quarterly_after_quarter", "day": 13},
+          {"form": "GSTR-3B", "kind": "quarterly_after_quarter", "state_category_days": {"X": 22, "Y": 24}},
+          {"form": "PMT-06",  "kind": "monthly_after_period_months_1_2_of_quarter", "day": 25},
+          {"form": "IFF",     "kind": "monthly_after_period_months_1_2_of_quarter", "day": 13, "optional": true},
+          {"form": "GSTR-9",  "kind": "annual", "month": 12, "day": 31, "years_after_fy_end": 0}
+        ],
+        "composition": [
+          {"form": "CMP-08",  "kind": "quarterly_after_quarter", "day": 18},
+          {"form": "GSTR-4",  "kind": "annual", "month": 4, "day": 30, "years_after_fy_end": 0}
+        ]
+      },
+      "qrmp_eligibility_note": "Aggregate turnover up to INR 5 crore in the preceding financial year (secondary sources).",
+      "source": {"title": "GST portal return due-date tutorials / CBIC notifications (summarised by secondary sources)",
+                 "primary_url": "https://www.gst.gov.in", "primary_url_status": "NOT_DEEP_LINKED", "verification": "SECONDARY_ONLY"}
+    }
+  ]
+}

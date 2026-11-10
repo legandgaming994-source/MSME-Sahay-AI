@@ -1,0 +1,801 @@
+// API base URL. Defaults to the relative "/api" (the demo app and most
+// deployments serve the frontend and backend from the same origin). A
+// customer deployment can point the published library at a different backend
+// either at build time (VITE_API_BASE) or at runtime before any request is
+// made (configureApiBase).
+let BASE = (import.meta.env.VITE_API_BASE as string | undefined) ?? "/api";
+
+export function configureApiBase(base: string) {
+  BASE = base.replace(/\/+$/, "");
+}
+
+// The API origin as a browser-navigable URL. Social login is a full-page
+// redirect (not a fetch), so the button must point the browser straight at the
+// backend endpoint — resolving BASE (which may be relative like "/api") against
+// the current origin.
+export function apiUrl(path: string): string {
+  return new URL(`${BASE}${path}`, window.location.origin).toString();
+}
+
+export class ApiError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
+}
+
+function formatErrorDetail(detail: unknown): string {
+  if (!detail) return "Request failed";
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    const parts = detail.map((item) => {
+      if (!item || typeof item !== "object") return String(item);
+      const rec = item as Record<string, unknown>;
+      const loc = Array.isArray(rec.loc) ? rec.loc.join(".") : "";
+      const msg = typeof rec.msg === "string" ? rec.msg : JSON.stringify(rec);
+      return loc ? `${loc}: ${msg}` : msg;
+    });
+    return parts.join("; ");
+  }
+  if (typeof detail === "object") {
+    const rec = detail as Record<string, unknown>;
+    if (typeof rec.message === "string") return rec.message;
+    if (typeof rec.msg === "string") return rec.msg;
+    return JSON.stringify(detail);
+  }
+  return String(detail);
+}
+
+export async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    headers: { "Content-Type": "application/json" },
+    credentials: "include",
+    ...options,
+  });
+  if (!res.ok) {
+    if (res.status === 401 && !path.startsWith("/auth/")) {
+      window.location.href = "/login";
+      throw new ApiError(401, "Session expired");
+    }
+    const body = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new ApiError(res.status, formatErrorDetail(body.detail || body.error_description));
+  }
+  return res.json();
+}
+
+async function multipartRequest<T>(path: string, form: FormData): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    method: "POST",
+    credentials: "include",
+    body: form,
+  });
+  if (!res.ok) {
+    if (res.status === 401) {
+      window.location.href = "/login";
+      throw new ApiError(401, "Session expired");
+    }
+    const body = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new ApiError(res.status, formatErrorDetail(body.detail || body.error_description));
+  }
+  return res.json() as Promise<T>;
+}
+
+export interface BankStatementPreview {
+  statement_key: string;
+  file_name: string;
+  schema_version: string;
+  statement_id: string;
+  account_iban_masked: string;
+  account_name: string | null;
+  account_currency: string;
+  bank_name: string | null;
+  bank_bic: string | null;
+  from_date: string | null;
+  to_date: string | null;
+  opening_balance: string | null;
+  closing_balance: string | null;
+  credit_total: string;
+  debit_total: string;
+  entry_count: number;
+  booked_entry_count: number;
+  detail_count: number;
+  batch_entry_count: number;
+  qr_reference_count: number;
+  duplicate_entry_count: number;
+  already_imported: boolean;
+  existing_import: string | null;
+  matched_bank_account: {
+    name: string;
+    account_name: string;
+    company: string;
+    account: string;
+    currency: string;
+    bank_name: string | null;
+    iban_masked: string;
+  } | null;
+  warnings: string[];
+}
+
+export interface BankStatementImportResult {
+  imports: Array<{
+    name: string;
+    bank_account: string;
+    account_iban_masked: string;
+    imported_entry_count: number;
+    duplicate_entry_count: number;
+    skipped_non_booked_count: number;
+  }>;
+  exact_duplicate_imports: string[];
+}
+
+export interface BankReconciliationTransaction {
+  name: string;
+  bank_account: string;
+  bank_account_id: string;
+  bank_statement_import: string;
+  company: string;
+  base_currency: string;
+  bank_currency: string;
+  posting_date: string;
+  value_date: string | null;
+  deposit: number;
+  withdrawal: number;
+  amount: number;
+  currency: string;
+  description: string | null;
+  remittance_information: string | null;
+  reference_number: string | null;
+  counterparty_name: string | null;
+  counterparty_iban_masked: string;
+  structured_reference: string | null;
+  status: string;
+  reference_doctype: string | null;
+  reference_name: string | null;
+  reconciled_by: string | null;
+  reconciled_at: string | null;
+}
+
+export interface BankInvoiceSuggestion {
+  kind: "invoice";
+  reference_doctype: "Sales Invoice" | "Purchase Invoice";
+  reference_name: string;
+  party_type: "Customer" | "Supplier";
+  party: string;
+  party_name: string;
+  payment_type: "Receive" | "Pay";
+  posting_date: string;
+  due_date: string | null;
+  currency: string;
+  grand_total: number;
+  outstanding_amount: number;
+  suggested_allocation: number;
+  score: number;
+  reasons: string[];
+}
+
+export interface BankVoucherSuggestion {
+  kind: "existing_voucher" | "existing_voucher_group";
+  voucher_type: "Payment Entry" | "Journal Entry";
+  voucher_no: string;
+  posting_date: string;
+  amount: number;
+  currency: string;
+  score: number;
+  reasons: string[];
+  bank_transactions: Array<{
+    name: string;
+    posting_date: string;
+    amount: number;
+    deposit: number;
+    withdrawal: number;
+    counterparty_name: string | null;
+    description: string | null;
+  }>;
+}
+
+export interface BankReconciliationSuggestions {
+  transaction: BankReconciliationTransaction;
+  active_reconciliation: Record<string, any> | null;
+  existing_vouchers: BankVoucherSuggestion[];
+  invoices: BankInvoiceSuggestion[];
+}
+
+function qs(params?: Record<string, string | number | undefined>) {
+  if (!params) return "";
+  const clean = Object.fromEntries(
+    Object.entries(params).filter(([, v]) => v !== undefined && v !== ""),
+  );
+  const s = new URLSearchParams(clean as Record<string, string>).toString();
+  return s ? `?${s}` : "";
+}
+
+// --- Rental types (asset availability + fleet calendar feed) ---
+export interface AvailabilityAsset {
+  name: string;
+  asset_tag: string | null;
+  warehouse: string | null;
+  status: string | null;
+  meter_reading: number | null;
+}
+export interface AvailabilityResult {
+  item_code: string;
+  warehouse: string | null;
+  from: string;
+  to: string;
+  capacity: number;
+  committed: number;
+  available_qty: number;
+  available: boolean;
+  available_assets: AvailabilityAsset[];
+  overlapping: unknown[];
+}
+export interface CalendarAsset {
+  name: string;
+  asset_tag: string | null;
+  item_code: string | null;
+  warehouse: string | null;
+  status: string | null;
+  meter_reading: number | null;
+}
+export interface CalendarReservation {
+  name: string;
+  item_code: string | null;
+  asset: string | null;
+  warehouse: string | null;
+  qty: number | null;
+  from_datetime: string;
+  to_datetime: string;
+  status: string | null;
+  party_type: string | null;
+  party: string | null;
+  purpose: string | null;
+}
+export interface FleetCalendarFeed {
+  from: string;
+  to: string;
+  warehouse: string | null;
+  item_code: string | null;
+  assets: CalendarAsset[];
+  reservations: CalendarReservation[];
+}
+
+export const api = {
+  // Generic request (used by sidebar for chat sessions)
+  request,
+
+  // Chat attachments
+  uploadChatAttachment: async (sessionId: string, file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("session_id", sessionId);
+    const res = await fetch(`${BASE}/chat/attachments`, {
+      method: "POST",
+      credentials: "include",
+      body: form,
+    });
+    if (!res.ok) {
+      if (res.status === 401) {
+        window.location.href = "/login";
+        throw new ApiError(401, "Session expired");
+      }
+      const body = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new ApiError(res.status, body.detail || "Upload failed");
+    }
+    return res.json() as Promise<{
+      id: string;
+      filename: string;
+      mime_type: string;
+      size_bytes: number;
+      created_at: string;
+      warning?: string;
+    }>;
+  },
+  getChatAttachmentUrl: (id: string) => `${BASE}/chat/attachments/${encodeURIComponent(id)}`,
+
+  previewBankStatements: (files: File[]) => {
+    const form = new FormData();
+    files.forEach((file) => form.append("files", file));
+    return multipartRequest<{ statements: BankStatementPreview[] }>("/bank-statements/preview", form);
+  },
+
+  importBankStatements: (files: File[], mappings: Record<string, string>) => {
+    const form = new FormData();
+    files.forEach((file) => form.append("files", file));
+    form.append("mappings", JSON.stringify(mappings));
+    return multipartRequest<BankStatementImportResult>("/bank-statements/import", form);
+  },
+
+  listBankStatementImports: (limit = 50) =>
+    request<{ rows: any[] }>(`/bank-statements${qs({ limit })}`),
+
+  bankStatementSourceUrl: (name: string) =>
+    `${BASE}/bank-statements/${encodeURIComponent(name)}/source`,
+
+  listBankReconciliationTransactions: (status = "Unreconciled", limit = 100) =>
+    request<{ rows: BankReconciliationTransaction[] }>(
+      `/bank-reconciliation/transactions${qs({ status, limit })}`,
+    ),
+
+  getBankReconciliationSuggestions: (name: string, limit = 12) =>
+    request<BankReconciliationSuggestions>(
+      `/bank-reconciliation/transactions/${encodeURIComponent(name)}/suggestions${qs({ limit })}`,
+    ),
+
+  reconcileBankPayment: (data: {
+    bank_transaction: string;
+    allocations: Array<{ reference_doctype: string; reference_name: string; allocated_amount: number }>;
+    conversion_rate?: number;
+    confirmed: boolean;
+  }) => request<any>("/bank-reconciliation/payment", { method: "POST", body: JSON.stringify(data) }),
+
+  reconcileBankJournal: (data: {
+    bank_transaction: string;
+    counterparty_account: string;
+    conversion_rate?: number;
+    remarks?: string;
+    confirmed: boolean;
+  }) => request<any>("/bank-reconciliation/journal", { method: "POST", body: JSON.stringify(data) }),
+
+  reconcileBankExistingVoucher: (data: {
+    bank_transaction: string;
+    bank_transactions?: string[];
+    voucher_type: string;
+    voucher_no: string;
+    confirmed: boolean;
+  }) => request<any>("/bank-reconciliation/match-existing", { method: "POST", body: JSON.stringify(data) }),
+
+  undoBankReconciliation: (bankTransaction: string) =>
+    request<any>("/bank-reconciliation/undo", {
+      method: "POST",
+      body: JSON.stringify({ bank_transaction: bankTransaction, confirmed: true }),
+    }),
+
+  // Chat
+  createChatSession: () =>
+    request<{ id: string; title: string; created_at: string; updated_at: string; last_message_at?: string | null }>(
+      "/chat/sessions",
+      { method: "POST" },
+    ),
+
+  getChatSession: (id: string) =>
+    request<{ id: string; title: string; created_at: string; updated_at: string; last_message_at?: string | null; detail?: string }>(
+      `/chat/sessions/${encodeURIComponent(id)}`,
+    ),
+
+  // Documents
+  documentFields: (doctype: string) =>
+    request<{ pdf: { supported: boolean; reason?: string; kind?: string; required_fields?: string[] } }>(`/documents/${encodeURIComponent(doctype)}/fields`),
+
+  generateDocumentPdf: (doctype: string, name: string) =>
+    request<{ artifact_id: string; filename: string; sha256: string }>(`/documents/${encodeURIComponent(doctype)}/${encodeURIComponent(name)}/pdf`, { method: "POST" }),
+
+  listDocuments: (doctype: string, params?: Record<string, string | number | undefined>) =>
+    request<{ rows: any[]; total: number; limit: number; offset: number; text_fields: string[] }>(
+      `/documents/${doctype}${qs(params)}`,
+    ),
+
+  getDocument: (doctype: string, name: string) =>
+    request<any>(`/documents/${doctype}/${encodeURIComponent(name)}`),
+
+  // Prev/next record around `name` in the same order+filters the list uses.
+  adjacentDocument: (doctype: string, name: string, params?: Record<string, string | number | undefined>) =>
+    request<{ prev: string | null; next: string | null }>(
+      `/documents/${doctype}/${encodeURIComponent(name)}/adjacent${qs(params)}`,
+    ),
+
+  // Prev/next master record around `name` in the same order+filters as its list.
+  adjacentMaster: (masterType: string, name: string, params?: Record<string, string | number | undefined>) =>
+    request<{ prev: string | null; next: string | null }>(
+      `/masters/${masterType}/${encodeURIComponent(name)}/adjacent${qs(params)}`,
+    ),
+
+  createDocument: (doctype: string, data: any) =>
+    request<any>(`/documents/${doctype}`, { method: "POST", body: JSON.stringify(data) }),
+
+  updateDocument: (doctype: string, name: string, data: any) =>
+    request<any>(`/documents/${doctype}/${encodeURIComponent(name)}`, {
+      method: "PUT",
+      body: JSON.stringify(data),
+    }),
+
+  submitDocument: (doctype: string, name: string) =>
+    request<any>(`/documents/${doctype}/${encodeURIComponent(name)}/submit`, { method: "POST" }),
+
+  cancelDocument: (doctype: string, name: string) =>
+    request<any>(`/documents/${doctype}/${encodeURIComponent(name)}/cancel`, { method: "POST" }),
+
+  discardDocument: (doctype: string, name: string) =>
+    request<any>(`/documents/${doctype}/${encodeURIComponent(name)}/discard`, { method: "POST" }),
+
+  convertDocument: (doctype: string, name: string, targetDoctype: string) =>
+    request<any>(`/documents/${doctype}/${encodeURIComponent(name)}/convert`, {
+      method: "POST",
+      body: JSON.stringify({ target_doctype: targetDoctype }),
+    }),
+
+  // Proposal (Sammelofferte) extras — CRUD goes through the document methods
+  // above (doctype "proposal"); these cover the appendix blob + cover default.
+  getProposalCoverDefault: (company?: string, customer?: string) =>
+    request<{ cover_letter: string }>(
+      `/proposals/cover-default${qs({ company, customer })}`,
+    ),
+
+  uploadProposalAppendix: async (name: string, file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    const res = await fetch(`${BASE}/proposals/${encodeURIComponent(name)}/appendix`, {
+      method: "POST",
+      credentials: "include",
+      body: form,
+    });
+    if (!res.ok) {
+      if (res.status === 401) {
+        window.location.href = "/login";
+        throw new ApiError(401, "Session expired");
+      }
+      const body = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new ApiError(res.status, body.detail || "Upload failed");
+    }
+    return res.json() as Promise<{ appendix_filename: string; size: number }>;
+  },
+
+  deleteProposalAppendix: (name: string) =>
+    request<{ ok: boolean }>(`/proposals/${encodeURIComponent(name)}/appendix`, { method: "DELETE" }),
+
+  proposalPdfUrl: (name: string) => `${BASE}/documents/proposal/${encodeURIComponent(name)}/pdf`,
+
+  // Masters
+  listMasters: (type: string, params?: Record<string, string | number | undefined>) =>
+    request<{ rows: any[]; total: number; limit: number; offset: number; text_fields: string[] }>(
+      `/masters/${type}${qs(params)}`,
+    ),
+
+  searchMasters: (type: string, q: string) =>
+    request<any[]>(`/masters/${type}/search?q=${encodeURIComponent(q)}`),
+
+  // Distinct values of one list column — used by dropdown filters and the
+  // shared field-aware search autocomplete.
+  masterFilterValues: (type: string, field: string, q = "", limit = 200) =>
+    request<{ values: any[] }>(
+      `/masters/${type}/filter-values${qs({ field, q: q || undefined, limit })}`,
+    ),
+
+  documentFilterValues: (doctype: string, field: string, q = "", limit = 200) =>
+    request<{ values: any[] }>(
+      `/documents/${doctype}/filter-values${qs({ field, q: q || undefined, limit })}`,
+    ),
+
+  searchDocuments: (doctype: string, q: string) =>
+    request<any[]>(`/documents/${doctype}/search?q=${encodeURIComponent(q)}`),
+
+  searchLink: async (type: string, q: string): Promise<any[]> => {
+    try {
+      const results = await request<any[]>(`/masters/${type}/search?q=${encodeURIComponent(q)}`);
+      if (results.length > 0) return results;
+    } catch {
+      // masters endpoint failed, try documents
+    }
+    return request<any[]>(`/documents/${type}/search?q=${encodeURIComponent(q)}`);
+  },
+
+  getMaster: (type: string, name: string) =>
+    request<any>(`/masters/${type}/${encodeURIComponent(name)}`),
+
+  currencies: (company?: string) =>
+    request<{ base_currency: string; currencies: string[] }>(
+      `/accounting/currencies${qs({ company })}`,
+    ),
+
+  createMaster: (type: string, data: any) =>
+    request<any>(`/masters/${type}`, { method: "POST", body: JSON.stringify(data) }),
+
+  updateMaster: (type: string, name: string, data: any) =>
+    request<any>(`/masters/${type}/${encodeURIComponent(name)}`, {
+      method: "PUT",
+      body: JSON.stringify(data),
+    }),
+
+  runAction: (action: string, data: Record<string, any>) =>
+    request<any>(`/actions/${encodeURIComponent(action)}`, {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+
+  deleteMaster: (type: string, name: string) =>
+    request<any>(`/masters/${type}/${encodeURIComponent(name)}`, { method: "DELETE" }),
+
+  // Reports
+  trialBalance: (params?: Record<string, string>) =>
+    request<{ rows: any[]; total_debit: number; total_credit: number; difference: number }>(
+      `/reports/trial-balance${qs(params)}`,
+    ),
+
+  chartOfAccounts: (params?: Record<string, string>) =>
+    request<{ accounts: any[]; from_date: string | null; to_date: string | null }>(
+      `/reports/chart-of-accounts${qs(params)}`,
+    ),
+
+  generalLedger: (params?: Record<string, string>) =>
+    request<{
+      rows: any[];
+      total: number;
+      limit: number;
+      offset: number;
+      opening_balance: number;
+    }>(`/reports/general-ledger${qs(params)}`),
+
+  stockBalance: (params?: Record<string, string>) =>
+    request<{ rows: any[] }>(`/reports/stock-balance${qs(params)}`),
+
+  // --- Rentals: availability + fleet calendar ---
+  availability: (params: { item_code: string; from: string; to: string; warehouse?: string; exclude?: string }) =>
+    request<AvailabilityResult>(`/availability${qs(params)}`),
+
+  fleetCalendar: (params: { from: string; to: string; warehouse?: string; item_code?: string }) =>
+    request<FleetCalendarFeed>(`/availability/calendar${qs(params)}`),
+
+  dashboardSummary: (company?: string) =>
+    request<any>(`/reports/dashboard-summary${qs({ company })}`),
+
+  profitAndLoss: (params?: Record<string, string>) =>
+    request<any>(`/reports/profit-and-loss${qs(params)}`),
+
+  balanceSheet: (params?: Record<string, string>) =>
+    request<any>(`/reports/balance-sheet${qs(params)}`),
+
+  arAging: (params?: Record<string, string>) =>
+    request<any>(`/reports/ar-aging${qs(params)}`),
+
+  apAging: (params?: Record<string, string>) =>
+    request<any>(`/reports/ap-aging${qs(params)}`),
+
+  analyticsMetrics: () =>
+    request<{
+      metrics: Array<{
+        metric: string;
+        label: string;
+        group_by: string[];
+        time_based: boolean;
+      }>;
+    }>("/reports/analytics/metrics"),
+
+  analytics: (params: Record<string, string>) =>
+    request<{
+      metric: string;
+      metric_label: string;
+      group_by: string;
+      chart_type: "bar" | "line";
+      time_based: boolean;
+      from_date: string | null;
+      to_date: string | null;
+      company: string | null;
+      rows: Array<{ label: string; value: number }>;
+      total: number;
+    }>(`/reports/analytics${qs(params)}`),
+
+  runtimeDatasets: () =>
+    request<{
+      datasets: Array<{
+        dataset: string;
+        label: string;
+        description: string;
+        fields: Record<string, string>;
+        filter_fields: string[];
+        default_limit: number;
+        max_limit: number;
+      }>;
+    }>("/reports/runtime/datasets"),
+
+  runtimeData: (data: {
+    requests: Array<{
+      name?: string;
+      dataset: string;
+      fields?: string[];
+      filters?: Record<string, unknown>;
+      limit?: number;
+    }>;
+  }) =>
+    request<{
+      datasets: Array<{
+        name: string;
+        dataset: string;
+        rows: Array<Record<string, unknown>>;
+        fields: Record<string, string>;
+        row_count: number;
+        truncated: boolean;
+        limit: number;
+      }>;
+    }>("/reports/runtime/data", { method: "POST", body: JSON.stringify(data) }),
+
+  createRuntimeDraft: (data: {
+    title: string;
+    description?: string;
+    data_requests: Array<{
+      name?: string;
+      dataset: string;
+      fields?: string[];
+      filters?: Record<string, unknown>;
+      limit?: number;
+    }>;
+    report: Record<string, unknown>;
+  }) =>
+    request<{
+      id: string;
+      title: string;
+      description?: string;
+      definition: Record<string, unknown>;
+      url: string;
+      created_by?: string;
+    }>("/reports/runtime/drafts", { method: "POST", body: JSON.stringify(data) }),
+
+  getRuntimeDraft: (id: string) =>
+    request<{
+      id: string;
+      title: string;
+      description?: string;
+      definition: Record<string, unknown>;
+      url: string;
+      created_by?: string;
+      source_chat_session_id?: string;
+      created_at?: string;
+      updated_at?: string;
+    }>(`/reports/runtime/drafts/${encodeURIComponent(id)}`),
+
+  listRuntimeDrafts: () =>
+    request<{
+      drafts: Array<{
+        id: string;
+        title: string;
+        description?: string;
+        created_by?: string;
+        source_chat_session_id?: string;
+        created_at?: string;
+        updated_at?: string;
+        url: string;
+      }>;
+    }>("/reports/runtime/drafts"),
+
+  deleteRuntimeDraft: (id: string) =>
+    request<{ deleted: string }>(`/reports/runtime/drafts/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
+
+  // Setup
+  setupStatus: () => request<{ setup_complete: boolean; companies?: any[] }>("/setup/status"),
+
+  createCompany: (data: {
+    name: string;
+    currency?: string;
+    email?: string;
+    phone?: string;
+    address?: string;
+    city?: string;
+    zip_code?: string;
+    country?: string;
+    tax_id?: string;
+  }) => request<any>("/setup/company", { method: "POST", body: JSON.stringify(data) }),
+
+  seedDemo: () => request<any>("/setup/seed-demo", { method: "POST" }),
+
+  seedHistory: (data?: { start_date?: string; end_date?: string; seed?: number; intensity?: number }) =>
+    request<{ ok: boolean; company: string; start_date: string; end_date: string; stats: Record<string, number> }>(
+      "/setup/seed-history",
+      { method: "POST", body: JSON.stringify(data ?? {}) },
+    ),
+
+  importAccountBalances: (data: any) =>
+    request<any>("/setup/opening-balances/accounts", { method: "POST", body: JSON.stringify(data) }),
+  importStockBalances: (data: any) =>
+    request<any>("/setup/opening-balances/stock", { method: "POST", body: JSON.stringify(data) }),
+  importOutstandingInvoices: (data: any) =>
+    request<any>("/setup/opening-balances/invoices", { method: "POST", body: JSON.stringify(data) }),
+
+  // Auth
+  authSetupStatus: () =>
+    request<{
+      has_users: boolean;
+      first_run: boolean;
+      public_signup: boolean;
+      registration_open: boolean;
+      oauth_providers: string[];
+    }>("/auth/setup-status"),
+  // Social login is a full-page navigation, not a fetch — build the URL the
+  // browser should be sent to. `link` starts a "link to my account" flow.
+  oauthLoginUrl: (provider: string, opts?: { link?: boolean; invite?: string }) => {
+    const qs = new URLSearchParams();
+    if (opts?.link) qs.set("link", "1");
+    if (opts?.invite) qs.set("invite", opts.invite);
+    const suffix = qs.toString() ? `?${qs.toString()}` : "";
+    return apiUrl(`/auth/${encodeURIComponent(provider)}/login${suffix}`);
+  },
+  oauthListIdentities: () => request<{ provider: string; email: string | null; creation: string }[]>("/auth/oauth/identities"),
+  authRegister: (data: { email: string; full_name: string; password: string; invite_token?: string }) =>
+    request<any>("/auth/register", { method: "POST", body: JSON.stringify(data) }),
+  authLogin: (email: string, password: string) =>
+    request<any>("/auth/login", { method: "POST", body: JSON.stringify({ email, password }) }),
+  authLogout: () => request<any>("/auth/logout", { method: "POST" }),
+  authMe: () => request<any>("/auth/me"),
+  authChangePassword: (current_password: string, new_password: string) =>
+    request<any>("/auth/change-password", {
+      method: "POST",
+      body: JSON.stringify({ current_password, new_password }),
+    }),
+  authSetPassword: (new_password: string) =>
+    request<any>("/auth/set-password", {
+      method: "POST",
+      body: JSON.stringify({ new_password }),
+    }),
+  authInvite: (email: string, role: string) =>
+    request<any>("/auth/invite", { method: "POST", body: JSON.stringify({ email, role }) }),
+  authListUsers: () => request<any[]>("/auth/users"),
+  authChangeRole: (userName: string, role: string) =>
+    request<any>(`/auth/users/${encodeURIComponent(userName)}/role`, { method: "PUT", body: JSON.stringify({ role }) }),
+  authDisableUser: (userName: string) =>
+    request<any>(`/auth/users/${encodeURIComponent(userName)}`, { method: "DELETE" }),
+  authListInvites: () => request<any[]>("/auth/invites"),
+  authRevokeInvite: (token: string) =>
+    request<any>(`/auth/invites/${encodeURIComponent(token)}`, { method: "DELETE" }),
+  getPublicManagerStatus: () => request<{ active: boolean; user?: any }>("/auth/public-manager"),
+  createPublicManager: () => request<any>("/auth/public-manager", { method: "POST" }),
+  removePublicManager: () => request<any>("/auth/public-manager", { method: "DELETE" }),
+  getHealth: () => request<{ status: string; version: string }>("/health"),
+  getSettings: () => request<Record<string, string>>("/auth/settings"),
+  updateSettings: (data: Record<string, string>) =>
+    request<Record<string, string>>("/auth/settings", { method: "PUT", body: JSON.stringify(data) }),
+  // Per-USER preferences (columns.<doctype>, language, …) — scoped to the caller,
+  // not admin-gated, unlike the global getSettings/updateSettings above.
+  getMySettings: () => request<Record<string, string>>("/auth/my-settings"),
+  updateMySettings: (data: Record<string, string>) =>
+    request<Record<string, string>>("/auth/my-settings", { method: "PUT", body: JSON.stringify(data) }),
+  getConnectionStatus: () => request<{ mcp_url: string; rest_enabled: boolean; chat_enabled: boolean }>("/mcp-oauth/status"),
+  getMcpConsent: (requestId: string) => request<{ client_name: string; redirect_uri: string; roles: string[]; csrf_token: string }>(`/mcp-oauth/consent?request_id=${encodeURIComponent(requestId)}`),
+  approveMcp: (request_id: string, csrf_token: string, allow: boolean, role: string) =>
+    request<{ redirect_uri: string }>("/mcp-oauth/consent", { method: "POST", body: JSON.stringify({ request_id, csrf_token, allow, role }) }),
+  getApiKeys: () =>
+    request<Array<{
+      id: string; name: string; user?: string; role: string; key_prefix: string;
+      created_at?: string; last_used_at?: string | null; revoked: boolean; app_type?: string;
+      owner_full_name?: string | null; owner_email?: string | null; is_mine?: boolean;
+    }>>("/auth/api-keys"),
+  createApiKey: (name: string, role: string, app_type: "claude_code" | "codex" | "other" = "other") =>
+    request<{
+      id: string; name: string; user?: string; role: string; key_prefix: string; token: string;
+      owner_full_name?: string | null; owner_email?: string | null; is_mine?: boolean;
+    }>("/auth/api-keys", { method: "POST", body: JSON.stringify({ name, role, app_type }) }),
+  revokeApiKey: (id: string) =>
+    request<{ id: string; revoked: boolean }>(
+      `/auth/api-keys/${encodeURIComponent(id)}/revoke`, { method: "POST" }),
+  deleteApiKey: (id: string) =>
+    request<{ id: string; deleted: boolean }>(
+      `/auth/api-keys/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  getDemoSpend: () =>
+    request<{
+      caps: { global_hourly_usd: number; per_ip_hourly_usd: number };
+      windows: Record<
+        string,
+        {
+          total_usd: number;
+          demo_usd: number;
+          prompt_tokens: number;
+          completion_tokens: number;
+          call_count: number;
+          unique_ips: number;
+          by_provider: Record<
+            string,
+            {
+              cost_usd: number;
+              call_count: number;
+              prompt_tokens: number;
+              completion_tokens: number;
+            }
+          >;
+        }
+      >;
+      top_ips_24h: Array<{
+        ip: string;
+        role: string | null;
+        cost_usd: number;
+        call_count: number;
+      }>;
+    }>("/admin/demo-spend"),
+};

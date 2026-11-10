@@ -1,0 +1,468 @@
+name: Tests
+
+# Runs the ERP validation suite (full document cycle + GL/stock + atomicity
+# regressions) on BOTH supported backends:
+#   * in-memory SQLite — the fast default used by local dev
+#   * PostgreSQL — the production backend, via a GitHub Actions service
+#     container (an ephemeral postgres:16 Docker container the runner starts
+#     alongside the job and tears down after; nothing managed/external).
+# This is the guard that the accounting invariants hold on what we actually
+# ship, not just on SQLite.
+on:
+  push:
+    branches: [master]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "frontend/**"
+      - "terraform/**"
+      - ".gitignore"
+      - "LICENSE"
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "frontend/**"
+      - "terraform/**"
+  workflow_dispatch:
+
+jobs:
+  validation:
+    name: Validation suite (SQLite + Postgres)
+    runs-on: ubuntu-latest
+    # Full SQLite/PostgreSQL regressions can exceed 15 minutes on slower runners.
+    timeout-minutes: 25
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: lambda_test
+        ports:
+          - 5432:5432
+        # Hold the job until Postgres accepts connections.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install OCR engine (Tesseract) for document-intelligence tests
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tesseract-ocr
+
+      - name: Install (with the postgres + msme + azure extras)
+        run: pip install -e ".[postgres,msme,azure]" pymupdf pyyaml
+
+      - name: Direct ERP discovery and extension metadata
+        run: python -m tests.test_erp_context
+
+      - name: LLM pricing and orchestrator request contract
+        run: python -m tests.test_llm_pricing
+
+      - name: Utils — now() timezone-aware UTC (backend-agnostic)
+        run: python -m tests.test_utils_now
+
+      - name: MSME rule engine (classification, GST calendar, schemes)
+        run: pip install pytest && python -m pytest tests/test_msme_rules.py -q
+
+      - name: Upload validation unit tests
+        run: python -m pytest tests/test_upload_validation_unit.py -q
+
+      - name: Upload content security (S-2) — SQLite
+        run: python -m tests.test_upload_security
+
+      - name: OIDC ID-token algorithm pinning
+        run: python -m tests.test_oauth_alg_pinning
+
+      - name: MSME deterministic checks (GSTIN, arithmetic, duplicates, matching, retry policy)
+        run: python -m pytest tests/test_msme_checks.py tests/test_msme_matching.py tests/test_msme_audit_retry.py -q
+
+      - name: MSME documents — service (SQLite)
+        run: python -m tests.test_msme_documents
+
+      - name: MSME documents — HTTP API (SQLite)
+        run: python -m tests.test_msme_documents_api
+
+      - name: MSME documents — real docket pipeline + Tesseract (SQLite)
+        run: python -m tests.test_msme_docket_integration
+
+      - name: MSME documents — service (PostgreSQL)
+        run: python -m tests.test_msme_documents
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+
+      - name: MSME documents — HTTP API (PostgreSQL)
+        run: python -m tests.test_msme_documents_api
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+
+      - name: MSME documents — real docket pipeline (PostgreSQL)
+        run: python -m tests.test_msme_docket_integration
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+
+      - name: MSME compliance workspace — service (SQLite)
+        run: python -m tests.test_msme_compliance
+
+      - name: MSME compliance workspace — HTTP API (SQLite)
+        run: python -m tests.test_msme_compliance_api
+
+      - name: MSME compliance workspace — service (PostgreSQL)
+        run: python -m tests.test_msme_compliance
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+
+      - name: MSME compliance workspace — HTTP API (PostgreSQL)
+        run: python -m tests.test_msme_compliance_api
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+
+      - name: MSME credit readiness + schemes — service (SQLite)
+        run: python -m tests.test_msme_credit
+
+      - name: MSME credit readiness + schemes — HTTP API (SQLite)
+        run: python -m tests.test_msme_credit_api
+
+      - name: MSME credit readiness + schemes — service (PostgreSQL)
+        run: python -m tests.test_msme_credit
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+
+      - name: MSME credit readiness + schemes — HTTP API (PostgreSQL)
+        run: python -m tests.test_msme_credit_api
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+
+      - name: MSME reconciliation — service (SQLite)
+        run: python -m tests.test_msme_reconciliation
+
+      - name: MSME reconciliation — HTTP API (SQLite)
+        run: python -m tests.test_msme_reconciliation_api
+
+      - name: MSME reconciliation — service (PostgreSQL)
+        run: python -m tests.test_msme_reconciliation
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+
+      - name: MSME reconciliation — HTTP API (PostgreSQL)
+        run: python -m tests.test_msme_reconciliation_api
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+
+      - name: Operations — logging, request ids, readiness, status, sweeper (SQLite)
+        run: python -m tests.test_msme_ops
+
+      - name: Operations — logging, request ids, readiness, status, sweeper (PostgreSQL)
+        run: python -m tests.test_msme_ops
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+
+      - name: Install Azurite (Azure Storage emulator)
+        run: sudo npm install -g azurite
+
+      - name: Document storage backends — local disk and Azure Blob (Azurite)
+        run: python -m tests.test_msme_storage
+        env:
+          REQUIRE_AZURITE: "1"
+
+      - name: Render Blueprint lint and policy checks
+        run: python -m tests.test_render_blueprint
+
+      - name: Container entrypoint (disk ownership, privilege drop)
+        run: sudo -E env "PATH=$PATH" REQUIRE_ROOT_TESTS=1 python -m tests.test_docker_entrypoint
+
+      - name: Backup and restore drill (SQLite + PostgreSQL)
+        run: |
+          sudo apt-get install -y --no-install-recommends postgresql-client
+          python -m tests.test_msme_restore_drill
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+          REQUIRE_PG_TOOLS: "1"
+
+      - name: Authorization matrix + cross-user isolation (S-1)
+        run: python -m tests.test_authz_matrix
+
+      - name: SQL injection probes (S-4)
+        run: python -m tests.test_sql_injection_probes
+
+      - name: Company default sales tax settings — SQLite
+        run: python -m tests.test_company_tax_settings
+
+      - name: Company default sales tax settings — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_company_tax_settings
+
+      - name: Validation suite — SQLite (in-memory)
+        run: python -m tests.test_erp_validation
+
+      - name: Validation suite — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_erp_validation
+
+      - name: Pricing, external identity, cost centres and migrations — SQLite
+        run: python -m tests.test_pricing_integrity
+
+      - name: Pricing, external identity, cost centres and migrations — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_pricing_integrity
+
+      - name: PDF content contracts — SQLite
+        run: python -m tests.test_pdf_contract
+
+      - name: PDF content contracts — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_pdf_contract
+
+      - name: PDF chat, REST and MCP transport — SQLite
+        run: python -m tests.test_pdf_channels
+
+      - name: PDF chat, REST and MCP transport — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_pdf_channels
+
+      - name: Document requirements — SQLite (synthetic records)
+        run: python -m tests.test_document_requirements
+
+      - name: Workflow guards — SQLite
+        run: python -m tests.test_workflow_guards
+
+      - name: Workflow integrity — SQLite
+        run: python -m tests.test_workflow_integrity
+
+      - name: Settlement guards — SQLite
+        run: python -m tests.test_settlement_guards
+
+      - name: Lifecycle and rental concurrency — SQLite
+        run: python -m tests.test_lifecycle_guards
+
+      - name: Server-owned fields and master structure — SQLite
+        run: python -m tests.test_master_structure_guards
+
+      - name: Business rule guards — SQLite
+        run: python -m tests.test_business_rule_guards
+
+      - name: Business rule guards — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_business_rule_guards
+
+      - name: Server-owned fields and master structure — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_master_structure_guards
+
+      - name: Lifecycle and rental concurrency — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_lifecycle_guards
+
+      - name: Settlement guards — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_settlement_guards
+
+      - name: Workflow integrity — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_workflow_integrity
+
+      - name: Workflow guards — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_workflow_guards
+
+      - name: Document requirements — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_document_requirements
+
+      - name: DB portability — SQLite (in-memory)
+        run: python -m tests.test_db_portability
+
+      - name: DB portability — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_db_portability
+
+      - name: Chat API — SQLite (in-memory)
+        run: python -m tests.test_chat_api
+
+      - name: Tool authorization — SQLite (synthetic records)
+        run: python -m tests.test_tool_permissions
+
+      - name: Tool authorization — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_tool_permissions
+
+      - name: Security regression suite — SQLite (synthetic records)
+        run: python -m tests.test_security_regressions
+
+      - name: Security regression suite — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_security_regressions
+
+      - name: Chat API — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_chat_api
+
+      - name: REST API (Bearer keys) — SQLite (temp file)
+        run: python -m tests.test_rest_api
+
+      - name: REST API (Bearer keys) — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_rest_api
+
+      - name: CAMT bank statement import — SQLite (temp file)
+        run: python -m tests.test_camt_import
+
+      - name: CAMT bank statement import — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_camt_import
+
+      - name: Bank reconciliation — SQLite (temp file)
+        run: python -m tests.test_bank_reconciliation
+
+      - name: Bank reconciliation — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_bank_reconciliation
+
+      - name: Rental availability endpoint — SQLite (in-memory)
+        run: python -m tests.test_availability_api
+
+      - name: Rental availability endpoint — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_availability_api
+
+      - name: Default sales tax auto-apply — SQLite (in-memory)
+        run: python -m tests.test_default_tax
+
+      - name: Default sales tax auto-apply — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_default_tax
+
+      - name: List performance (index + count cache + projection) — SQLite (in-memory)
+        run: python -m tests.test_list_perf
+
+      - name: Recent-change windows, timestamp migration and REST/chat/MCP — SQLite
+        run: python -m tests.test_time_filters
+
+      - name: Recent-change windows, timestamp migration and REST/chat/MCP — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_time_filters
+
+      - name: List performance (index + count cache + projection) — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_list_perf
+
+      - name: Documents route (advisory fields projection) — SQLite (in-memory)
+        run: python -m tests.test_documents_route
+
+      - name: Documents route (advisory fields projection) — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_documents_route
+
+      - name: Master registry seam — SQLite (temp file)
+        run: python -m tests.test_master_registry
+
+      - name: Registered action seam
+        run: python -m tests.test_registered_actions
+
+      - name: Master registry seam — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_master_registry
+
+      - name: Seed admin — SQLite (temp file)
+        run: python -m tests.test_seed_admin
+
+      - name: Seed admin — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_seed_admin
+
+      - name: Plugin schema seam — SQLite (temp file)
+        run: python -m tests.test_plugin_schema
+
+      - name: Plugin schema seam — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_plugin_schema
+
+      - name: Chat doctype seam — SQLite (temp file)
+        run: python -m tests.test_chat_doctype
+
+      - name: Chat doctype seam — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_chat_doctype
+
+      - name: Lock-safe DDL — SQLite (temp file)
+        run: python -m tests.test_lock_safe_ddl
+
+      - name: Lock-safe DDL — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_lock_safe_ddl
+
+      - name: Adjacent (prev/next) — SQLite (temp file)
+        run: python -m tests.test_adjacent
+
+      - name: Adjacent (prev/next) — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_adjacent
+
+      - name: MCP OAuth connectors — SQLite
+        run: python -m tests.test_mcp_oauth
+
+      - name: MCP OAuth connectors — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_mcp_oauth
+
+      - name: MCP endpoint — SQLite (temp file)
+        run: python -m tests.test_mcp
+
+      - name: MCP endpoint — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_mcp
+
+      - name: List search — SQLite (temp file)
+        run: python -m tests.test_search
+
+      - name: List search — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_search
+
+      - name: Transaction release (no idle-in-transaction) — PostgreSQL
+        env:
+          LAMBDA_ERP_TEST_DB: postgresql://postgres:postgres@localhost:5432/lambda_test
+        run: python -m tests.test_txn_release

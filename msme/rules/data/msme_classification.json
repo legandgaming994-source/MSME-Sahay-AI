@@ -1,0 +1,33 @@
+{
+  "rule_id": "msme-classification",
+  "description": "MSMED Act 2006 enterprise classification: composite of investment in plant & machinery/equipment AND annual turnover. Category = highest rank across both metrics.",
+  "currency": "INR",
+  "versions": [
+    {
+      "version": "S.O.2119(E)-2020-06-26",
+      "effective_from": "2020-07-01",
+      "effective_from_verified": false,
+      "effective_to": "2025-03-31",
+      "limits_inr": {
+        "Micro":  {"investment": 10000000,   "turnover": 50000000},
+        "Small":  {"investment": 100000000,  "turnover": 500000000},
+        "Medium": {"investment": 500000000,  "turnover": 2500000000}
+      },
+      "source": {"title": "MSME Ministry notification S.O. 2119(E), 26 Jun 2020 (previous limits as reported alongside S.O. 1364(E))",
+                 "primary_url": null, "primary_url_status": "TO_LOCATE", "verification": "SECONDARY_ONLY"}
+    },
+    {
+      "version": "S.O.1364(E)-2025-03-21",
+      "effective_from": "2025-04-01",
+      "effective_from_verified": true,
+      "effective_to": null,
+      "limits_inr": {
+        "Micro":  {"investment": 25000000,   "turnover": 100000000},
+        "Small":  {"investment": 250000000,  "turnover": 1000000000},
+        "Medium": {"investment": 1250000000, "turnover": 5000000000}
+      },
+      "source": {"title": "MSME Ministry notification S.O. 1364(E), 21 Mar 2025, effective 1 Apr 2025",
+                 "primary_url": null, "primary_url_status": "TO_LOCATE", "verification": "SECONDARY_ONLY"}
+    }
+  ]
+}

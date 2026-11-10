@@ -1,0 +1,1313 @@
+import { useState, useEffect, useLayoutEffect, useRef, useCallback } from "react";
+import { Link, useParams, useNavigate, useSearchParams, useLocation } from "react-router-dom";
+import { type ChatMessage, type ChatAttachment, useChat, rememberSessionId } from "@/components/chat/chat-provider";
+import { api } from "@/api/client";
+import { usePageTitle } from "@/lib/use-page-title";
+import { useTranslation } from "react-i18next";
+
+const MAX_ATTACHMENTS = 5;
+const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024;
+const ALLOWED_MIMES = new Set([
+  "image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf",
+  // Spreadsheets
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", // xlsx
+  "application/vnd.ms-excel", // xls
+  "application/vnd.oasis.opendocument.spreadsheet", // ods
+  // Documents
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document", // docx
+  "application/msword", // doc
+  "application/vnd.oasis.opendocument.text", // odt
+  // Presentations
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation", // pptx
+  "application/vnd.ms-powerpoint", // ppt
+  "application/vnd.oasis.opendocument.presentation", // odp
+  // Delimited / text
+  "text/csv", "text/plain",
+  // Structured bank statements
+  "application/xml", "text/xml", "application/zip", "application/x-zip-compressed",
+]);
+
+// Some browsers/OSes hand us an empty or octet-stream type for Office files, so
+// the picker also accepts by extension (mirrors the server's extension fallback).
+const ALLOWED_EXTS = new Set([
+  "png", "jpg", "jpeg", "gif", "webp", "pdf",
+  "xlsx", "xls", "ods", "docx", "doc", "odt", "pptx", "ppt", "odp", "csv", "txt",
+  "xml", "zip",
+]);
+
+interface PendingAttachment {
+  localId: string;
+  file: File;
+  previewUrl?: string;
+  uploadedId?: string;
+  uploading: boolean;
+  error?: string;
+}
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+// Strip the `data:<mime>;base64,` prefix a FileReader data URL carries so we
+// send the server the bare base64 payload.
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const result = typeof reader.result === "string" ? reader.result : "";
+      resolve(result.includes(",") ? result.slice(result.indexOf(",") + 1) : result);
+    };
+    reader.onerror = () => reject(reader.error ?? new Error("Could not read audio."));
+    reader.readAsDataURL(blob);
+  });
+}
+
+function formatTime(ts?: string): string {
+  if (!ts) return "";
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return "";
+
+  const now = new Date();
+  const sameDay =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate();
+
+  if (sameDay) {
+    return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+
+  const sameYear = d.getFullYear() === now.getFullYear();
+  if (sameYear) {
+    return d.toLocaleDateString([], { day: "numeric", month: "short" });
+  }
+
+  return d.toLocaleDateString([], { day: "numeric", month: "short", year: "numeric" });
+}
+
+function formatFullTimestamp(ts?: string): string {
+  if (!ts) return "";
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return "";
+  return d.toLocaleString([], {
+    year: "numeric", month: "short", day: "numeric",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+    timeZoneName: "short",
+  });
+}
+
+export default function ChatPage() {
+  const { t } = useTranslation();
+  const { sessionId } = useParams<{ sessionId: string }>();
+  const navigate = useNavigate();
+  const location = useLocation();
+  const [searchParams] = useSearchParams();
+  const demoRequested = searchParams.get("demo") === "1";
+  const [input, setInput] = useState("");
+  const [demoError, setDemoError] = useState("");
+  const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
+  const [attachmentError, setAttachmentError] = useState("");
+  const [isDragOver, setIsDragOver] = useState(false);
+  // Voice → text: "idle" (mic ready), "recording" (capturing), "transcribing"
+  // (waiting on the server). Click toggles record on/off.
+  const [voiceState, setVoiceState] = useState<"idle" | "recording" | "transcribing">("idle");
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const {
+    sessions,
+    connectionStatus,
+    connectionVersion,
+    createSession,
+    startDemo,
+    completeDemoTyping,
+    loadHistory,
+    loadMoreHistory,
+    sendMessage,
+    transcribeAudio,
+    getMessages,
+    hasMoreHistory,
+    isLoadingOlder,
+    isThinking: getIsThinking,
+    getDemoStatus,
+    getDemoTypingCue,
+  } = useChat();
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const inputAreaRef = useRef<HTMLDivElement>(null);
+  const [inputAreaHeight, setInputAreaHeight] = useState(0);
+  const previousThinkingRef = useRef(false);
+  const demoRunStartedRef = useRef<string | null>(null);
+  const demoTypingRunIdRef = useRef(0);
+  const shouldAutoScrollRef = useRef(true);
+  const pendingPrependHeightRef = useRef<number | null>(null);
+  // True while we're driving the scroll ourselves (smooth-scroll animation
+  // or ResizeObserver-driven pin-to-bottom). Scroll events fired by those
+  // animations must NOT be interpreted as the user scrolling up, or else
+  // shouldAutoScrollRef flips to false mid-animation and every subsequent
+  // rescroll gets gated out.
+  const programmaticScrollRef = useRef(false);
+  const programmaticScrollTimerRef = useRef<number | null>(null);
+  const messages = getMessages(sessionId);
+  // Tab title = the chat's own (auto-generated) name, so a bookmarked chat keeps
+  // that string. Updates live when the title is generated on the first reply.
+  const chatTitle = sessions.find((s) => s.id === sessionId)?.title;
+  usePageTitle(chatTitle || null);
+  const isConnected = connectionStatus === "connected";
+  const isThinking = getIsThinking(sessionId);
+  const demoStatus = getDemoStatus(sessionId);
+  const demoTypingCue = getDemoTypingCue(sessionId);
+  const isDemoReplaying = demoRequested || demoStatus === "running";
+  const canLoadOlder = hasMoreHistory(sessionId);
+  const loadingOlder = isLoadingOlder(sessionId);
+
+  const lastMessage = messages[messages.length - 1];
+  const lastMessageKey = lastMessage
+    ? `${lastMessage.type}:${lastMessage.timestamp || ""}:${lastMessage.content}`
+    : "empty";
+
+  // Flag programmatic scrolls so the onScroll handler doesn't interpret
+  // the browser's mid-animation scroll events as "user scrolled up".
+  // Refreshes the reset timer each call — a rescroll inside 600ms
+  // keeps the flag on for the full animation + reflow window.
+  const markProgrammaticScroll = useCallback(() => {
+    programmaticScrollRef.current = true;
+    if (programmaticScrollTimerRef.current !== null) {
+      window.clearTimeout(programmaticScrollTimerRef.current);
+    }
+    programmaticScrollTimerRef.current = window.setTimeout(() => {
+      programmaticScrollRef.current = false;
+      programmaticScrollTimerRef.current = null;
+    }, 600);
+  }, []);
+
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    // Drive the container directly instead of relying on
+    // scrollIntoView — it's more predictable for tall messages and
+    // avoids quirks around the zero-height end-of-list marker.
+    markProgrammaticScroll();
+    el.scrollTo({ top: el.scrollHeight, behavior });
+    // A tall, freshly-mounted assistant bubble (markdown tables, long
+    // lists) can still reflow after the effect commits — re-check once
+    // a frame later, and once more after ~100ms for stragglers like
+    // late-rendered images or resize-observed blocks. If the user has
+    // already scrolled up manually, leave them alone.
+    const rescroll = () => {
+      const current = scrollContainerRef.current;
+      if (!current) return;
+      if (!shouldAutoScrollRef.current && !isDemoReplaying && !isThinking) return;
+      if (current.scrollTop + current.clientHeight >= current.scrollHeight - 2) return;
+      markProgrammaticScroll();
+      current.scrollTo({ top: current.scrollHeight, behavior: "auto" });
+    };
+    requestAnimationFrame(rescroll);
+    window.setTimeout(rescroll, 120);
+  }, [isDemoReplaying, isThinking, markProgrammaticScroll]);
+
+  useLayoutEffect(() => {
+    const el = scrollContainerRef.current;
+    const prevHeight = pendingPrependHeightRef.current;
+    if (!el || prevHeight === null) return;
+    const delta = el.scrollHeight - prevHeight;
+    if (delta > 0) {
+      el.scrollTop = el.scrollTop + delta;
+    }
+    pendingPrependHeightRef.current = null;
+  }, [messages.length]);
+
+  useEffect(() => {
+    if (pendingPrependHeightRef.current !== null) return;
+    if (!shouldAutoScrollRef.current && !isDemoReplaying && !isThinking) return;
+    scrollToBottom(isDemoReplaying ? "auto" : "smooth");
+  }, [lastMessageKey, isDemoReplaying, isThinking, scrollToBottom]);
+
+  // Chase any post-commit layout growth (markdown tables, late-rendered
+  // links, web-font reflows, images finalising their box). ResizeObserver
+  // fires whenever the scroll container's content box changes size; if the
+  // user hasn't manually scrolled up, keep pinning the view to the bottom.
+  useEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    let raf = 0;
+    const observer = new ResizeObserver(() => {
+      if (pendingPrependHeightRef.current !== null) return;
+      if (!shouldAutoScrollRef.current && !isDemoReplaying && !isThinking) return;
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => {
+        const current = scrollContainerRef.current;
+        if (!current) return;
+        const distanceFromBottom =
+          current.scrollHeight - current.scrollTop - current.clientHeight;
+        // Only chase when we're already near the bottom — avoids yanking the
+        // view when the user is scrolled up reading history.
+        if (distanceFromBottom <= 120) {
+          markProgrammaticScroll();
+          current.scrollTo({ top: current.scrollHeight, behavior: "auto" });
+        }
+      });
+    });
+    // Observe the content wrapper so tall new bubbles trigger the callback.
+    const content = el.firstElementChild;
+    if (content) observer.observe(content);
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+      cancelAnimationFrame(raf);
+    };
+  }, [isDemoReplaying, isThinking, markProgrammaticScroll]);
+
+  // Reserve bottom space in the scroll content equal to the floating input's
+  // actual height so the tail of a long message never hides behind it. The
+  // input height is variable (textarea auto-grows, attachment strip appears),
+  // so measure it live instead of hardcoding the padding.
+  useLayoutEffect(() => {
+    const el = inputAreaRef.current;
+    if (!el) return;
+    setInputAreaHeight(el.offsetHeight);
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => setInputAreaHeight(el.offsetHeight));
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
+  const handleLoadOlder = useCallback(() => {
+    if (!sessionId) return;
+    if (loadingOlder || !canLoadOlder) return;
+    const el = scrollContainerRef.current;
+    pendingPrependHeightRef.current = el ? el.scrollHeight : null;
+    shouldAutoScrollRef.current = false;
+    void loadMoreHistory(sessionId).catch(() => {
+      pendingPrependHeightRef.current = null;
+    });
+  }, [sessionId, loadingOlder, canLoadOlder, loadMoreHistory]);
+
+  // Tracks the location.state object we've already consumed so the
+  // StrictMode synthetic remount (and any later re-render with the same
+  // state) doesn't double-apply or clobber the prefill.
+  const consumedNavStateRef = useRef<unknown>(null);
+
+  useEffect(() => {
+    setDemoError("");
+    demoRunStartedRef.current = null;
+    demoTypingRunIdRef.current += 1;
+    // Remember that this browser participated in this chat, so the sidebar
+    // keeps showing it even when the server-side filter hides demo-only
+    // sessions for the shared public_manager account.
+    if (sessionId) rememberSessionId(sessionId);
+
+    const navState = location.state as { prefillMessage?: string } | null;
+    if (navState?.prefillMessage && consumedNavStateRef.current !== navState) {
+      consumedNavStateRef.current = navState;
+      setInput(navState.prefillMessage);
+      window.setTimeout(() => inputRef.current?.focus(), 50);
+    } else if (!navState?.prefillMessage) {
+      consumedNavStateRef.current = null;
+      setInput("");
+    }
+  }, [sessionId, demoRequested, location.state]);
+
+  // If no sessionId, create one and redirect
+  useEffect(() => {
+    if (sessionId || !isConnected) return;
+
+    let cancelled = false;
+    createSession()
+      .then((session) => {
+        if (!cancelled) {
+          navigate(`/chat/${session.id}`, { replace: true });
+        }
+      })
+      .catch(() => {
+        // ignore
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, isConnected, navigate]);
+
+  const loadHistoryRef = useRef(loadHistory);
+  useEffect(() => {
+    loadHistoryRef.current = loadHistory;
+  }, [loadHistory]);
+
+  useEffect(() => {
+    if (!sessionId || !isConnected) return;
+    if (demoRequested || demoStatus === "running") return;
+    void loadHistoryRef.current(sessionId).catch(() => {
+      // ignore
+    });
+  }, [sessionId, isConnected, connectionVersion, demoRequested, demoStatus]);
+
+  useEffect(() => {
+    if (previousThinkingRef.current && !isThinking && isConnected) {
+      setTimeout(() => inputRef.current?.focus(), 50);
+    }
+    previousThinkingRef.current = isThinking;
+  }, [isThinking, isConnected]);
+
+  function handleMessagesScroll(e: React.UIEvent<HTMLDivElement>) {
+    // Ignore scroll events fired by our own programmatic scrolls —
+    // mid-animation positions are meaningless for "is the user reading
+    // history?" and flipping shouldAutoScrollRef mid-animation defeats
+    // the whole auto-scroll chain.
+    if (programmaticScrollRef.current) return;
+    const el = e.currentTarget;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    shouldAutoScrollRef.current = distanceFromBottom < 80;
+  }
+
+  useEffect(() => {
+    if (!sessionId || !isConnected || !demoRequested) return;
+    if (demoRunStartedRef.current === sessionId) return;
+
+    demoRunStartedRef.current = sessionId;
+    setDemoError("");
+    void startDemo(sessionId).catch((err) => {
+      demoRunStartedRef.current = null;
+      setDemoError(err instanceof Error ? err.message : t("chat.demoError"));
+    });
+  }, [sessionId, isConnected, demoRequested, startDemo]);
+
+  useEffect(() => {
+    if (!sessionId || !demoRequested || demoStatus !== "complete") return;
+    setInput("");
+    navigate(`/chat/${sessionId}`, { replace: true });
+  }, [sessionId, demoRequested, demoStatus, navigate]);
+
+  const completeDemoTypingRef = useRef(completeDemoTyping);
+  useEffect(() => {
+    completeDemoTypingRef.current = completeDemoTyping;
+  }, [completeDemoTyping]);
+
+  const typedCueSeqRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!demoTypingCue || !sessionId) return;
+    // Guard against re-runs for the same cue (provider re-renders recreate object refs)
+    if (typedCueSeqRef.current === demoTypingCue.seq) return;
+    typedCueSeqRef.current = demoTypingCue.seq;
+
+    const targetSessionId = sessionId;
+    const typingContent = demoTypingCue.content;
+    const charDelay = typingContent.length > 0
+      ? Math.max(8, demoTypingCue.typingMs / typingContent.length)
+      : 0;
+    const typingSeq = demoTypingCue.seq;
+
+    const runId = ++demoTypingRunIdRef.current;
+
+    async function animateTyping() {
+      setInput("");
+      for (const char of typingContent) {
+        if (runId !== demoTypingRunIdRef.current) return;
+        setInput((prev) => prev + char);
+        await wait(charDelay);
+      }
+      if (runId !== demoTypingRunIdRef.current) return;
+      completeDemoTypingRef.current(targetSessionId, typingSeq);
+    }
+
+    void animateTyping();
+  }, [demoTypingCue, sessionId]);
+
+  useEffect(() => {
+    if (demoStatus !== "complete") return;
+    demoTypingRunIdRef.current += 1;
+    setInput("");
+  }, [demoStatus]);
+
+  const addFiles = useCallback((fileList: FileList | File[]) => {
+    if (!sessionId) return;
+    setAttachmentError("");
+    const incoming = Array.from(fileList);
+
+    setAttachments((prev) => {
+      const result = [...prev];
+      for (const file of incoming) {
+        if (result.length >= MAX_ATTACHMENTS) {
+          setAttachmentError(`Maximum ${MAX_ATTACHMENTS} attachments per message.`);
+          break;
+        }
+        const ext = file.name.includes(".") ? file.name.split(".").pop()!.toLowerCase() : "";
+        if (!ALLOWED_MIMES.has(file.type) && !ALLOWED_EXTS.has(ext)) {
+          setAttachmentError(`Unsupported file type: ${file.type || file.name}`);
+          continue;
+        }
+        if (file.size > MAX_ATTACHMENT_SIZE) {
+          setAttachmentError(`"${file.name}" is too large (max 10 MB).`);
+          continue;
+        }
+
+        const localId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const previewUrl = file.type.startsWith("image/")
+          ? URL.createObjectURL(file)
+          : undefined;
+        const pending: PendingAttachment = { localId, file, previewUrl, uploading: true };
+        result.push(pending);
+
+        // Fire upload
+        api.uploadChatAttachment(sessionId, file)
+          .then((res) => {
+            setAttachments((current) =>
+              current.map((a) =>
+                a.localId === localId ? { ...a, uploading: false, uploadedId: res.id } : a,
+              ),
+            );
+            // Non-blocking advisory (e.g. a spreadsheet over the model's
+            // per-sheet row limit) — the attachment still uploaded fine.
+            if (res.warning) setAttachmentError(`"${file.name}": ${res.warning}`);
+          })
+          .catch((err) => {
+            const msg = err?.message || "Upload failed";
+            // Surface the server's detail (e.g. demo size cap) in the banner
+            // so the user actually sees *why* — the pending tile only has
+            // room for "Failed".
+            setAttachmentError(`"${file.name}": ${msg}`);
+            setAttachments((current) =>
+              current.map((a) =>
+                a.localId === localId ? { ...a, uploading: false, error: msg } : a,
+              ),
+            );
+          });
+      }
+      return result;
+    });
+  }, [sessionId]);
+
+  const removeAttachment = (localId: string) => {
+    setAttachments((prev) => {
+      const victim = prev.find((a) => a.localId === localId);
+      if (victim?.previewUrl) URL.revokeObjectURL(victim.previewUrl);
+      return prev.filter((a) => a.localId !== localId);
+    });
+  };
+
+  // Drag-and-drop support on the chat area
+  const handleDragOver = (e: React.DragEvent) => {
+    if (e.dataTransfer.types.includes("Files")) {
+      e.preventDefault();
+      setIsDragOver(true);
+    }
+  };
+  const handleDragLeave = (e: React.DragEvent) => {
+    // Only clear when the drag actually leaves the outer container, not when
+    // moving over children. relatedTarget is null or outside when truly leaving.
+    const related = e.relatedTarget as Node | null;
+    if (!related || !(e.currentTarget as Node).contains(related)) {
+      setIsDragOver(false);
+    }
+  };
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragOver(false);
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      addFiles(e.dataTransfer.files);
+    }
+  };
+
+  // Paste image / PDF from clipboard
+  const handlePaste = (e: React.ClipboardEvent) => {
+    const files: File[] = [];
+    for (const item of e.clipboardData.items) {
+      if (item.kind === "file") {
+        const f = item.getAsFile();
+        if (f) files.push(f);
+      }
+    }
+    if (files.length > 0) {
+      e.preventDefault();
+      addFiles(files);
+    }
+  };
+
+  const hasUnfinishedUploads = attachments.some((a) => a.uploading);
+  const hasFailedUploads = attachments.some((a) => a.error);
+  const readyAttachmentIds = attachments
+    .filter((a) => a.uploadedId && !a.error)
+    .map((a) => a.uploadedId as string);
+
+  function sendCurrentMessage() {
+    const text = input.trim();
+    if (!sessionId) return;
+    if (!text && readyAttachmentIds.length === 0) return;
+    if (hasUnfinishedUploads) return;
+    if (!sendMessage(sessionId, text, readyAttachmentIds.length > 0 ? readyAttachmentIds : undefined)) return;
+    // Clean up previews
+    for (const att of attachments) {
+      if (att.previewUrl) URL.revokeObjectURL(att.previewUrl);
+    }
+    setAttachments([]);
+    setAttachmentError("");
+    setInput("");
+  }
+
+  function handleKeyDown(e: React.KeyboardEvent) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendCurrentMessage();
+    }
+  }
+
+  // Append the transcript to whatever is already typed so a voice note adds to
+  // the draft rather than replacing it. Returns the text trimmed/spaced.
+  function appendTranscript(text: string) {
+    const clean = text.trim();
+    if (!clean) return;
+    setInput((prev) => (prev.trim() ? `${prev.trim()} ${clean}` : clean));
+    // Defer focus so the textarea has the new value when we resize it.
+    window.setTimeout(() => {
+      const el = inputRef.current;
+      if (!el) return;
+      el.focus();
+      el.style.height = "auto";
+      el.style.height = Math.min(Math.max(el.scrollHeight, 48), 120) + "px";
+    }, 0);
+  }
+
+  async function startRecording() {
+    if (voiceState !== "idle") return;
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch {
+      setAttachmentError(t("chat.micDenied"));
+      return;
+    }
+
+    setAttachmentError("");
+    const recorder = new MediaRecorder(stream);
+    mediaRecorderRef.current = recorder;
+    audioChunksRef.current = [];
+
+    recorder.ondataavailable = (event) => {
+      if (event.data.size > 0) audioChunksRef.current.push(event.data);
+    };
+
+    recorder.onstop = async () => {
+      stream.getTracks().forEach((track) => track.stop());
+      const chunks = audioChunksRef.current;
+      audioChunksRef.current = [];
+      mediaRecorderRef.current = null;
+      if (chunks.length === 0) {
+        setVoiceState("idle");
+        return;
+      }
+      const mimeType = recorder.mimeType || chunks[0]?.type || "audio/webm";
+      const blob = new Blob(chunks, { type: mimeType });
+      // "audio/webm;codecs=opus" → "webm"; the server only needs the container.
+      const format = (mimeType.split(";")[0].split("/")[1] || "webm").toLowerCase();
+
+      setVoiceState("transcribing");
+      try {
+        const base64 = await blobToBase64(blob);
+        const text = await transcribeAudio(base64, format, sessionId);
+        appendTranscript(text);
+      } catch (error) {
+        setAttachmentError(error instanceof Error ? error.message : t("chat.transcribeFailed"));
+      } finally {
+        setVoiceState("idle");
+      }
+    };
+
+    recorder.start();
+    setVoiceState("recording");
+  }
+
+  function stopRecording() {
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state !== "inactive") {
+      recorder.stop();
+    }
+  }
+
+  function toggleRecording() {
+    if (voiceState === "recording") {
+      stopRecording();
+    } else if (voiceState === "idle") {
+      void startRecording();
+    }
+  }
+
+  if (!sessionId) {
+    return (
+      <div className="flex h-full items-center justify-center text-fg-muted">
+        {t("chat.creating")}
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="relative -m-4 h-[calc(100%+2rem)] overflow-hidden md:-m-6 md:h-[calc(100%+3rem)]"
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
+      {isDragOver && (
+        <div className="pointer-events-none absolute inset-3 z-50 flex items-center justify-center rounded-lg border-2 border-dashed border-brand bg-brand/5 text-sm font-medium text-brand">
+          {t("chat.dropToAttach")}
+        </div>
+      )}
+      {/* Messages — full-height scroll area so the scrollbar reaches the
+          bottom edge of the viewport. Inner content reserves bottom padding
+          equal to the floating input's measured height (inputAreaHeight) so
+          the last message always clears it, even as the input grows. */}
+      <div
+        ref={scrollContainerRef}
+        className="absolute inset-0 overflow-y-auto px-4 py-6"
+        onScroll={handleMessagesScroll}
+      >
+        <div
+          className="mx-auto max-w-3xl space-y-4"
+          style={{ paddingBottom: (inputAreaHeight || 96) + 16 }}
+        >
+          {(canLoadOlder || loadingOlder) && messages.length > 0 && (
+            <div className="flex justify-center">
+              <button
+                onClick={handleLoadOlder}
+                disabled={loadingOlder || !canLoadOlder}
+                className="rounded-full bg-surface px-3 py-1 text-xs text-fg-muted ring-1 ring-line transition-colors hover:bg-surface-subtle hover:text-fg disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {loadingOlder ? t("common.loading") : t("chat.loadOlder")}
+              </button>
+            </div>
+          )}
+          {demoError && (
+            <div className="rounded-md bg-rose-50 px-4 py-3 text-sm text-rose-700 ring-1 ring-rose-200">
+              {demoError}
+            </div>
+          )}
+
+          {messages.length === 0 && demoStatus !== "running" && !demoRequested && (
+            <div className="py-20 text-center">
+              <h3 className="text-lg font-semibold text-fg-muted">
+                {t("chat.title")}
+              </h3>
+              <p className="mt-2 text-sm text-fg-muted">
+                {t("chat.subtitle")}
+              </p>
+              <div className="mt-6 flex flex-wrap justify-center gap-2">
+                {[
+                  t("chat.s1"),
+                  t("chat.s2"),
+                  t("chat.s3"),
+                  t("chat.s4"),
+                ].map((suggestion) => (
+                  <button
+                    key={suggestion}
+                    onClick={() => {
+                      setInput(suggestion);
+                      inputRef.current?.focus();
+                    }}
+                    className="rounded-full bg-surface px-3 py-1.5 text-xs text-fg-muted ring-1 ring-line transition-all hover:bg-surface-subtle hover:text-fg hover:ring-brand/30"
+                  >
+                    {suggestion}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {messages.map((msg, idx) => (
+            <MessageBubble key={idx} message={msg} />
+          ))}
+          <div ref={messagesEndRef} />
+        </div>
+      </div>
+
+      {/* Input — absolutely positioned over the message scroll area so the
+           scrollbar can reach the bottom edge. bg-surface-muted matches the
+           page bg so the textarea card visually floats. The right-side gap
+           (md:right-6 / md:pl-6 / md:pr-0) only applies on desktop, where
+           scrollbars are always visible and ~17–18px wide. On mobile the
+           overlay scrollbar auto-hides, so we extend the wrapper edge-to-
+           edge (right-0, px-4) to avoid an empty gap on the right. */}
+      <div
+        ref={inputAreaRef}
+        className="absolute bottom-0 left-0 right-0 bg-surface-muted px-4 pb-[max(0.75rem,env(safe-area-inset-bottom))] md:right-6 md:pl-6 md:pr-0"
+      >
+        <div className="mx-auto max-w-3xl">
+          {/* Attachment preview strip */}
+          {attachments.length > 0 && (
+            <div className="mb-2 flex flex-wrap gap-2">
+              {attachments.map((att) => (
+                <div
+                  key={att.localId}
+                  className="relative flex items-center gap-2 rounded-lg bg-surface px-2 py-1.5 text-xs ring-1 ring-line shadow-card"
+                >
+                  {att.previewUrl ? (
+                    <img src={att.previewUrl} alt="" className="h-10 w-10 rounded object-cover" />
+                  ) : (
+                    <div className="flex h-10 w-10 items-center justify-center rounded bg-surface-subtle text-[10px] font-bold text-fg-muted">
+                      {fileBadge(att.file.name)}
+                    </div>
+                  )}
+                  <div className="flex min-w-0 flex-col">
+                    <span className="max-w-[160px] truncate text-fg">{att.file.name}</span>
+                    <span className="text-[10px] text-fg-muted">
+                      {att.uploading ? t("chat.uploading") : att.error ? t("chat.failed") : `${Math.round(att.file.size / 1024)} KB`}
+                    </span>
+                  </div>
+                  <button
+                    onClick={() => removeAttachment(att.localId)}
+                    className="ml-1 text-fg-muted transition-colors hover:text-red-500"
+                    title={t("chat.remove")}
+                  >
+                    <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor">
+                      <path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
+                    </svg>
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+          {attachmentError && (
+            <div className="mb-2 rounded-md bg-rose-50 px-3 py-1.5 text-xs text-rose-700 ring-1 ring-rose-200 shadow-card">{attachmentError}</div>
+          )}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/png,image/jpeg,image/gif,image/webp,application/pdf,.xlsx,.xls,.ods,.docx,.doc,.odt,.pptx,.ppt,.odp,.csv,.txt,.xml,.zip,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,application/vnd.oasis.opendocument.spreadsheet,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/msword,application/vnd.oasis.opendocument.text,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/vnd.ms-powerpoint,application/vnd.oasis.opendocument.presentation,text/csv,text/plain,application/xml,text/xml,application/zip,application/x-zip-compressed"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              if (e.target.files && e.target.files.length > 0) {
+                addFiles(e.target.files);
+                e.target.value = "";
+              }
+            }}
+          />
+          {/* Single "input card" that contains the textarea and both action
+              buttons. The card carries the surface bg + ring + shadow that
+              the textarea used to carry on its own; focus-within promotes
+              the ring to the brand-tinted halo when the textarea is
+              focused. Send button no longer has a filled bg — both action
+              buttons are ghost-style with semantic colors (text-fg-muted
+              for attach, text-brand for send). */}
+          <div className="flex items-end gap-1 rounded-xl bg-surface p-1.5 ring-1 ring-line shadow-card transition-all focus-within:ring-2 focus-within:ring-brand/30">
+            <textarea
+              ref={inputRef}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={handleKeyDown}
+              onPaste={handlePaste}
+              placeholder={
+                isDemoReplaying
+                  ? t("chat.placeholderDemo")
+                  : isConnected
+                  ? t("chat.placeholderType")
+                  : t("chat.placeholderConnecting")
+              }
+              disabled={!isConnected || !sessionId || isThinking || isDemoReplaying}
+              rows={2}
+              className="block flex-1 resize-none bg-transparent px-2.5 py-1.5 text-sm text-fg outline-none placeholder:text-fg-muted/70 disabled:text-fg-muted"
+              style={{ minHeight: "3rem", maxHeight: "120px" }}
+              onInput={(e) => {
+                const target = e.target as HTMLTextAreaElement;
+                target.style.height = "auto";
+                target.style.height = Math.min(Math.max(target.scrollHeight, 48), 120) + "px";
+              }}
+            />
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              disabled={!isConnected || !sessionId || isThinking || isDemoReplaying || attachments.length >= MAX_ATTACHMENTS}
+              className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-fg-muted transition-all hover:bg-surface-subtle hover:text-fg disabled:cursor-not-allowed disabled:opacity-40 md:h-10 md:w-10"
+              title={t("chat.attachTitle")}
+            >
+              <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48" />
+              </svg>
+            </button>
+            <button
+              onClick={toggleRecording}
+              disabled={!isConnected || !sessionId || isThinking || isDemoReplaying || voiceState === "transcribing"}
+              className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-lg transition-all disabled:cursor-not-allowed disabled:opacity-40 md:h-10 md:w-10 ${
+                voiceState === "recording"
+                  ? "bg-rose-500/10 text-rose-600 hover:bg-rose-500/20"
+                  : "text-fg-muted hover:bg-surface-subtle hover:text-fg"
+              }`}
+              title={
+                voiceState === "recording"
+                  ? t("chat.voiceStop")
+                  : voiceState === "transcribing"
+                  ? t("chat.voiceTranscribing")
+                  : t("chat.voiceStart")
+              }
+            >
+              {voiceState === "transcribing" ? (
+                <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" className="animate-spin">
+                  <path d="M21 12a9 9 0 11-6.219-8.56" strokeLinecap="round" />
+                </svg>
+              ) : voiceState === "recording" ? (
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor" className="animate-pulse">
+                  <rect x="6" y="6" width="12" height="12" rx="2" />
+                </svg>
+              ) : (
+                <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z" />
+                  <path d="M19 10v2a7 7 0 01-14 0v-2" />
+                  <line x1="12" y1="19" x2="12" y2="23" />
+                  <line x1="8" y1="23" x2="16" y2="23" />
+                </svg>
+              )}
+            </button>
+            <button
+              onClick={sendCurrentMessage}
+              disabled={(!input.trim() && readyAttachmentIds.length === 0) || !isConnected || !sessionId || isThinking || isDemoReplaying || hasUnfinishedUploads || hasFailedUploads}
+              className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-brand transition-all hover:bg-brand/10 active:translate-y-px disabled:cursor-not-allowed disabled:text-fg-muted disabled:active:translate-y-0 md:h-10 md:w-10"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                width="18"
+                height="18"
+                fill="currentColor"
+              >
+                <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" />
+              </svg>
+            </button>
+          </div>
+          <div className="mt-1.5 flex items-center gap-1.5">
+            <span
+              className={`inline-block h-1.5 w-1.5 rounded-full ${isConnected ? "bg-emerald-500" : "bg-rose-500"} ${isConnected ? "" : "animate-pulse"}`}
+            />
+            <span className="text-[11px] text-fg-muted">
+              {isConnected ? "Connected" : connectionStatus === "connecting" ? "Connecting..." : "Disconnected"}
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Short type badge for a non-image attachment — the file extension, uppercased
+// (e.g. PDF, DOCX, XLSX). Falls back to FILE when there's no extension.
+function fileBadge(name: string): string {
+  const ext = name.includes(".") ? name.split(".").pop()!.toUpperCase() : "";
+  return ext ? ext.slice(0, 4) : "FILE";
+}
+
+function AttachmentThumbs({ attachments }: { attachments?: ChatAttachment[] }) {
+  if (!attachments || attachments.length === 0) return null;
+  return (
+    <div className="mt-1 flex flex-wrap gap-1.5">
+      {attachments.map((att) => {
+        const url = api.getChatAttachmentUrl(att.id);
+        const isImage = att.mime_type.startsWith("image/");
+        return (
+          <a
+            key={att.id}
+            href={url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-1.5 rounded bg-black/10 px-1.5 py-1 text-[11px] hover:bg-black/20"
+            title={att.filename}
+          >
+            {isImage ? (
+              <img src={url} alt={att.filename} className="h-8 w-8 rounded object-cover" />
+            ) : (
+              <span className="flex h-8 w-8 items-center justify-center rounded bg-black/20 text-[9px] font-bold">{fileBadge(att.filename)}</span>
+            )}
+            <span className="max-w-[120px] truncate">{att.filename}</span>
+          </a>
+        );
+      })}
+    </div>
+  );
+}
+
+function MessageBubble({ message }: { message: ChatMessage }) {
+  if (message.type === "user") {
+    return (
+      <div className="flex justify-end">
+        <div className="max-w-[80%] break-words rounded-2xl rounded-br-md bg-gradient-to-b from-brand to-brand/90 px-4 py-2.5 text-sm text-brand-fg ring-1 ring-black/10 shadow-bubble-user">
+          <div className="whitespace-pre-wrap">{message.content}</div>
+          <AttachmentThumbs attachments={message.attachments} />
+          {message.timestamp && (
+            <div className="mt-1 text-right text-[10px] text-brand-fg/70" title={formatFullTimestamp(message.timestamp)}>{formatTime(message.timestamp)}</div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (message.type === "assistant") {
+    return (
+      <div className="flex justify-start">
+        <div className="max-w-[80%] break-words rounded-2xl rounded-bl-md bg-surface px-4 py-2.5 text-sm text-fg ring-1 ring-line shadow-card">
+          <MarkdownContent content={message.content} />
+          {message.timestamp && (
+            <div className="mt-1 text-right text-[10px] text-fg-muted" title={formatFullTimestamp(message.timestamp)}>{formatTime(message.timestamp)}</div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (message.type === "thinking") {
+    return (
+      <div className="flex justify-start">
+        <div className="flex items-center gap-2 rounded-full bg-surface px-3 py-1.5 text-xs text-fg-muted ring-1 ring-line shadow-card">
+          <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-brand" />
+          {message.content}
+          {message.provider && (
+            <span className="rounded bg-surface-subtle px-1.5 py-0.5 text-[10px] font-medium text-fg-muted ring-1 ring-line">
+              {message.provider}
+              {message.model ? ` · ${message.model}` : ""}
+            </span>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (message.type === "tool_call") {
+    return (
+      <div className="flex justify-start">
+        <div className="rounded-lg bg-surface px-3 py-2 text-xs ring-1 ring-line shadow-card">
+          <div className="flex items-center gap-1.5 font-medium text-fg-muted">
+            <svg
+              viewBox="0 0 24 24"
+              width="12"
+              height="12"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+            >
+              <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
+            </svg>
+            <span className="font-mono">{message.tool}</span>
+          </div>
+          {message.args && (
+            <pre className="mt-1 max-h-20 overflow-auto whitespace-pre-wrap font-mono text-[11px] text-fg-muted/80">
+              {JSON.stringify(message.args, null, 2)}
+            </pre>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (message.type === "tool_result") {
+    return (
+      <div className="flex justify-start">
+        <div
+          className={`rounded-lg px-3 py-2 text-xs shadow-card ring-1 ring-inset ${message.success ? "bg-emerald-50 ring-emerald-200" : "bg-rose-50 ring-rose-200"}`}
+        >
+          <div className="flex items-center gap-1.5">
+            <span className={message.success ? "text-emerald-600" : "text-rose-600"}>
+              {message.success ? "\u2713" : "\u2717"}
+            </span>
+            <span className="font-mono font-medium text-fg">{message.tool}</span>
+          </div>
+          <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap font-mono text-[11px] text-fg-muted">
+            {message.content}
+          </pre>
+        </div>
+      </div>
+    );
+  }
+
+  if (message.type === "error") {
+    return (
+      <div className="flex justify-start">
+        <div className="max-w-[80%] rounded-2xl rounded-bl-md bg-rose-50 px-4 py-2.5 text-sm text-rose-700 ring-1 ring-rose-200 shadow-card">
+          {message.content}
+        </div>
+      </div>
+    );
+  }
+
+  return null;
+}
+
+type TableAlignment = "left" | "center" | "right";
+
+function splitMarkdownTableRow(line: string): string[] | null {
+  let value = line.trim();
+  if (!value.includes("|")) return null;
+  if (value.startsWith("|")) value = value.slice(1);
+  if (value.endsWith("|")) value = value.slice(0, -1);
+
+  const cells: string[] = [];
+  let cell = "";
+  let inCode = false;
+  for (let i = 0; i < value.length; i += 1) {
+    const char = value[i];
+    if (char === "\\" && value[i + 1] === "|") {
+      cell += "|";
+      i += 1;
+    } else if (char === "`") {
+      inCode = !inCode;
+      cell += char;
+    } else if (char === "|" && !inCode) {
+      cells.push(cell.trim());
+      cell = "";
+    } else {
+      cell += char;
+    }
+  }
+  cells.push(cell.trim());
+  return cells.length >= 2 ? cells : null;
+}
+
+function tableAlignments(cells: string[] | null): TableAlignment[] | null {
+  if (!cells || !cells.every((cell) => /^:?-{3,}:?$/.test(cell.trim()))) return null;
+  return cells.map((cell) => {
+    const marker = cell.trim();
+    if (marker.startsWith(":") && marker.endsWith(":")) return "center";
+    if (marker.endsWith(":")) return "right";
+    return "left";
+  });
+}
+
+function MarkdownTable({
+  header,
+  rows,
+  alignments,
+}: {
+  header: string[];
+  rows: string[][];
+  alignments: TableAlignment[];
+}) {
+  return (
+    <div className="my-3 max-w-full overflow-x-auto rounded-lg border border-line">
+      <table className="min-w-full border-collapse text-sm">
+        <thead className="bg-surface-subtle">
+          <tr>
+            {header.map((cell, index) => (
+              <th
+                key={index}
+                scope="col"
+                className="border-b border-line px-3 py-2 font-semibold text-fg"
+                style={{ textAlign: alignments[index] || "left" }}
+              >
+                {formatInline(cell)}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-line">
+          {rows.map((row, rowIndex) => (
+            <tr key={rowIndex} className="bg-surface">
+              {header.map((_, cellIndex) => (
+                <td
+                  key={cellIndex}
+                  className="px-3 py-2 align-top text-fg"
+                  style={{ textAlign: alignments[cellIndex] || "left" }}
+                >
+                  {formatInline(row[cellIndex] || "")}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function MarkdownContent({ content }: { content: string }) {
+  const lines = content.split("\n");
+  const elements: React.ReactNode[] = [];
+  let inCodeBlock = false;
+  let codeLines: string[] = [];
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (line.startsWith("```")) {
+      if (inCodeBlock) {
+        elements.push(
+          <pre
+            key={`code-${i}`}
+            className="my-2 overflow-auto rounded bg-gray-800 p-3 text-xs text-green-300"
+          >
+            {codeLines.join("\n")}
+          </pre>,
+        );
+        codeLines = [];
+        inCodeBlock = false;
+      } else {
+        inCodeBlock = true;
+      }
+      continue;
+    }
+    if (inCodeBlock) {
+      codeLines.push(line);
+      continue;
+    }
+
+    // Models occasionally put blank lines between Markdown table rows. GFM
+    // considers that invalid, but it is unambiguous once a header and delimiter
+    // row are present, so accept the whitespace rather than exposing raw pipes.
+    const header = splitMarkdownTableRow(line);
+    let separatorIndex = i + 1;
+    while (separatorIndex < lines.length && lines[separatorIndex].trim() === "") {
+      separatorIndex += 1;
+    }
+    const alignments = tableAlignments(
+      separatorIndex < lines.length ? splitMarkdownTableRow(lines[separatorIndex]) : null,
+    );
+    if (header && alignments && header.length === alignments.length) {
+      const rows: string[][] = [];
+      let lastConsumed = separatorIndex;
+      let cursor = separatorIndex + 1;
+      while (cursor < lines.length) {
+        if (lines[cursor].trim() === "") {
+          let next = cursor + 1;
+          while (next < lines.length && lines[next].trim() === "") next += 1;
+          const nextRow = next < lines.length ? splitMarkdownTableRow(lines[next]) : null;
+          if (nextRow && nextRow.length === header.length && !tableAlignments(nextRow)) {
+            cursor = next;
+            continue;
+          }
+          break;
+        }
+        const row = splitMarkdownTableRow(lines[cursor]);
+        if (!row || row.length !== header.length || tableAlignments(row)) break;
+        rows.push(row);
+        lastConsumed = cursor;
+        cursor += 1;
+      }
+      elements.push(
+        <MarkdownTable
+          key={`table-${i}`}
+          header={header}
+          rows={rows}
+          alignments={alignments}
+        />,
+      );
+      i = lastConsumed;
+      continue;
+    }
+
+    if (line.startsWith("### ")) {
+      elements.push(
+        <h4 key={i} className="mt-3 mb-1 font-semibold">
+          {line.slice(4)}
+        </h4>,
+      );
+    } else if (line.startsWith("## ")) {
+      elements.push(
+        <h3 key={i} className="mt-3 mb-1 text-base font-semibold">
+          {line.slice(3)}
+        </h3>,
+      );
+    } else if (/^\s*[-*•]\s+/.test(line)) {
+      // Require whitespace after the marker so a bold line like `**Heading**`
+      // isn't mistaken for a `*` bullet (which stripped one star and mangled
+      // the bold). Real list items always have a space: `- item`, `* item`.
+      const content = line.replace(/^\s*[-*•]\s+/, "");
+      elements.push(
+        <div key={i} className="ml-3 flex gap-1">
+          <span className="text-fg-muted">&bull;</span>
+          <span>{formatInline(content)}</span>
+        </div>,
+      );
+    } else if (line.trim() === "") {
+      elements.push(<div key={i} className="h-2" />);
+    } else {
+      elements.push(
+        <p key={i} className="leading-relaxed">
+          {formatInline(line)}
+        </p>,
+      );
+    }
+  }
+
+  return <div>{elements}</div>;
+}
+
+function renderLink(href: string, label: React.ReactNode, key: number | string): React.ReactNode {
+  // `/api/*` is a backend endpoint (PDFs, file downloads, attachments) —
+  // not a React Router route. Route client-side only for real SPA paths.
+  const isSpaRoute = href.startsWith("/") && !href.startsWith("/api/");
+  const baseClass = "font-medium text-brand underline decoration-brand/40 underline-offset-2 transition-colors hover:decoration-brand";
+  if (isSpaRoute) {
+    return (
+      <Link key={key} to={href} className={baseClass}>
+        {label}
+      </Link>
+    );
+  }
+  return (
+    <a
+      key={key}
+      href={href}
+      className={baseClass}
+      target="_blank"
+      rel="noopener noreferrer"
+    >
+      {label}
+    </a>
+  );
+}
+
+// Bare URLs: http(s)://... or /internal?query paths. We stop at whitespace,
+// closing punctuation like ), ], }, ", ', and end-of-string. Trailing
+// sentence punctuation (. , ; : ! ?) is stripped below so it doesn't get
+// swallowed into the href.
+const BARE_URL_RE = /(https?:\/\/[^\s)\]}"'<>]+|\/(?:reports|app|masters|admin|chat|setup|tutorial)[^\s)\]}"'<>]*)/g;
+
+function formatInline(text: string): React.ReactNode {
+  // Split on (in priority order) markdown links, bold, inline code, bare URLs.
+  const parts = text.split(/(\[[^\]]+\]\([^)]+\)|\*\*[^*]+?\*\*|`[^`]+`)/g);
+  return parts.flatMap((part, i) => {
+    const linkMatch = part.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+    if (linkMatch) {
+      const [, label, href] = linkMatch;
+      return renderLink(href, formatInline(label), i);
+    }
+    if (part.startsWith("**") && part.endsWith("**") && part.length > 4) {
+      return (
+        <strong key={i} className="font-semibold">
+          {formatInline(part.slice(2, -2))}
+        </strong>
+      );
+    }
+    if (part.startsWith("`") && part.endsWith("`")) {
+      return (
+        <code
+          key={i}
+          className="rounded bg-gray-200 px-1 py-0.5 text-xs font-mono"
+        >
+          {part.slice(1, -1)}
+        </code>
+      );
+    }
+    // Plain text segment: scan for bare URLs and linkify them.
+    return linkifyBare(part, `${i}`);
+  });
+}
+
+function linkifyBare(text: string, keyPrefix: string): React.ReactNode[] {
+  const nodes: React.ReactNode[] = [];
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  const re = new RegExp(BARE_URL_RE.source, "g");
+  let idx = 0;
+  while ((match = re.exec(text)) !== null) {
+    const start = match.index;
+    let matched = match[0];
+    // Strip trailing sentence punctuation that shouldn't belong to the URL.
+    let trailing = "";
+    while (matched.length > 0 && /[.,;:!?]$/.test(matched)) {
+      trailing = matched.slice(-1) + trailing;
+      matched = matched.slice(0, -1);
+    }
+    if (start > lastIndex) {
+      nodes.push(text.slice(lastIndex, start));
+    }
+    nodes.push(renderLink(matched, matched, `${keyPrefix}-u${idx}`));
+    if (trailing) nodes.push(trailing);
+    lastIndex = start + match[0].length;
+    idx += 1;
+  }
+  if (lastIndex < text.length) {
+    nodes.push(text.slice(lastIndex));
+  }
+  return nodes.length > 0 ? nodes : [text];
+}

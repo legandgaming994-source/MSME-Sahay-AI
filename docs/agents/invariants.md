@@ -1,0 +1,96 @@
+# Invariants
+
+Rules the system relies on. Some are enforced in code; some are enforced
+only by convention and will bite you silently if broken. Check this list
+before touching any accounting, stock, or lifecycle path.
+
+## Enforced — don't try to bypass
+
+- **Submitted documents are immutable.** `Document.save()` raises if
+  `docstatus != DRAFT`. Post-submit field updates (`outstanding_amount`,
+  `billed_qty`, `modified`) go through `db.set_value` directly, never
+  round-trip via `.save()`. (`lambda_erp/model.py`)
+- **Generic submission is opt-in.** A new document class must declare
+  `SUBMITTABLE = True` only if Draft/Submitted/Cancelled is its actual workflow.
+  Discard requires a persisted flag; save/update cannot set it directly.
+- **Rental capacity changes share locks.** Asset and Reservation saves use
+  `assets.lifecycle` locks (voucher, asset, then item pool) before validation.
+  Do not bypass them with direct updates to active bookings or asset capacity.
+- **Discard is a draft-only soft delete, never a hard delete.** There is no
+  row deletion anywhere — `Document.discard()` voids an unwanted **draft**
+  (docstatus 0) by setting `discarded = 1` / status `'Discarded'`; the row is
+  kept for the audit trail and hidden from default lists (`list_documents`
+  filters `discarded = 0` unless `include_discarded`). It refuses non-drafts
+  (submitted docs must be **cancelled**), and `submit()` refuses a discarded
+  draft (else it would post to the ledger while staying hidden). Cancel
+  (docstatus 1 → 2) is the separate, posting-reversing operation. (`model.py`)
+- **Every voucher that posts GL must balance to the cent.** Enforced by
+  `general_ledger.process_debit_credit_difference`. Small rounding residues
+  post to the company's Round Off account; gaps > 0.5 raise.
+- **Cancel chain guards.** A PR cannot be cancelled while a PI clears
+  SRBNB against the same PO. SI/PI cannot be cancelled while a Payment
+  Entry is allocated against them. Add a guard to `on_cancel` **before**
+  any ledger mutation — raising after a partial write leaves the books
+  half-reversed until the outer transaction rolls back.
+- **Return doubles.** `_validate_return` caps qty at `original − already
+  returned`, and `_validate_return_value` caps grand_total the same way.
+  Never bypass either — the floor-at-0 in `_update_original_outstanding`
+  is defense-in-depth, not correctness.
+
+## Convention — easy to break, hard to spot
+
+- **Sign convention for outstanding.** Normal invoices carry positive
+  outstanding; return invoices carry negative. `PaymentEntry._update_outstanding`
+  switches direction based on the sign. If you add a new settlement path
+  (e.g., on Journal Entry — see `_update_referenced_outstanding`), mirror
+  the same sign logic.
+- **Stock-moving documents share helpers.** DN, SI `update_stock`, POS
+  `update_stock`, PI `update_stock` all go through
+  `stock_ledger.build_sell_side_sles` / `build_buy_side_sles` /
+  `build_cost_basis_gl` / `reverse_stock_sles`. Before these existed, POS
+  silently drifted (sell-rate SLE, no GL). If you add a fifth path, **use
+  the helpers** or the drift pattern repeats.
+- **Material Receipt vs Opening Stock.** Material Receipt contras to
+  `stock_adjustment_account` (Expense — write-offs, found stock). Opening
+  Stock contras to `default_opening_balance_equity` (Equity — day-one
+  inventory). Don't conflate; opening stock via Material Receipt would
+  pad the P&L.
+- **PI `items.expense_account` routes three ways.** For stock items with
+  `update_stock=1` → Stock In Hand. For stock items with `update_stock=0`
+  → SRBNB (to clear a prior PR). For non-stock → default_expense_account.
+  If you touch `_set_missing_accounts`, preserve all three branches.
+- **Order progress is derived.** `workflow.refresh_order_progress` recalculates
+  billing and fulfillment from submitted vouchers on both sales and purchase
+  paths. Direct-stock invoices count toward fulfillment. Bin planning is the
+  remaining quantity, not the original order quantity. Never increment cached
+  counters or commit from a lifecycle helper.
+- **Opening Stock + opening-balances wizard are deterministic.** The
+  simulator pins `start=2023-04-20 end=2026-04-20 seed=42`. The demo chat
+  script references specific invoice names produced by that sim. Breaking
+  determinism breaks the live demo.
+
+## Declarative validations — declare them on every new document
+
+Declare `SERVER_MANAGED_FIELDS` for persisted progress owned by a workflow.
+Generic save checks supplied values against storage before validation; workflow
+methods may derive and persist them within their transaction. Do not rely on a
+frontend read-only field to protect billing progress.
+
+`REQUIRED_FIELDS` are checked on save and submit. Implement conditional checks
+in `validate()` and describe them in `CONDITIONAL_REQUIREMENTS`, which feeds
+field metadata and the chat prompt. Document service inputs reject unknown
+fields; declare intentional transient plugin inputs in `INPUT_FIELDS` /
+`CHILD_INPUT_FIELDS`. See [document validation](../document-validation.md).
+
+The `Document` base class auto-validates four things from class attributes.
+When you add a new `Document` subclass, declare whatever applies:
+
+- `LINK_FIELDS = {field: "Master Doctype"}` — static FK-like links.
+- `CHILD_LINK_FIELDS = {child_key: {field: "Master Doctype"}}` — same on
+  child table rows.
+- `DYNAMIC_LINK_FIELDS = {field: (type_field, {type_value: doctype})}` —
+  links whose target doctype depends on a sibling type field (party/party_type).
+- `ACCOUNT_TYPE_CONSTRAINTS = {field: {"root_type"|"account_type": "..."}}`
+  — prevent income going to an expense account and similar footguns.
+
+Existing SI/PI/PE/JE classes are the examples.

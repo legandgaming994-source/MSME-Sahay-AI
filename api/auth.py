@@ -1,0 +1,1123 @@
+"""Authentication & team management for Lambda ERP.
+
+JWT cookie-based auth with role hierarchy: admin > manager > viewer.
+First user to register becomes admin. Subsequent users need an invite.
+"""
+
+import os
+import uuid
+import secrets
+import hashlib
+from datetime import datetime, timedelta, timezone
+from typing import Literal
+
+import bcrypt
+from jose import jwt, JWTError
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from pydantic import BaseModel
+
+from lambda_erp.database import get_db
+from lambda_erp.utils import now
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+def _resolve_jwt_secret() -> str:
+    """Get a stable JWT signing secret.
+
+    Priority:
+      1. JWT_SECRET_KEY env var (ops override, e.g. for multi-container
+         deployments where all instances must share the secret).
+      2. A `.jwt_secret` file next to the SQLite DB (auto-generated on
+         first boot, persists via the same volume as the DB so restarts
+         don't invalidate existing cookies).
+      3. Newly-generated random secret (only used if the filesystem is
+         read-only or inaccessible — cookies will be invalidated on
+         restart in that degenerate case).
+    """
+    env_secret = os.environ.get("JWT_SECRET_KEY")
+    if env_secret:
+        return env_secret
+
+    db_path = os.environ.get("LAMBDA_ERP_DB", "lambda_erp.db")
+    data_dir = os.path.dirname(os.path.abspath(db_path)) or "."
+    secret_file = os.path.join(data_dir, ".jwt_secret")
+
+    if os.path.isfile(secret_file):
+        try:
+            with open(secret_file, "r", encoding="utf-8") as f:
+                existing = f.read().strip()
+            if existing:
+                return existing
+        except OSError:
+            pass
+
+    new_secret = secrets.token_hex(32)
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+        fd = os.open(secret_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(new_secret)
+    except OSError:
+        # Filesystem is read-only or permission denied. Fall through and
+        # use the in-memory secret; it just won't survive this restart.
+        pass
+
+    return new_secret
+
+
+SECRET_KEY = _resolve_jwt_secret()
+ALGORITHM = "HS256"
+COOKIE_NAME = "lambda_erp_token"
+TOKEN_EXPIRE_DAYS = 30
+PASSWORD_HASH_PREFIX = "bcrypt_sha256$"
+router = APIRouter(prefix="/auth", tags=["auth"])
+
+# ---------------------------------------------------------------------------
+# Password helpers
+# ---------------------------------------------------------------------------
+
+
+def hash_password(password: str) -> str:
+    digest = hashlib.sha256(password.encode("utf-8")).hexdigest().encode("ascii")
+    hashed = bcrypt.hashpw(digest, bcrypt.gensalt()).decode("utf-8")
+    return f"{PASSWORD_HASH_PREFIX}{hashed}"
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    if not hashed.startswith(PASSWORD_HASH_PREFIX):
+        return False
+
+    digest = hashlib.sha256(plain.encode("utf-8")).hexdigest().encode("ascii")
+    encoded_hash = hashed.removeprefix(PASSWORD_HASH_PREFIX).encode("utf-8")
+    try:
+        return bcrypt.checkpw(digest, encoded_hash)
+    except ValueError:
+        return False
+
+
+def has_usable_password(hashed: str | None) -> bool:
+    """True if the stored hash is a real bcrypt password. Social-login-only
+    users carry a non-matchable sentinel that fails this check — they have no
+    password to change (they can set a first one via /auth/set-password)."""
+    return bool(hashed) and hashed.startswith(PASSWORD_HASH_PREFIX)
+
+
+# ---------------------------------------------------------------------------
+# JWT helpers
+# ---------------------------------------------------------------------------
+
+
+def create_access_token(user_name: str) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(days=TOKEN_EXPIRE_DAYS)
+    return jwt.encode({"sub": user_name, "exp": expire}, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def decode_token(token: str) -> str | None:
+    """Returns user name (sub) or None if invalid/expired."""
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload.get("sub")
+    except JWTError:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Cookie helpers
+# ---------------------------------------------------------------------------
+
+
+def _is_https_request(request: Request) -> bool:
+    """True if the request reached us over HTTPS, including via a TLS-
+    terminating proxy (Azure Container Apps, Cloudflare, etc.) that sets
+    X-Forwarded-Proto."""
+    if request.url.scheme == "https":
+        return True
+    return request.headers.get("x-forwarded-proto", "").lower() == "https"
+
+
+def set_auth_cookie(request: Request, response: Response, token: str):
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=token,
+        httponly=True,
+        # Only mark Secure when the request actually came in over HTTPS,
+        # so local http://localhost dev still gets the cookie.
+        secure=_is_https_request(request),
+        samesite="lax",
+        max_age=TOKEN_EXPIRE_DAYS * 24 * 3600,
+        path="/",
+    )
+
+
+def clear_auth_cookie(response: Response):
+    response.delete_cookie(key=COOKIE_NAME, path="/")
+
+
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
+
+
+class RegisterRequest(BaseModel):
+    email: str
+    full_name: str
+    password: str
+    invite_token: str | None = None
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class InviteRequest(BaseModel):
+    email: str
+    role: str = "viewer"
+
+
+class ChangeRoleRequest(BaseModel):
+    role: str
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+
+
+class SetPasswordRequest(BaseModel):
+    new_password: str
+
+
+# ---------------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------------
+
+ROLE_HIERARCHY = {"admin": 3, "manager": 2, "public_manager": 2, "viewer": 1}
+ASSIGNABLE_ROLES = {"admin", "manager", "viewer"}
+
+SESSION_CREDENTIAL = "session"
+API_KEY_CREDENTIAL = "api_key"
+PUBLIC_DEMO_CREDENTIAL = "public_demo"
+
+
+def make_auth_principal(
+    user: dict,
+    credential_type: str,
+    *,
+    name: str | None = None,
+    api_key_id: str | None = None,
+) -> dict:
+    """Return the request-scoped identity used by authorization checks.
+
+    ``User`` and ``Api Key`` rows remain the persistence model.  A principal is
+    deliberately ephemeral: it records both *who* the owner is and *how* this
+    request authenticated, so a role-capped API key cannot be mistaken for an
+    interactive browser session at credential-management endpoints.
+    """
+    principal = dict(user)
+    principal["user_id"] = user["name"]
+    principal["name"] = name or user["name"]
+    principal["credential_type"] = credential_type
+    if api_key_id:
+        principal["api_key_id"] = api_key_id
+    return principal
+
+
+def refresh_auth_principal(principal: dict | None) -> dict | None:
+    """Re-resolve an authenticated principal from live database state.
+
+    Used at long-lived boundaries (notably chat WebSockets and tool dispatch)
+    so disabling/demoting a user or revoking a key takes effect without waiting
+    for the connection to close.  Legacy in-process callers without an explicit
+    credential type are returned unchanged; every real HTTP/WS auth path sets it.
+    """
+    if not principal:
+        return None
+    credential_type = principal.get("credential_type")
+    if not credential_type:
+        return principal
+
+    db = get_db()
+    if credential_type == API_KEY_CREDENTIAL:
+        key_id = principal.get("api_key_id")
+        rows = db.sql(
+            'SELECT id, owner, role, session_owner, revoked FROM "Api Key" WHERE id = ?',
+            [key_id],
+        )
+        if not rows or rows[0].get("revoked"):
+            return None
+        key = dict(rows[0])
+        owner = db.get_value(
+            "User", key["owner"], ["name", "email", "full_name", "role", "enabled"]
+        )
+        if not owner or not owner.get("enabled"):
+            return None
+        owner = dict(owner)
+        effective_role = (
+            key["role"] if _role_rank(key["role"]) <= _role_rank(owner["role"])
+            else owner["role"]
+        )
+        owner["role"] = effective_role
+        scope_role = principal.get("oauth_scope_role")
+        if scope_role:
+            owner["role"] = min((owner["role"], scope_role), key=_role_rank)
+        refreshed = make_auth_principal(
+            owner,
+            API_KEY_CREDENTIAL,
+            name=principal.get("name") or key.get("session_owner") or owner["name"],
+            api_key_id=key["id"],
+        )
+        if scope_role:
+            refreshed["oauth_scope_role"] = scope_role
+        return refreshed
+
+    user_id = principal.get("user_id") or principal.get("name")
+    user = db.get_value(
+        "User", user_id, ["name", "email", "full_name", "role", "enabled"]
+    )
+    if not user or not user.get("enabled"):
+        return None
+    user = dict(user)
+    if credential_type == PUBLIC_DEMO_CREDENTIAL and user.get("role") != "public_manager":
+        return None
+    return make_auth_principal(user, credential_type)
+
+
+def get_current_user(request: Request) -> dict:
+    """FastAPI dependency: resolve the caller for every cookie-gated REST route.
+
+    Resolution order:
+      1. Session cookie (the web app) — a valid JWT wins.
+      2. `Authorization: Bearer <api-key>` — a programmatic caller, gated by the
+         `rest_api_enabled` Settings flag (off by default). The key acts AS its
+         owner with the owner's live role (capped at the key's role — see
+         `_lookup_api_key`), so a document it creates is attributed to the real
+         user and every `require_role` check behaves as if that user logged in.
+         This is the same key type the chat API uses; the two surfaces are
+         gated by independent flags.
+      3. Public manager (demo mode) when no credential is presented.
+
+    A malformed or invalid Bearer credential is a *failed* auth attempt, not a
+    fall-through — it raises 401 rather than silently downgrading to demo
+    access. `_lookup_api_key` / `_bearer_token` / `_setting_enabled` are defined
+    lower in this module and resolved at call time (late binding)."""
+    db = get_db()
+
+    token = request.cookies.get(COOKIE_NAME)
+    if token:
+        user_name = decode_token(token)
+        if user_name:
+            user = db.get_value("User", user_name, ["name", "email", "full_name", "role", "enabled"])
+            if user and user.get("enabled"):
+                return make_auth_principal(dict(user), SESSION_CREDENTIAL)
+
+    bearer = _bearer_token(request)
+    if bearer is not None:
+        if not _setting_enabled(db, "rest_api_enabled"):
+            raise HTTPException(status_code=401, detail="REST API key access is disabled")
+        key, owner, effective_role = _lookup_api_key(db, bearer)
+        owner = dict(owner)
+        owner["role"] = effective_role
+        return make_auth_principal(
+            owner, API_KEY_CREDENTIAL, api_key_id=key["id"]
+        )
+
+    # Fall back to public manager (demo mode)
+    pub = db.sql('SELECT name, email, full_name, role, enabled FROM "User" WHERE role = \'public_manager\' AND enabled = 1')
+    if pub:
+        return make_auth_principal(dict(pub[0]), PUBLIC_DEMO_CREDENTIAL)
+
+    raise HTTPException(status_code=401, detail="Not authenticated")
+
+
+def validate_assignable_role(role: str) -> str:
+    if role not in ASSIGNABLE_ROLES:
+        raise HTTPException(status_code=422, detail=f"Invalid role: {role}")
+    return role
+
+
+def require_role(minimum_role: str):
+    """Returns a dependency that checks the user has at least the specified role."""
+    min_level = ROLE_HIERARCHY[minimum_role]
+
+    def checker(user: dict = Depends(get_current_user)) -> dict:
+        user_level = ROLE_HIERARCHY.get(user["role"], 0)
+        if user_level < min_level:
+            raise HTTPException(status_code=403, detail=f"Requires {minimum_role} role or higher")
+        return user
+
+    return checker
+
+
+# Pre-built for convenience
+require_admin = require_role("admin")
+require_manager = require_role("manager")
+require_viewer = require_role("viewer")
+
+
+def require_interactive_user(user: dict = Depends(get_current_user)) -> dict:
+    """Require a real browser session for account/credential management."""
+    if user.get("credential_type") != SESSION_CREDENTIAL:
+        raise HTTPException(
+            status_code=403,
+            detail="This account-security operation requires an interactive sign-in.",
+        )
+    return user
+
+
+def require_interactive_role(minimum_role: str):
+    """Require both a browser session and the requested live account role."""
+    min_level = ROLE_HIERARCHY[minimum_role]
+
+    def checker(user: dict = Depends(require_interactive_user)) -> dict:
+        if ROLE_HIERARCHY.get(user.get("role"), 0) < min_level:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Requires {minimum_role} role or higher",
+            )
+        return user
+
+    return checker
+
+
+require_interactive_admin = require_interactive_role("admin")
+
+
+def require_non_public_manager(user: dict = Depends(get_current_user)) -> dict:
+    user_level = ROLE_HIERARCHY.get(user["role"], 0)
+    if user_level < ROLE_HIERARCHY["manager"]:
+        raise HTTPException(status_code=403, detail="Requires manager role or higher")
+    if user["role"] == "public_manager":
+        raise HTTPException(status_code=403, detail="Demo mode cannot modify master data")
+    return user
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.get("/setup-status")
+def auth_setup_status():
+    """Public: first-run detection + whether registration is open.
+
+    - first_run: no users yet — the next registrant becomes the admin.
+    - public_signup: the admin has enabled open self-registration (as viewer).
+    - registration_open: registration without an invite is possible at all
+      (first_run OR public_signup) — the signup form keys off this.
+    """
+    db = get_db()
+    count = db.sql('SELECT COUNT(*) as cnt FROM "User"')[0]["cnt"]
+    first_run = count == 0
+    public_signup = _setting_enabled(db, "allow_public_signup")
+    # Lazy import avoids a circular import (api.oauth imports from api.auth).
+    from api.oauth import configured_providers
+    return {
+        "has_users": count > 0,
+        "first_run": first_run,
+        "public_signup": public_signup,
+        "registration_open": first_run or public_signup,
+        "oauth_providers": configured_providers(),
+    }
+
+
+@router.post("/register")
+def register(data: RegisterRequest, request: Request, response: Response):
+    db = get_db()
+
+    # Check if email already taken
+    existing = db.sql('SELECT name FROM "User" WHERE email = ?', [data.email.lower()])
+    if existing:
+        raise HTTPException(status_code=409, detail="Email already registered")
+
+    # Determine role
+    user_count = db.sql('SELECT COUNT(*) as cnt FROM "User"')[0]["cnt"]
+
+    if user_count == 0:
+        # First user bootstraps the instance as admin.
+        role = "admin"
+    elif data.invite_token:
+        # Invite-only registration: the invite is bound to an email and a role.
+        rows = db.sql('SELECT token, email, role, used FROM "Invite" WHERE token = ?', [data.invite_token])
+        invite = rows[0] if rows else None
+        if not invite:
+            raise HTTPException(status_code=404, detail="Invalid invite token")
+        if invite["used"]:
+            raise HTTPException(status_code=410, detail="Invite already used")
+        if invite["email"].lower() != data.email.lower():
+            raise HTTPException(status_code=403, detail="This invite was issued for a different email")
+
+        role = validate_assignable_role(invite["role"])
+        db.sql('UPDATE "Invite" SET used = 1 WHERE token = ?', [data.invite_token])
+        db.conn.commit()
+    elif _setting_enabled(db, "allow_public_signup"):
+        # Open signup is enabled: anyone may self-register, but only as a viewer.
+        role = "viewer"
+    else:
+        raise HTTPException(status_code=403, detail="Registration requires an invite")
+
+    user_name = f"USR-{uuid.uuid4().hex[:8]}"
+    db.insert("User", {
+        "name": user_name,
+        "email": data.email.lower(),
+        "full_name": data.full_name,
+        "hashed_password": hash_password(data.password),
+        "role": role,
+        "enabled": 1,
+        "creation": now(),
+        "modified": now(),
+    })
+
+    token = create_access_token(user_name)
+    set_auth_cookie(request, response, token)
+
+    return {"name": user_name, "email": data.email.lower(), "full_name": data.full_name, "role": role, "has_password": True}
+
+
+@router.post("/login")
+def login(data: LoginRequest, request: Request, response: Response):
+    db = get_db()
+    rows = db.sql(
+        'SELECT name, email, full_name, hashed_password, role, enabled FROM "User" WHERE email = ?',
+        [data.email.lower()],
+    )
+    if not rows:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    user = rows[0]
+    if not verify_password(data.password, user["hashed_password"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    if not user.get("enabled", 1):
+        raise HTTPException(status_code=403, detail="Account disabled")
+    if user["role"] == "public_manager":
+        raise HTTPException(status_code=403, detail="Demo mode account cannot sign in directly")
+
+    token = create_access_token(user["name"])
+    set_auth_cookie(request, response, token)
+
+    return {"name": user["name"], "email": user["email"], "full_name": user["full_name"], "role": user["role"],
+            "has_password": has_usable_password(user["hashed_password"])}
+
+
+@router.post("/logout")
+def logout(response: Response):
+    clear_auth_cookie(response)
+    return {"ok": True}
+
+
+@router.get("/me")
+def me(user: dict = Depends(get_current_user)):
+    db = get_db()
+    row = db.get_value("User", user["name"], ["hashed_password"])
+    has_password = has_usable_password(row["hashed_password"]) if row else False
+    return {"name": user["name"], "email": user["email"], "full_name": user["full_name"],
+            "role": user["role"], "has_password": has_password}
+
+
+@router.post("/change-password")
+def change_password(data: ChangePasswordRequest, user: dict = Depends(require_interactive_user)):
+    """Change the signed-in user's own password (verifies the current one)."""
+    # The public_manager is a shared demo account — no real password to change.
+    if user["role"] == "public_manager":
+        raise HTTPException(status_code=403, detail="Demo accounts cannot change password")
+
+    if len(data.new_password) < 6:
+        raise HTTPException(status_code=422, detail="Password must be at least 6 characters")
+
+    db = get_db()
+    rows = db.sql('SELECT hashed_password FROM "User" WHERE name = ?', [user["name"]])
+    if not rows:
+        raise HTTPException(status_code=404, detail="User not found")
+    if not verify_password(data.current_password, rows[0]["hashed_password"]):
+        raise HTTPException(status_code=403, detail="Current password is incorrect")
+
+    db.set_value("User", user["name"],
+                 {"hashed_password": hash_password(data.new_password), "modified": now()})
+    return {"ok": True}
+
+
+@router.post("/set-password")
+def set_password(data: SetPasswordRequest, user: dict = Depends(require_interactive_user)):
+    """Set a first password for an account that has none — e.g. a user created
+    via social login who wants an email+password fallback. Requires an
+    authenticated session; refuses if a usable password already exists (that
+    path is change-password, which verifies the current one) or for the shared
+    demo account."""
+    if user["role"] == "public_manager":
+        raise HTTPException(status_code=403, detail="Demo accounts cannot set a password")
+
+    if len(data.new_password) < 6:
+        raise HTTPException(status_code=422, detail="Password must be at least 6 characters")
+
+    db = get_db()
+    row = db.get_value("User", user["name"], ["hashed_password"])
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+    if has_usable_password(row["hashed_password"]):
+        raise HTTPException(status_code=409, detail="A password is already set; use change password instead")
+
+    db.set_value("User", user["name"],
+                 {"hashed_password": hash_password(data.new_password), "modified": now()})
+    return {"ok": True}
+
+
+@router.post("/invite")
+def create_invite(data: InviteRequest, user: dict = Depends(require_interactive_admin)):
+    db = get_db()
+
+    validate_assignable_role(data.role)
+
+    existing = db.sql('SELECT name FROM "User" WHERE email = ?', [data.email.lower()])
+    if existing:
+        raise HTTPException(status_code=409, detail="User with this email already exists")
+
+    token = secrets.token_hex(16)
+    db.insert("Invite", {
+        "token": token,
+        "email": data.email.lower(),
+        "role": data.role,
+        "created_by": user["name"],
+        "used": 0,
+        "creation": now(),
+    })
+
+    return {"token": token, "email": data.email.lower(), "role": data.role, "link": f"/login?invite={token}"}
+
+
+@router.get("/users")
+def list_users(user: dict = Depends(require_interactive_admin)):
+    db = get_db()
+    rows = db.sql('SELECT name, email, full_name, role, enabled, creation FROM "User" ORDER BY creation')
+    return [dict(r) for r in rows]
+
+
+@router.put("/users/{user_name}/role")
+def change_role(user_name: str, data: ChangeRoleRequest, user: dict = Depends(require_interactive_admin)):
+    validate_assignable_role(data.role)
+
+    db = get_db()
+    if not db.exists("User", user_name):
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if user_name == user["name"] and data.role != "admin":
+        admin_count = db.sql('SELECT COUNT(*) as cnt FROM "User" WHERE role = \'admin\' AND enabled = 1')[0]["cnt"]
+        if admin_count <= 1:
+            raise HTTPException(status_code=409, detail="Cannot demote the only admin")
+
+    db.set_value("User", user_name, {"role": data.role, "modified": now()})
+    return {"ok": True}
+
+
+@router.delete("/users/{user_name}")
+def disable_user(user_name: str, user: dict = Depends(require_interactive_admin)):
+    if user_name == user["name"]:
+        raise HTTPException(status_code=409, detail="Cannot disable yourself")
+
+    db = get_db()
+    if not db.exists("User", user_name):
+        raise HTTPException(status_code=404, detail="User not found")
+
+    db.set_value("User", user_name, {"enabled": 0, "modified": now()})
+    return {"ok": True}
+
+
+@router.get("/invites")
+def list_invites(user: dict = Depends(require_interactive_admin)):
+    db = get_db()
+    rows = db.sql('SELECT token, email, role, used, creation FROM "Invite" ORDER BY creation DESC')
+    return [dict(r) for r in rows]
+
+
+@router.delete("/invites/{token}")
+def revoke_invite(token: str, user: dict = Depends(require_interactive_admin)):
+    """Revoke a pending (unused) invite so its link no longer works."""
+    db = get_db()
+    rows = db.sql('SELECT token, used FROM "Invite" WHERE token = ?', [token])
+    if not rows:
+        raise HTTPException(status_code=404, detail="Invite not found")
+    if rows[0]["used"]:
+        raise HTTPException(status_code=409, detail="Invite already used")
+    db.sql('DELETE FROM "Invite" WHERE token = ?', [token])
+    db.conn.commit()
+    return {"ok": True}
+
+
+@router.post("/public-manager")
+def create_public_manager(user: dict = Depends(require_interactive_admin)):
+    """Create (or re-enable) the public manager account for demo mode.
+
+    Also seeds the chat-replay artefacts the "Enter Live Demo" script
+    narrates (quotation, purchase order, custom analytics draft, the
+    Redstone sales invoice, top-customer snapshots). Without this the
+    admin-UI toggle would produce a public_manager account but a blank
+    replay session, while booting with LAMBDA_ERP_ENABLE_PUBLIC_DEMO=1
+    would produce both — same end state no matter how demo mode gets
+    turned on.
+    """
+    db = get_db()
+    existing = db.sql('SELECT name, enabled FROM "User" WHERE role = \'public_manager\'')
+    if existing:
+        if not existing[0]["enabled"]:
+            db.set_value("User", existing[0]["name"], {"enabled": 1, "modified": now()})
+        user_name = existing[0]["name"]
+        status = "enabled"
+    else:
+        user_name = f"USR-{uuid.uuid4().hex[:8]}"
+        db.insert("User", {
+            "name": user_name,
+            "email": "demo@lambda-erp.local",
+            "full_name": "Demo User",
+            "hashed_password": hash_password(secrets.token_hex(32)),
+            "role": "public_manager",
+            "enabled": 1,
+            "creation": now(),
+            "modified": now(),
+        })
+        status = "created"
+
+    # Seed replay records idempotently. The helper is safe to call on
+    # every invocation — it checks existing settings before inserting.
+    # Wrapped so a seed edge case (e.g. simulator hasn't run yet in an
+    # unusual deploy) never blocks the public_manager toggle.
+    try:
+        companies = db.get_all("Company", fields=["name"])
+        if companies:
+            from api.bootstrap import ensure_demo_chat_records
+            ensure_demo_chat_records(companies[0]["name"])
+    except Exception:
+        pass
+
+    return {"ok": True, "name": user_name, "status": status}
+
+
+@router.delete("/public-manager")
+def remove_public_manager(user: dict = Depends(require_interactive_admin)):
+    """Disable the public manager account."""
+    db = get_db()
+    existing = db.sql('SELECT name FROM "User" WHERE role = \'public_manager\'')
+    if not existing:
+        return {"ok": True, "status": "not_found"}
+    db.set_value("User", existing[0]["name"], {"enabled": 0, "modified": now()})
+    return {"ok": True, "status": "disabled"}
+
+
+@router.get("/public-manager")
+def get_public_manager_status():
+    """Public: check if a public manager exists and is enabled."""
+    db = get_db()
+    existing = db.sql('SELECT name, full_name, role, enabled FROM "User" WHERE role = \'public_manager\' AND enabled = 1')
+    if existing:
+        return {"active": True, "user": dict(existing[0])}
+    return {"active": False}
+
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+
+DEFAULTS = {
+    "pdf_page_size": "A4",
+    "opening_balances_enabled": "1",
+    # When "1", anyone may self-register (as viewer) without an invite. Default
+    # off: after the first user (admin), registration is invite-only.
+    "allow_public_signup": "0",
+    # When "1", the programmatic chat API (POST /api/v1/chat, Bearer API keys) is
+    # active. Default off — an admin turns it on and issues keys. See
+    # docs/chat-api.md.
+    "chat_api_enabled": "0",
+    # When "1", the same Bearer API keys authenticate the regular REST API
+    # (/api/documents, /api/masters, /api/reports, …) in addition to the session
+    # cookie. Default off — an admin turns it on to let connectors/scripts drive
+    # the ERP the way the web app does. Independent of chat_api_enabled. See
+    # docs/rest-api.md.
+    "rest_api_enabled": "0",
+}
+
+
+def _setting_enabled(db, key: str) -> bool:
+    """Read a boolean Settings flag, honoring DEFAULTS for unset keys."""
+    rows = db.sql('SELECT value FROM "Settings" WHERE key = ?', [key])
+    value = rows[0]["value"] if rows else DEFAULTS.get(key)
+    return str(value) == "1"
+
+
+def ensure_seed_admin() -> dict | None:
+    """Idempotently provision an admin account from the environment.
+
+    When both LAMBDA_ERP_ADMIN_EMAIL and LAMBDA_ERP_ADMIN_PASSWORD are set,
+    guarantee an enabled admin with that email exists *before* the first
+    visitor can register. This closes the "first user to sign up becomes
+    admin" bootstrap window (see `register`) on any deployment whose
+    database is recreated on every rollout — e.g. the ephemeral-SQLite demo
+    container, where otherwise whichever stranger loads the login page first
+    after a redeploy would silently own the instance.
+
+    Create-if-missing: an existing account with that email is promoted to an
+    enabled admin if needed, but its password is left untouched so a redeploy
+    never clobbers a credential changed inside a live instance. The password
+    is read only from the environment and is never logged.
+
+    No-op (returns None) when either variable is unset — this is a general
+    ops seam, not demo-only.
+    """
+    email = os.environ.get("LAMBDA_ERP_ADMIN_EMAIL")
+    password = os.environ.get("LAMBDA_ERP_ADMIN_PASSWORD")
+    if not email or not password:
+        return None
+
+    email = email.strip().lower()
+    db = get_db()
+
+    existing = db.sql('SELECT name, role, enabled FROM "User" WHERE email = ?', [email])
+    if existing:
+        row = existing[0]
+        updates = {}
+        if row["role"] != "admin":
+            updates["role"] = "admin"
+        if not row["enabled"]:
+            updates["enabled"] = 1
+        if updates:
+            updates["modified"] = now()
+            db.set_value("User", row["name"], updates)
+            print(f"[seed-admin] promoted existing user to enabled admin: {email}", flush=True)
+        else:
+            print(f"[seed-admin] admin already present: {email}", flush=True)
+        return {"name": row["name"], "status": "exists"}
+
+    user_name = f"USR-{uuid.uuid4().hex[:8]}"
+    full_name = os.environ.get("LAMBDA_ERP_ADMIN_NAME", "Administrator")
+    db.insert("User", {
+        "name": user_name,
+        "email": email,
+        "full_name": full_name,
+        "hashed_password": hash_password(password),
+        "role": "admin",
+        "enabled": 1,
+        "creation": now(),
+        "modified": now(),
+    })
+    print(f"[seed-admin] created admin account: {email}", flush=True)
+    return {"name": user_name, "status": "created"}
+
+
+@router.get("/settings")
+def get_settings(user: dict = Depends(require_interactive_user)):
+    db = get_db()
+    rows = db.sql('SELECT key, value FROM "Settings"')
+    settings = {r["key"]: r["value"] for r in rows}
+    # Merge defaults for missing keys
+    for k, v in DEFAULTS.items():
+        if k not in settings:
+            settings[k] = v
+    return settings
+
+
+@router.put("/settings")
+def update_settings(data: dict, user: dict = Depends(require_interactive_admin)):
+    db = get_db()
+    for key, value in data.items():
+        existing = db.sql('SELECT key FROM "Settings" WHERE key = ?', [key])
+        if existing:
+            db.sql('UPDATE "Settings" SET value = ? WHERE key = ?', [str(value), key])
+        else:
+            db.sql('INSERT INTO "Settings" (key, value) VALUES (?, ?)', [key, str(value)])
+    db.conn.commit()
+    # Return updated settings
+    rows = db.sql('SELECT key, value FROM "Settings"')
+    settings = {r["key"]: r["value"] for r in rows}
+    for k, v in DEFAULTS.items():
+        if k not in settings:
+            settings[k] = v
+    return settings
+
+
+@router.get("/my-settings")
+def get_my_settings(user: dict = Depends(get_current_user)):
+    """The CURRENT user's personal preferences as a {key: value} bag.
+
+    Distinct from the global, admin-only /settings above: this is scoped to the
+    caller and any authenticated user may read (and, via PUT, write) their OWN
+    row. Consumers so far: `columns.<doctype>` (personal list columns) and
+    `language`. Returns {} for a user who has set nothing.
+    """
+    db = get_db()
+    rows = db.sql('SELECT key, value FROM "User Preference" WHERE user_name = ?', [user["name"]])
+    return {r["key"]: r["value"] for r in rows}
+
+
+@router.put("/my-settings")
+def update_my_settings(data: dict, user: dict = Depends(get_current_user)):
+    """Merge-upsert the caller's OWN preferences (not admin-gated — a user owns
+    their prefs). Only rows with this user_name are ever touched, so one user can
+    never read or overwrite another's. Send only the keys you want to change."""
+    db = get_db()
+    uname = user["name"]
+    for key, value in data.items():
+        existing = db.sql(
+            'SELECT 1 FROM "User Preference" WHERE user_name = ? AND key = ?', [uname, key]
+        )
+        if existing:
+            db.sql(
+                'UPDATE "User Preference" SET value = ? WHERE user_name = ? AND key = ?',
+                [str(value), uname, key],
+            )
+        else:
+            db.sql(
+                'INSERT INTO "User Preference" (user_name, key, value) VALUES (?, ?, ?)',
+                [uname, key, str(value)],
+            )
+    db.conn.commit()
+    rows = db.sql('SELECT key, value FROM "User Preference" WHERE user_name = ?', [uname])
+    return {r["key"]: r["value"] for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Programmatic chat API — Bearer API keys
+# ---------------------------------------------------------------------------
+
+API_KEY_PREFIX = "sk_erp_"
+API_KEY_ROLES = ("viewer", "manager", "admin")
+
+
+def hash_api_key(token: str) -> str:
+    """Hash an API token for storage/lookup. Tokens are high-entropy, so a fast
+    sha256 is sufficient (unlike user passwords, which use bcrypt)."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def generate_api_key() -> tuple[str, str, str]:
+    """Return (token, key_prefix, key_hash) for a fresh API key.
+
+    The full token is shown to the admin exactly once; only the hash + a short
+    display prefix are stored.
+    """
+    token = API_KEY_PREFIX + secrets.token_hex(24)
+    return token, token[: len(API_KEY_PREFIX) + 4], hash_api_key(token)
+
+
+def _role_rank(role: str) -> int:
+    return ROLE_HIERARCHY.get(role, 0)
+
+
+def _bearer_token(request: Request) -> str | None:
+    """The token from an `Authorization: Bearer <token>` header.
+
+    Returns None when the header is absent or not a Bearer scheme (no auth
+    attempt — the caller may still have a cookie). Returns "" for a bare
+    `Bearer ` with no token — a malformed *attempt* that callers treat as a
+    401, distinct from None.
+    """
+    header = request.headers.get("authorization", "")
+    if not header.lower().startswith("bearer "):
+        return None
+    return header[7:].strip()
+
+
+def _lookup_api_key(db, token: str) -> tuple[dict, dict, str]:
+    """Validate a Bearer API token → (key, owner, effective_role).
+
+    Raises 401 on any failure (empty/unknown/revoked token, or a disabled/
+    deleted owner). Bumps `last_used_at`. Shared by the chat API and the REST
+    API so both resolve a key identically — they differ only in the Settings
+    flag that gates them and the caller identity they build from the result.
+
+    The effective role is resolved LIVE as min(key's role cap, owner's current
+    role): a key can never out-rank its owner, and lowering an owner's role (or
+    disabling them) instantly constrains every one of their keys.
+    """
+    if not token:
+        raise HTTPException(status_code=401, detail="Empty bearer token")
+
+    rows = db.sql(
+        'SELECT id, name, owner, role, session_owner FROM "Api Key" WHERE key_hash = ? AND revoked = 0',
+        [hash_api_key(token)],
+    )
+    if not rows:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    key = dict(rows[0])
+
+    owner = db.get_value("User", key["owner"], ["name", "email", "full_name", "role", "enabled"])
+    if not owner or not owner.get("enabled"):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    owner = dict(owner)
+    effective_role = (
+        key["role"] if _role_rank(key["role"]) <= _role_rank(owner["role"]) else owner["role"]
+    )
+
+    db.sql('UPDATE "Api Key" SET last_used_at = ? WHERE id = ?', [now(), key["id"]])
+    db.conn.commit()
+    return key, owner, effective_role
+
+
+def get_api_caller(request: Request) -> dict:
+    """FastAPI dependency for the programmatic chat API (POST /api/v1/chat).
+
+    Gated by the `chat_api_enabled` Settings flag — when off the whole surface
+    404s (never advertised on instances that don't use it). Otherwise validates
+    the Bearer key via `_lookup_api_key`. The caller's `name` is the key's
+    session_owner (``api:<username>``) — all of one user's keys share a chat
+    session space, separate from their interactive web chats. (The REST API, by
+    contrast, has the key act as the real user — see `get_current_user`.)
+    """
+    db = get_db()
+    if not _setting_enabled(db, "chat_api_enabled"):
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    token = _bearer_token(request)
+    if token is None:
+        raise HTTPException(status_code=401, detail="Missing or malformed Authorization header")
+    key, owner, effective_role = _lookup_api_key(db, token)
+
+    owner = dict(owner)
+    owner["role"] = effective_role
+    principal = make_auth_principal(
+        owner,
+        API_KEY_CREDENTIAL,
+        name=key["session_owner"],
+        api_key_id=key["id"],
+    )
+    principal["full_name"] = f"{owner.get('full_name') or key['owner']} (API)"
+    principal["api_key_user"] = key["owner"]
+    return principal
+
+
+class ApiKeyCreate(BaseModel):
+    name: str
+    # Optional role CAP. Defaults to the creator's own role; may only be equal
+    # or lower — a key can never out-rank its owner.
+    role: str | None = None
+    app_type: Literal['claude_code', 'codex', 'other'] = 'other'
+
+
+def _serialize_api_key(row: dict) -> dict:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "user": row.get("owner"),
+        # Owner's display identity so the UI can group keys per user with a
+        # human name instead of the opaque USR-id (admins see many owners).
+        "owner_full_name": row.get("owner_full_name"),
+        "owner_email": row.get("owner_email"),
+        "role": row["role"],
+        "key_prefix": row["key_prefix"],
+        "created_at": row.get("created_at"),
+        "last_used_at": row.get("last_used_at"),
+        "revoked": bool(row.get("revoked")),
+        "app_type": row.get("app_type") or "other",
+    }
+
+
+def _get_key_or_404(db, key_id: str) -> dict:
+    rows = db.sql('SELECT id, owner, revoked FROM "Api Key" WHERE id = ?', [key_id])
+    if not rows:
+        raise HTTPException(status_code=404, detail="API key not found")
+    return dict(rows[0])
+
+
+def _require_key_access(key: dict, user: dict) -> None:
+    """A key is managed by its owner; admins can manage every key."""
+    if key["owner"] != user["name"] and user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Not your API key")
+
+
+@router.get("/api-keys")
+def list_api_keys(user: dict = Depends(require_interactive_user)):
+    """List API keys (metadata only — the token is never returned).
+
+    Users see their own keys; admins see everyone's. Each key carries its
+    owner's display name/email and an `is_mine` flag so the UI can group keys
+    per user (your own first) and warn before touching someone else's.
+    """
+    db = get_db()
+    base = (
+        'SELECT k.id, k.name, k.owner, k.role, k.key_prefix, k.created_at, '
+        'k.last_used_at, k.revoked, k.app_type, u.full_name AS owner_full_name, u.email AS owner_email '
+        'FROM "Api Key" k LEFT JOIN "User" u ON u.name = k.owner '
+    )
+    if user["role"] == "admin":
+        rows = db.sql(base + 'ORDER BY k.created_at DESC')
+    else:
+        rows = db.sql(base + 'WHERE k.owner = ? ORDER BY k.created_at DESC', [user["name"]])
+    out = []
+    for r in rows:
+        d = _serialize_api_key(dict(r))
+        d["is_mine"] = d["user"] == user["name"]
+        out.append(d)
+    return out
+
+
+@router.post("/api-keys")
+def create_api_key(data: ApiKeyCreate, user: dict = Depends(require_interactive_user)):
+    """Create an API key for YOURSELF. Returns the full token exactly once.
+
+    Self-service: any logged-in (non-demo) user can mint keys, because a key
+    can never exceed its owner's live role — the optional `role` is a cap that
+    must be equal or lower.
+    """
+    if user["role"] == "public_manager":
+        raise HTTPException(status_code=403, detail="Demo mode cannot create API keys.")
+    name = (data.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="A name is required.")
+
+    role = data.role or user["role"]
+    if role not in API_KEY_ROLES:
+        raise HTTPException(status_code=422, detail=f"Invalid role: {role}")
+    if _role_rank(role) > _role_rank(user["role"]):
+        raise HTTPException(
+            status_code=403,
+            detail=f"A key cannot out-rank its owner (your role: {user['role']}).",
+        )
+
+    db = get_db()
+    key_id = str(uuid.uuid4())
+    token, key_prefix, key_hash = generate_api_key()
+    created_at = now()
+    db.sql(
+        'INSERT INTO "Api Key" '
+        '(id, name, owner, key_hash, key_prefix, role, session_owner, created_at, last_used_at, revoked, app_type) '
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)',
+        [key_id, name, user["name"], key_hash, key_prefix, role, f"api:{user['name']}", created_at, None, data.app_type],
+    )
+    db.conn.commit()
+    row = {
+        "id": key_id, "name": name, "owner": user["name"], "role": role, "key_prefix": key_prefix,
+        "created_at": created_at, "last_used_at": None, "revoked": 0,
+        "owner_full_name": user.get("full_name"), "owner_email": user.get("email"),
+        "app_type": data.app_type,
+    }
+    result = _serialize_api_key(row)
+    result["is_mine"] = True
+    result["token"] = token  # shown once
+    return result
+
+
+@router.post("/api-keys/{key_id}/revoke")
+def revoke_api_key(key_id: str, user: dict = Depends(require_interactive_user)):
+    """Revoke (soft-disable) an API key. Owner or admin."""
+    db = get_db()
+    key = _get_key_or_404(db, key_id)
+    _require_key_access(key, user)
+    db.sql('UPDATE "Api Key" SET revoked = 1 WHERE id = ?', [key_id])
+    db.conn.commit()
+    return {"id": key_id, "revoked": True}
+
+
+@router.delete("/api-keys/{key_id}")
+def delete_api_key(key_id: str, user: dict = Depends(require_interactive_user)):
+    """Hard-delete a REVOKED API key. Owner or admin.
+
+    Two-step by design: a live key must be revoked first (409 otherwise), so a
+    key can't vanish while still usable. Past sessions keep their session_owner
+    string, so historical attribution survives the row's deletion.
+    """
+    db = get_db()
+    key = _get_key_or_404(db, key_id)
+    _require_key_access(key, user)
+    if not key.get("revoked"):
+        raise HTTPException(status_code=409, detail="Revoke the key first, then delete it.")
+    db.sql('DELETE FROM "Api Key" WHERE id = ?', [key_id])
+    db.conn.commit()
+    return {"id": key_id, "deleted": True}

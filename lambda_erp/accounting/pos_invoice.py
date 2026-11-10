@@ -1,0 +1,350 @@
+"""
+POS Invoice.
+
+POS Invoice is a Sales Invoice with immediate payment. It combines:
+- Sales Invoice GL entries (Dr: Receivable, Cr: Income)
+- Payment GL entries (Dr: Cash/Bank, Cr: Receivable)
+- Optional stock update (Dr: COGS, Cr: Stock In Hand)
+
+The receivable is created and immediately settled in one transaction.
+"""
+
+from lambda_erp.model import Document
+from lambda_erp.utils import _dict, flt, nowdate
+from lambda_erp.database import get_db
+from lambda_erp.controllers.taxes_and_totals import calculate_taxes_and_totals
+from lambda_erp.controllers.defaults import (
+    set_default_currency, apply_external_source_defaults,
+    derived_pricing_fields, derived_line_pricing_fields,
+)
+from lambda_erp.controllers.item_price import set_item_defaults
+from lambda_erp.exceptions import ValidationError
+from lambda_erp.stock.stock_ledger import (
+    make_sl_entries,
+    build_sell_side_sles,
+    build_cost_basis_gl,
+    reverse_stock_sles,
+)
+from lambda_erp.accounting.general_ledger import make_gl_entries, make_reverse_gl_entries, to_base_currency
+
+class POSInvoice(Document):
+    DOCTYPE = "POS Invoice"
+    SUBMITTABLE = True
+    CHILD_TABLES = {
+        "items": ("POS Invoice Item", None),
+        "taxes": ("Sales Taxes and Charges", None),
+        "payments": ("POS Invoice Payment", None),
+    }
+    PREFIX = "POS"
+
+    LINK_FIELDS = {
+        "customer": "Customer",
+        "company": "Company",
+        "debit_to": "Account",
+    }
+    CHILD_LINK_FIELDS = {
+        "items": {
+            "item_code": "Item",
+            "warehouse": "Warehouse",
+            "income_account": "Account",
+            "cost_center": "Cost Center",
+        },
+        "taxes": {
+            "account_head": "Account",
+            "cost_center": "Cost Center",
+        },
+    }
+    ACCOUNT_TYPE_CONSTRAINTS = {
+        "debit_to": {"account_type": "Receivable"},
+    }
+    CHILD_ACCOUNT_TYPE_CONSTRAINTS = {
+        "items": {"income_account": {"root_type": "Income"}},
+    }
+
+    def validate(self):
+        if not self.customer:
+            raise ValidationError("Customer is required")
+        if not self.get("items"):
+            raise ValidationError("At least one item is required")
+        if not self.posting_date:
+            self.posting_date = nowdate()
+
+        apply_external_source_defaults(self)
+        self._set_customer_name()
+        self._set_missing_accounts()
+        set_default_currency(self, "Customer", "customer")
+        self._set_item_defaults()
+        self._validate_external_source_stock()
+        if self.is_return:
+            self._validate_return()
+        # POS was the only selling document that never applied pricing rules.
+        # Nothing about a till sale makes a discount inapplicable, so the same
+        # item rang up at a different price depending on which document the
+        # sale happened to be written to.
+        from lambda_erp.controllers.pricing_rule import apply_pricing_rules
+        apply_pricing_rules(self)
+
+        calculate_taxes_and_totals(self)
+        self._calculate_payments()
+        self._set_status()
+
+    def _validate_external_source_stock(self):
+        """An upstream system's stock movement already accounts for the goods.
+
+        `_validate_no_double_shipment` catches the same mistake on the Sales
+        Order -> Delivery Note path by looking up `sales_order_item`. A document
+        created from an external system has no such link, so that lookup finds
+        nothing and passes. Without this guard the upstream issue and this
+        document's own update_stock each decrement the same quantity.
+        """
+        if not self._data.get("external_source"):
+            return
+        if flt(self.get("update_stock")):
+            raise ValidationError(
+                f"Cannot submit with update_stock=1: this document is sourced "
+                f"from {self._data['external_source']}, which already recorded "
+                f"the stock movement. Use this invoice as a bill only and "
+                f"record any required stock movement in a separate stock document."
+            )
+
+    def _validate_return(self):
+        from lambda_erp.workflow import validate_return
+        validate_return(self)
+
+    def _set_customer_name(self):
+        if not self.customer_name and self.customer:
+            db = get_db()
+            self.customer_name = db.get_value("Customer", self.customer, "customer_name")
+
+    def _set_missing_accounts(self):
+        db = get_db()
+        if self.company:
+            if not self.debit_to:
+                self._data["debit_to"] = db.get_value(
+                    "Company", self.company, "default_receivable_account"
+                )
+            default_income = db.get_value("Company", self.company, "default_income_account")
+            default_cc = db.get_value("Company", self.company, "default_cost_center")
+            for item in self.get("items"):
+                if not item.get("income_account"):
+                    item["income_account"] = default_income
+                if not item.get("cost_center"):
+                    item["cost_center"] = default_cc
+
+    def _set_item_defaults(self):
+        """Names, units and unsupplied rates. See controllers/item_price.py."""
+        set_item_defaults(self, "Customer", "customer", set_description=False)
+
+    def _calculate_payments(self):
+        paid = sum(flt(p.get("amount", 0)) for p in self.get("payments") or [])
+        self._data["paid_amount"] = flt(paid, 2)
+        grand = flt(self.grand_total, 2)
+        self._data["change_amount"] = flt(max(0, paid - grand), 2)
+        self._data["outstanding_amount"] = flt(max(0, grand - paid), 2)
+
+    def _set_status(self):
+        if self.docstatus == 0:
+            self._data["status"] = "Draft"
+        elif self.docstatus == 2:
+            self._data["status"] = "Cancelled"
+        elif self.docstatus == 1:
+            if flt(self.outstanding_amount) <= 0:
+                self._data["status"] = "Paid"
+            else:
+                self._data["status"] = "Unpaid"
+
+    def on_submit(self):
+        # POS sales must be paid at time of submit. Returns are the exception:
+        # refund payments are optional — the user can settle the refund later
+        # via a Payment Entry or off-ledger.
+        if not self.is_return and not self.get("payments"):
+            raise ValidationError("At least one payment is required for POS Invoice")
+
+        gl_entries = self._get_gl_entries()
+        # Financial side (AR/income/tax/payments) is in document currency;
+        # convert to base before posting. Cost-of-goods entries below are
+        # already in base currency.
+        to_base_currency(gl_entries, self.get("conversion_rate"))
+
+        # When update_stock=1, post SLEs first so stock_value_difference is
+        # available on the persisted rows, then append the matching stock-side
+        # GL entries (Dr COGS / Cr Stock In Hand at cost). Without this, stock
+        # leaves physically but the balance sheet never reflects it.
+        if flt(self._data.get("update_stock")):
+            sl_entries = self._get_sl_entries()
+            if sl_entries:
+                make_sl_entries(sl_entries)
+            gl_entries.extend(build_cost_basis_gl(self, remarks=f"POS sale via {self.name}"))
+
+        if gl_entries:
+            make_gl_entries(gl_entries)
+
+    def on_cancel(self):
+        if flt(self._data.get("update_stock")):
+            reversed_sles = reverse_stock_sles(self._get_sl_entries())
+            if reversed_sles:
+                make_sl_entries(reversed_sles, allow_negative_stock=True)
+
+        make_reverse_gl_entries(
+            voucher_type=self.DOCTYPE,
+            voucher_no=self.name,
+        )
+
+    def _get_gl_entries(self):
+        db = get_db()
+        gl_entries = []
+
+        grand_total = flt(self.grand_total, 2)
+        if not grand_total:
+            return []
+
+        # 1. Dr: Accounts Receivable
+        gl_entries.append(_dict(
+            account=self.debit_to,
+            party_type="Customer",
+            party=self.customer,
+            debit=grand_total,
+            debit_in_account_currency=grand_total,
+            credit=0,
+            credit_in_account_currency=0,
+            voucher_type=self.DOCTYPE,
+            voucher_no=self.name,
+            posting_date=self.posting_date,
+            company=self.company,
+        ))
+
+        # 2. Cr: Income accounts
+        income_accounts = {}
+        for item in self.get("items"):
+            account = item.get("income_account")
+            if not account:
+                continue
+            key = (account, item.get("cost_center"))
+            income_accounts[key] = income_accounts.get(key, 0) + flt(item.get("net_amount", 0))
+
+        for (account, cost_center), amount in income_accounts.items():
+            gl_entries.append(_dict(
+                account=account,
+                credit=flt(amount, 2),
+                credit_in_account_currency=flt(amount, 2),
+                debit=0,
+                debit_in_account_currency=0,
+                cost_center=cost_center,
+                voucher_type=self.DOCTYPE,
+                voucher_no=self.name,
+                posting_date=self.posting_date,
+                company=self.company,
+            ))
+
+        # 3. Cr: Tax accounts
+        for tax in self.get("taxes") or []:
+            if flt(tax.get("tax_amount")):
+                gl_entries.append(_dict(
+                    account=tax.get("account_head"),
+                    credit=flt(tax["tax_amount"], 2),
+                    credit_in_account_currency=flt(tax["tax_amount"], 2),
+                    debit=0,
+                    debit_in_account_currency=0,
+                    voucher_type=self.DOCTYPE,
+                    voucher_no=self.name,
+                    posting_date=self.posting_date,
+                    company=self.company,
+                ))
+
+        # 4. Payment entries — Dr: Cash/Bank, Cr: Receivable
+        for payment in self.get("payments") or []:
+            pay_amount = flt(payment.get("amount", 0), 2)
+            if not pay_amount:
+                continue
+            pay_account = payment.get("account")
+            if not pay_account:
+                pay_account = db.get_value("Company", self.company, "default_bank_account")
+            if not pay_account:
+                continue
+
+            # Dr: Cash/Bank
+            gl_entries.append(_dict(
+                account=pay_account,
+                debit=pay_amount,
+                debit_in_account_currency=pay_amount,
+                credit=0,
+                credit_in_account_currency=0,
+                voucher_type=self.DOCTYPE,
+                voucher_no=self.name,
+                posting_date=self.posting_date,
+                company=self.company,
+            ))
+
+            # Cr: Receivable (settles the debit from step 1)
+            gl_entries.append(_dict(
+                account=self.debit_to,
+                party_type="Customer",
+                party=self.customer,
+                debit=0,
+                debit_in_account_currency=0,
+                credit=pay_amount,
+                credit_in_account_currency=pay_amount,
+                voucher_type=self.DOCTYPE,
+                voucher_no=self.name,
+                posting_date=self.posting_date,
+                company=self.company,
+            ))
+
+        return gl_entries
+
+    def _get_sl_entries(self):
+        """SLEs for direct-ship POS sales. See stock_ledger.build_sell_side_sles
+        for semantics (rates passed as 0 so moving-average cost is used)."""
+        return build_sell_side_sles(self, self.get("items"))
+
+def make_pos_return(posi_name):
+    """Create a return POS Invoice from an existing one. Carries update_stock
+    so the return also reverses inventory when the original was direct-ship.
+    Refund payments are optional — a POS return with no payment row leaves
+    the refund as an AR balance the original customer can draw from, or the
+    user can post a Payment Entry separately."""
+    original = POSInvoice.load(posi_name)
+
+    if original.docstatus != 1:
+        raise ValidationError("POS Invoice must be submitted before creating a return")
+    if original.is_return:
+        raise ValidationError("Cannot create a return against a return")
+
+    return_pos = POSInvoice(
+        **derived_pricing_fields(original, is_return=True),
+        customer=original.customer,
+        company=original.company,
+        currency=original.get("currency") or "USD",
+        conversion_rate=original.get("conversion_rate") or 1.0,
+        posting_date=nowdate(),
+        debit_to=original.debit_to,
+        is_return=1,
+        return_against=original.name,
+        update_stock=flt(original.get("update_stock")) or 0,
+    )
+
+    from lambda_erp.workflow import returnable_rows
+    for item in returnable_rows(original):
+        return_pos.append("items", _dict(
+            **derived_line_pricing_fields(item),
+            item_code=item.get("item_code"),
+            item_name=item.get("item_name"),
+            description=item.get("description"),
+            qty=-flt(item.get("qty")),
+            uom=item.get("uom"),
+            rate=flt(item.get("rate")),
+            income_account=item.get("income_account"),
+            cost_center=item.get("cost_center"),
+            warehouse=item.get("warehouse"),
+        ))
+
+    for tax in original.get("taxes") or []:
+        return_pos.append("taxes", _dict(
+            charge_type=tax.get("charge_type"),
+            account_head=tax.get("account_head"),
+            description=tax.get("description"),
+            rate=flt(tax.get("rate")),
+            tax_amount=-flt(tax.get("tax_amount")),
+        ))
+
+    return return_pos

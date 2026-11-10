@@ -1,0 +1,88 @@
+# Render Blueprint for the Lambda ERP + MSME finance & compliance platform.
+#
+# What this creates (all in one region so the web service reaches the database over Render's private network):
+#   - msme-db        managed PostgreSQL 16 (paid plan: continuous point-in-time recovery + 7-day dashboard exports)
+#   - lambda-erp-msme  Docker web service, ONE instance, with a persistent disk for documents and chat attachments
+#
+# Hard-to-reverse choices (read docs/msme/DEPLOYMENT_RENDER.md before the first sync):
+#   - region: fixed at creation for both the service and the database.
+#   - a persistent disk pins the service to a single instance and every deploy has a brief gap (Render stops the old
+#     instance before starting the new one). Disk snapshots are DAILY, so files on the disk can lose up to 24 h; the
+#     runbook explains the off-platform copy that closes that gap.
+#   - database name/user/region cannot be changed after creation.
+#
+# Secrets are never stored here: `sync: false` makes Render prompt for the value in the Dashboard.
+# Plan IDs follow Render's current compute naming (https://render.com/docs/blueprint-spec). Before the first sync run
+#   render blueprints validate render.yaml      (needs `render login`; checks schema, plans and regions server-side)
+
+databases:
+  - name: msme-db
+    plan: 0.5c-1g                   # 0.5 CPU / 1 GB (Render's "Basic-1gb"). Paid => continuous point-in-time recovery (3-day window on a Hobby workspace, 7-day on Pro)
+    region: singapore
+    postgresMajorVersion: "16"
+    databaseName: lambda_erp
+    user: lambda_erp
+    ipAllowList: []                 # no external access: only services on Render's private network can connect
+
+services:
+  - type: web
+    name: lambda-erp-msme
+    runtime: docker
+    plan: 1c-2g                     # 1 CPU / 2 GB RAM: OCR (Tesseract), PDF rendering and the extraction stack do not fit in 512 MB
+    region: singapore
+    dockerfilePath: ./Dockerfile    # build context defaults to the repository root
+    numInstances: 1                 # required by the persistent disk; the app also keeps chat/session state in memory
+    healthCheckPath: /api/ready     # 200 only when the database, migrations and document storage are all healthy
+    autoDeployTrigger: checksPass   # deploy only when the branch's CI checks (GitHub Actions) pass
+    maxShutdownDelaySeconds: 60     # let in-flight requests and background extraction finish on redeploy
+
+    disk:
+      name: msme-data
+      mountPath: /var/data          # not one of Render's reserved paths; the entrypoint fixes ownership at start
+      sizeGB: 10                    # can be increased later, never decreased
+
+    envVars:
+      - key: PORT
+        value: "10000"              # Render's default port; the image's CMD binds to ${PORT}
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: LOG_LEVEL
+        value: INFO
+
+      # --- data stores ---
+      - key: LAMBDA_ERP_DB
+        fromDatabase:
+          name: msme-db
+          property: connectionString   # internal connection string (private network)
+      - key: MSME_STORAGE_DIR
+        value: /var/data/msme-documents
+      - key: LAMBDA_ERP_UPLOAD_DIR
+        value: /var/data/chat-uploads
+
+      # --- security and mode ---
+      - key: LAMBDA_ERP_AUTO_DEMO
+        value: "0"                  # the image defaults this to 1 (demo data); never in a real deployment
+      - key: JWT_SECRET_KEY
+        generateValue: true
+      - key: LAMBDA_ERP_ADMIN_EMAIL
+        sync: false                 # seeds the first admin so a stranger cannot claim it by registering first
+      - key: LAMBDA_ERP_ADMIN_PASSWORD
+        sync: false
+      - key: MSME_REQUIRE_DISTINCT_APPROVER
+        value: "1"                  # maker-checker on compliance workpapers; set "0" only for a one-person business
+
+      # --- AI providers (prompted on first sync) ---
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: DOCKET_TEXT_MODEL
+        sync: false
+      - key: DOCKET_LLM_PROVIDER
+        sync: false
+      - key: DOCKET_LLM_BASE_URL
+        sync: false
+      - key: DOCKET_LLM_API_KEY
+        sync: false
+
+      # --- background work (runs inside the web service because the disk is not reachable from cron/one-off jobs) ---
+      - key: MSME_SWEEP_INTERVAL_SECONDS
+        value: "300"

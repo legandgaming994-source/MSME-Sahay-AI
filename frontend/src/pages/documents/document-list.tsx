@@ -1,0 +1,609 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Link, useParams, useLocation } from "react-router-dom";
+import { setListContext } from "@/lib/doc-list-context";
+import { useMySettings } from "@/hooks/use-my-settings";
+import { useTranslation } from "react-i18next";
+import {
+  useReactTable,
+  getCoreRowModel,
+  flexRender,
+  createColumnHelper,
+  type ColumnDef,
+} from "@tanstack/react-table";
+import { api } from "@/api/client";
+import { useDocumentList } from "@/hooks/use-document-list";
+import { useBaseCurrency } from "@/hooks/use-base-currency";
+import { useUrlState, useUrlPatch } from "@/hooks/use-url-state";
+import { getDoctypeConfig } from "@/lib/doctypes";
+import { usePageTitle } from "@/lib/use-page-title";
+import { linkRefHref } from "@/pages/documents/document-form";
+import { StatusBadge } from "@/components/document/status-badge";
+import { ListPager } from "@/components/list-pager";
+import { Button } from "@/components/ui/button";
+import { SmartListSearch, type SmartSearchField } from "@/components/smart-list-search";
+import { Input } from "@/components/ui/input";
+import { Select } from "@/components/ui/select";
+import { DateRangePresets } from "@/components/ui/date-range-presets";
+import { formatCurrency, formatDate, formatDateTime } from "@/lib/utils";
+import { ChevronUp, ChevronDown, ChevronsUpDown, SlidersHorizontal } from "lucide-react";
+
+const STATUS_OPTIONS = ["All", "Draft", "Submitted", "Cancelled"];
+
+const CURRENCY_FIELDS = new Set([
+  "grand_total",
+  "outstanding_amount",
+  "paid_amount",
+  "total_debit",
+  "total_amount",
+  "net_total",
+]);
+
+const DATE_FIELDS = new Set([
+  "transaction_date",
+  "posting_date",
+  "due_date",
+  "delivery_date",
+  "valid_till",
+  "date",
+]);
+
+// System columns every doctype/master row carries — offerable in the column
+// picker and sortable, even though they aren't in the doctype's `fields`.
+const SYSTEM_COLUMNS: Array<{ name: string; label: string; isDate: boolean }> = [
+  { name: "modified", label: "Last modified", isDate: true },
+  { name: "creation", label: "Created", isDate: true },
+];
+const SYSTEM_COLUMN_NAMES = new Set(SYSTEM_COLUMNS.map((c) => c.name));
+// A column whose default first-click sort should be DESC (newest/highest first).
+const isDateColumn = (col: string) =>
+  DATE_FIELDS.has(col) || col === "modified" || col === "creation" ||
+  col.endsWith("_date") || col.endsWith("_at") || col.endsWith("_datetime");
+
+// Columns that reference a master record — rendered as clickable links to the master page.
+const MASTER_REF_FIELDS: Record<string, string> = {
+  customer: "customer",
+  supplier: "supplier",
+  item_code: "item",
+  item: "item",
+  warehouse: "warehouse",
+  company: "company",
+  account: "account",
+  cost_center: "cost-center",
+};
+
+// `party` references different master types depending on `party_type` in the row.
+function partyMasterType(partyType: unknown): string | null {
+  if (typeof partyType !== "string") return null;
+  const t = partyType.toLowerCase();
+  if (t === "customer") return "customer";
+  if (t === "supplier") return "supplier";
+  return null;
+}
+
+export default function DocumentListPage() {
+  const { t } = useTranslation();
+  // Rows without a per-document currency (Stock Entry, …) hold base-currency
+  // values — format them with the company currency, not a hardcoded USD.
+  const baseCurrency = useBaseCurrency();
+  const { doctype } = useParams<{ doctype: string }>();
+  const config = getDoctypeConfig(doctype ?? "");
+  const location = useLocation();
+  usePageTitle(config?.label ?? doctype ?? null);
+
+  // Config-driven filter dropdowns (opt-in via config.listFilters). Their values
+  // live in the URL like every other filter; read them generically since the
+  // field names are dynamic. Each names a select field whose options drive the
+  // dropdown; the selection is sent as a plain column filter.
+  const configFilters = config?.listFilters ?? [];
+  const queryFilterValues = useMemo(() => {
+    const params = new URLSearchParams(location.search);
+    const out: Record<string, string> = {};
+    const controls = new Set(["q", "page", "per_page", "from", "to", "discarded", "order_by", "order"]);
+    for (const [key, value] of params.entries()) {
+      if (!controls.has(key) && value && value !== "All") out[key] = value;
+    }
+    return out;
+  }, [location.search]);
+  const filterValues = useMemo(() => {
+    const out: Record<string, string> = {};
+    for (const field of configFilters) out[field] = queryFilterValues[field] ?? "";
+    return out;
+  }, [configFilters, queryFilterValues]);
+
+  // All user-facing filter state lives in the URL. The param names are the
+  // short human-readable form (`from` / `to` / `per_page`); the backend still
+  // wants `from_date` / `to_date` / `limit` / `offset`, translated below.
+  const [status] = useUrlState<string>("status", "All");
+  const [fromDate] = useUrlState<string>("from", "");
+  const [toDate] = useUrlState<string>("to", "");
+  const [showDiscarded] = useUrlState<string>("discarded", "");
+  const [pageSize] = useUrlState<number>("per_page", 50);
+  // Free-text search (opt-in via config.searchFields). The committed query lives
+  // in the URL (`q`); a separate local draft avoids refetching while typing.
+  const searchFields = config?.searchFields ?? [];
+  const [urlQ] = useUrlState<string>("q", "");
+  const [searchInput, setSearchInput] = useState(urlQ);
+  // URL is human-friendly 1-indexed; internal state stays 0-indexed for
+  // offset calculation. setPage accepts the 0-indexed value.
+  const [urlPage] = useUrlState<number>("page", 1);
+  const page = urlPage - 1;
+  const patchUrl = useUrlPatch();
+
+  // Per-user preferences (columns + sort), persisted server-side via
+  // /auth/my-settings — cross-device, unlike localStorage.
+  const { settings, setSetting } = useMySettings();
+
+  // Sort. The URL (order_by/order) is the immediate, shareable state; the per-user
+  // store holds this doctype's DEFAULT sort ("col:dir"). Effective sort = the URL
+  // when present, else the saved default, else the backend's creation-DESC.
+  // Toggling a header updates BOTH (so "I sorted by X" sticks on a fresh revisit).
+  // The backend validates order_by against the doctype's real columns.
+  const [urlOrderBy] = useUrlState<string>("order_by", "");
+  const [urlOrder] = useUrlState<string>("order", "");
+  const [savedSortCol, savedSortDir] = (settings[`sort.${doctype}`] || "").split(":");
+  const activeSortCol = urlOrderBy || savedSortCol || "";
+  const activeSortDir = (urlOrderBy ? urlOrder : savedSortDir) || "desc";
+  const toggleSort = (col: string) => {
+    const next = activeSortCol === col
+      ? (activeSortDir === "desc" ? "asc" : "desc")   // same column: flip direction
+      : (isDateColumn(col) ? "desc" : "asc");          // new column: sensible first click
+    patchUrl({ order_by: col, order: next, page: null });
+    setSetting(`sort.${doctype}`, `${col}:${next}`);
+  };
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const pickerRef = useRef<HTMLDivElement>(null);
+  const savedCols = useMemo(
+    () => (settings[`columns.${doctype}`] || "").split(",").map((s) => s.trim()).filter(Boolean),
+    [settings, doctype],
+  );
+  const effectiveCols = savedCols.length ? savedCols : (config?.listColumns ?? []);
+  // Ask the API for only the columns this list renders (+ currency for amount
+  // formatting and party_type for party links — the two fields cells read beyond
+  // their own column). The backend always keeps `name`. A stable string so it can
+  // be a memo/query dependency without churning. Trims wide-doctype payloads.
+  const fieldsParam = effectiveCols.length
+    ? [...effectiveCols, "currency", "party_type"].join(",")
+    : undefined;
+  // The full menu of columns a user can pick: name (the id) + the doctype's own
+  // fields + the system columns (modified/creation).
+  const availableCols = useMemo(() => {
+    if (!config) return [];
+    const seen = new Set<string>();
+    const out: Array<{ name: string; label: string }> = [];
+    const push = (name: string, label: string) => {
+      if (seen.has(name)) return;
+      seen.add(name); out.push({ name, label });
+    };
+    push("name", t("fields.Name", { defaultValue: "Name" }));
+    for (const f of config.fields) push(f.name, t(`fields.${f.label}`, { defaultValue: f.label }));
+    for (const c of SYSTEM_COLUMNS) push(c.name, t(`fields.${c.label}`, { defaultValue: c.label }));
+    return out;
+  }, [config, t]);
+  const toggleColumn = (col: string) => {
+    const set = effectiveCols.includes(col)
+      ? effectiveCols.filter((c) => c !== col)          // remove
+      : [...effectiveCols, col];                         // append
+    if (set.length === 0) return;                        // never leave an empty table
+    setSetting(`columns.${doctype}`, set.join(","));
+  };
+  useEffect(() => {
+    if (!pickerOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (pickerRef.current && !pickerRef.current.contains(e.target as Node)) setPickerOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [pickerOpen]);
+
+  // All writes go through one atomic patch so multiple params update together
+  // — calling two individual setters in the same handler races (react-router
+  // caches the previous searchParams, so the last call wins).
+  const setPage = (p: number) => patchUrl({ page: p === 0 ? null : p + 1 });
+  const setStatus = (s: string) => patchUrl({ status: s === "All" ? null : s, page: null });
+  const setFromDate = (s: string) => patchUrl({ from: s || null, page: null });
+  const setToDate = (s: string) => patchUrl({ to: s || null, page: null });
+  const setShowDiscarded = (on: boolean) => patchUrl({ discarded: on ? "1" : null, page: null });
+  const setPageSize = (n: number) => patchUrl({ per_page: n, page: null });
+
+  // Keep the draft in sync with committed URL state (back/forward and links).
+  // Typing stays local; Enter or the Search button commits it deliberately.
+  useEffect(() => { setSearchInput(urlQ); }, [urlQ]);
+
+  const filters = useMemo(() => {
+    const f: Record<string, string | number | undefined> = {};
+    // The default status dropdown is hidden when a doctype opts into its own
+    // filters, so only apply it in that default case.
+    if (configFilters.length === 0 && status !== "All") f.status = status;
+    if (fromDate) f.from_date = fromDate;
+    if (toDate) f.to_date = toDate;
+    // Tell the backend which column the date range filters on. Without this the
+    // server only knows the built-in core doctypes; plugin doctypes' date
+    // pickers would be silently ignored.
+    if (config?.dateField) f.date_field = config.dateField;
+    for (const key of configFilters) {
+      if (filterValues[key]) f[key] = filterValues[key];
+    }
+    for (const [key, value] of Object.entries(queryFilterValues)) {
+      f[key] = value;
+    }
+    // Free-text search across the config's searchFields (the committed URL `q`).
+    if (searchFields.length > 0 && urlQ) {
+      f.search = urlQ;
+      f.search_fields = searchFields.join(",");
+    }
+    if (showDiscarded) f.include_discarded = "true";
+    if (activeSortCol) { f.order_by = activeSortCol; f.order = activeSortDir; }
+    if (fieldsParam) f.fields = fieldsParam;
+    f.limit = pageSize;
+    f.offset = page * pageSize;
+    return f;
+  }, [status, fromDate, toDate, showDiscarded, pageSize, page, config?.dateField, configFilters, filterValues, queryFilterValues, searchFields, urlQ, activeSortCol, activeSortDir, fieldsParam]);
+
+  const { data, isLoading, refetch } = useDocumentList(doctype ?? "", filters);
+  const rows = data?.rows ?? [];
+  const total = data?.total ?? 0;
+  const textFields = useMemo(() => new Set(data?.text_fields ?? []), [data?.text_fields]);
+  const smartFields = useMemo<SmartSearchField[]>(() => {
+    if (!config) return [];
+    const configured = new Map(config.fields.map((field) => [field.name, field]));
+    const names = new Set<string>([
+      "name",
+      ...config.fields.map((field) => field.name),
+      ...config.listColumns,
+      ...searchFields,
+      ...SYSTEM_COLUMNS.map((column) => column.name),
+    ]);
+    return [...names].map((name) => {
+      const field = configured.get(name);
+      const rawLabel = field?.label ?? availableCols.find((column) => column.name === name)?.label ??
+        name.split("_").map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(" ");
+      const configuredOptions = field?.options?.map((option) =>
+        typeof option === "string"
+          ? { value: option, label: option }
+          : { value: option.value, label: option.label }
+      );
+      const options = configuredOptions ?? (name === "status" && configFilters.length === 0
+        ? STATUS_OPTIONS.filter((option) => option !== "All").map((option) => ({ value: option, label: option }))
+        : undefined);
+      return {
+        name,
+        label: t(`fields.${rawLabel}`, { defaultValue: rawLabel }),
+        type: field?.type ?? (isDateColumn(name) ? "date" : "text"),
+        options,
+        contains: textFields.has(name),
+        suggestOnEmpty: !!options?.length || configFilters.includes(name),
+      };
+    });
+  }, [availableCols, config, configFilters, searchFields, t, textFields]);
+
+  // Remember this list's filters + URL so a detail page's prev/next (DocPager)
+  // follows it, and "back to list" returns here. Pagination is dropped — it's
+  // not a record filter.
+  useEffect(() => {
+    const { limit, offset, ...ctxFilters } = filters;
+    setListContext(doctype ?? "", { filters: ctxFilters, search: location.search });
+  }, [doctype, filters, location.search]);
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  const rangeStart = total === 0 ? 0 : page * pageSize + 1;
+  const rangeEnd = Math.min(total, (page + 1) * pageSize);
+
+  const columns = useMemo<ColumnDef<any, any>[]>(() => {
+    if (!config) return [];
+    const helper = createColumnHelper<any>();
+    // Title-case a column slug, then translate it (English title-case is the
+    // fallback when a field has no translation yet).
+    const headerLabel = (c: string) => {
+      const sys = SYSTEM_COLUMNS.find((s) => s.name === c);
+      if (sys) return t(`fields.${sys.label}`, { defaultValue: sys.label });
+      const titleCased = c
+        .split("_")
+        .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+        .join(" ");
+      return t(`fields.${titleCased}`, { defaultValue: titleCased });
+    };
+
+    return effectiveCols.map((col) => {
+      if (col === "name") {
+        return helper.accessor("name", {
+          header: t("fields.Name", { defaultValue: "Name" }),
+          cell: (info) => (
+            <Link
+              to={`/app/${config.slug}/${info.getValue()}`}
+              className="font-medium text-brand transition-colors hover:text-brand/80"
+            >
+              {info.getValue()}
+            </Link>
+          ),
+        });
+      }
+
+      if (col === "status") {
+        return helper.accessor("status", {
+          header: t("fields.Status", { defaultValue: "Status" }),
+          cell: (info) => <StatusBadge status={info.getValue()} />,
+        });
+      }
+
+      if (CURRENCY_FIELDS.has(col)) {
+        return helper.accessor(col, {
+          header: headerLabel(col),
+          cell: (info) => formatCurrency(info.getValue(), (info.row.original as any)?.currency || baseCurrency),
+        });
+      }
+
+      if (col === "party") {
+        return helper.accessor("party", {
+          header: t("fields.Party", { defaultValue: "Party" }),
+          cell: (info) => {
+            const value = info.getValue();
+            if (!value) return "-";
+            const masterType = partyMasterType(info.row.original.party_type);
+            const href = masterType ? linkRefHref(masterType, String(value)) : null;
+            if (!href) return String(value);
+            return (
+              <Link
+                to={href}
+                onClick={(e) => e.stopPropagation()}
+                className="text-brand transition-colors hover:text-brand/80 hover:underline"
+              >
+                {value}
+              </Link>
+            );
+          },
+        });
+      }
+
+      if (MASTER_REF_FIELDS[col]) {
+        const masterType = MASTER_REF_FIELDS[col];
+        return helper.accessor(col, {
+          header: headerLabel(col),
+          cell: (info) => {
+            const value = info.getValue();
+            if (!value) return "-";
+            const href = linkRefHref(masterType, String(value));
+            if (!href) return String(value);
+            return (
+              <Link
+                to={href}
+                onClick={(e) => e.stopPropagation()}
+                className="text-brand transition-colors hover:text-brand/80 hover:underline"
+              >
+                {value}
+              </Link>
+            );
+          },
+        });
+      }
+
+      if (col.endsWith("_datetime")) {
+        return helper.accessor(col, {
+          header: headerLabel(col),
+          cell: (info) => formatDateTime(info.getValue() as string),
+        });
+      }
+
+      if (DATE_FIELDS.has(col) || SYSTEM_COLUMN_NAMES.has(col)) {
+        return helper.accessor(col, {
+          header: headerLabel(col),
+          cell: (info) => formatDate(info.getValue()),
+        });
+      }
+
+      return helper.accessor(col, {
+        header: headerLabel(col),
+      });
+    });
+  }, [config, t, baseCurrency, effectiveCols]);
+
+  const table = useReactTable({
+    data: rows,
+    columns,
+    getCoreRowModel: getCoreRowModel(),
+  });
+
+  if (!config) {
+    return (
+      <p className="text-fg-muted">
+        Unknown document type: {doctype}
+      </p>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-end gap-2">
+        <div className="relative" ref={pickerRef}>
+          <Button variant="secondary" onClick={() => setPickerOpen((o) => !o)}>
+            <span className="inline-flex items-center gap-1.5">
+              <SlidersHorizontal className="h-4 w-4" />
+              {t("common.columns", { defaultValue: "Columns" })}
+            </span>
+          </Button>
+          {pickerOpen && (
+            <div className="absolute right-0 z-20 mt-2 max-h-80 w-60 overflow-y-auto rounded-lg border border-line bg-surface p-2 shadow-card">
+              <div className="px-2 py-1 text-xs font-medium uppercase tracking-wide text-fg-muted">
+                {t("common.columns", { defaultValue: "Columns" })}
+              </div>
+              {availableCols.map((c) => {
+                const checked = effectiveCols.includes(c.name);
+                const lastOne = checked && effectiveCols.length === 1;
+                return (
+                  <label
+                    key={c.name}
+                    className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-sm text-fg hover:bg-surface-subtle"
+                  >
+                    <input
+                      type="checkbox"
+                      className="h-4 w-4 rounded border-line text-brand focus:ring-brand/30 disabled:opacity-50"
+                      checked={checked}
+                      disabled={lastOne}
+                      onChange={() => toggleColumn(c.name)}
+                    />
+                    {c.label}
+                  </label>
+                );
+              })}
+            </div>
+          )}
+        </div>
+        <Link to={`/app/${config.slug}/new`}>
+          <Button>{t("common.new")}</Button>
+        </Link>
+      </div>
+
+      <div className="flex flex-wrap items-end gap-4">
+        {searchFields.length > 0 && (
+          <SmartListSearch
+            scope={`document:${doctype}`}
+            value={searchInput}
+            onChange={setSearchInput}
+            fields={smartFields}
+            filters={queryFilterValues}
+            onFiltersChange={(updates) => patchUrl({ ...updates, page: null })}
+            onSubmit={(search, updates) => {
+              const unchanged = page === 0 && search === urlQ &&
+                Object.entries(updates).every(([key, value]) =>
+                  (queryFilterValues[key] ?? "") === (value === "All" ? "" : value || ""));
+              patchUrl({ q: search || null, ...updates, page: null });
+              // Changed filters/page fetch through the query key; an unchanged
+              // submission explicitly reloads without fetching the old filters.
+              if (unchanged) void refetch();
+            }}
+            loadValues={(field, prefix) =>
+              api.documentFilterValues(doctype!, field, prefix, 12).then((result) => result.values)
+            }
+            hiddenChipFields={[
+              ...configFilters,
+              ...(configFilters.length === 0 ? ["status"] : []),
+            ]}
+          />
+        )}
+        {configFilters.length === 0 ? (
+          <Select
+            label={t("fields.Status", { defaultValue: "Status" })}
+            options={STATUS_OPTIONS.map((s) => ({
+              value: s,
+              label: s === "All" ? t("common.all") : t(`status.${s}`, { defaultValue: s }),
+            }))}
+            value={status}
+            onChange={(e) => setStatus(e.target.value)}
+          />
+        ) : (
+          configFilters.map((key) => {
+            const field = config.fields.find((f) => f.name === key);
+            const opts = (field?.options ?? []).map((o) =>
+              typeof o === "string" ? { value: o, label: o } : o,
+            );
+            return (
+              <Select
+                key={key}
+                label={t(`fields.${field?.label ?? key}`, { defaultValue: field?.label ?? key })}
+                options={[{ value: "", label: t("common.all") }, ...opts]}
+                value={filterValues[key]}
+                onChange={(e) => patchUrl({ [key]: e.target.value || null, page: null })}
+              />
+            );
+          })
+        )}
+        <Input
+          label={t("fields.From Date", { defaultValue: "From Date" })}
+          type="date"
+          value={fromDate}
+          onChange={(e) => setFromDate(e.target.value)}
+        />
+        <Input
+          label={t("fields.To Date", { defaultValue: "To Date" })}
+          type="date"
+          value={toDate}
+          onChange={(e) => setToDate(e.target.value)}
+        />
+        <label className="flex h-10 items-center gap-2 text-sm text-fg-muted">
+          <input
+            type="checkbox"
+            className="h-4 w-4 rounded border-line text-brand focus:ring-brand/30"
+            checked={!!showDiscarded}
+            onChange={(e) => setShowDiscarded(e.target.checked)}
+          />
+          {t("common.showDiscarded")}
+        </label>
+      </div>
+      <DateRangePresets onSelect={(from, to) => patchUrl({ from, to, page: null })} />
+
+      {isLoading ? (
+        <p className="text-fg-muted">{t("common.loading")}</p>
+      ) : rows.length === 0 ? (
+        <p className="py-8 text-center text-fg-muted">{t("reports.noDocuments")}</p>
+      ) : (
+        <>
+          <ListPager
+            page={page}
+            totalPages={totalPages}
+            pageSize={pageSize}
+            total={total}
+            rangeStart={rangeStart}
+            rangeEnd={rangeEnd}
+            setPage={setPage}
+            setPageSize={setPageSize}
+          />
+          <div className="overflow-x-auto rounded-xl bg-surface ring-1 ring-line shadow-card">
+            <table className="min-w-full divide-y divide-line text-sm">
+              <thead className="bg-surface-subtle">
+                {table.getHeaderGroups().map((headerGroup) => (
+                  <tr key={headerGroup.id}>
+                    {headerGroup.headers.map((header) => (
+                      <th
+                        key={header.id}
+                        className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wide text-fg-muted"
+                      >
+                        {header.isPlaceholder ? null : (
+                          <button
+                            type="button"
+                            onClick={() => toggleSort(header.column.id)}
+                            title={t("common.sortByColumn", { defaultValue: "Sort by this column" })}
+                            className="group inline-flex items-center gap-1 uppercase tracking-wide transition-colors hover:text-fg"
+                          >
+                            {flexRender(header.column.columnDef.header, header.getContext())}
+                            {activeSortCol === header.column.id
+                              ? (activeSortDir === "asc"
+                                  ? <ChevronUp className="h-3.5 w-3.5" />
+                                  : <ChevronDown className="h-3.5 w-3.5" />)
+                              : <ChevronsUpDown className="h-3.5 w-3.5 opacity-0 transition-opacity group-hover:opacity-40" />}
+                          </button>
+                        )}
+                      </th>
+                    ))}
+                  </tr>
+                ))}
+              </thead>
+              <tbody className="divide-y divide-line">
+                {table.getRowModel().rows.map((row) => (
+                  <tr key={row.id} className="transition-colors hover:bg-surface-subtle">
+                    {row.getVisibleCells().map((cell) => (
+                      <td key={cell.id} className="px-4 py-2.5 text-fg">
+                        {flexRender(
+                          cell.column.columnDef.cell,
+                          cell.getContext(),
+                        )}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <ListPager
+            page={page}
+            totalPages={totalPages}
+            pageSize={pageSize}
+            total={total}
+            rangeStart={rangeStart}
+            rangeEnd={rangeEnd}
+            setPage={setPage}
+            setPageSize={setPageSize}
+          />
+        </>
+      )}
+    </div>
+  );
+}

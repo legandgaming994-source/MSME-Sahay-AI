@@ -1,0 +1,52 @@
+[project]
+name = "lambda-erp"
+version = "1.1.10"
+description = "Core ERP logic - accounting, sales, purchasing, inventory"
+readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "TORUS INVESTMENTS AG" }]
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+    "pydantic>=2.0",
+    "openai>=1.0",
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+    "python-dateutil>=2.8",
+    "python-jose[cryptography]>=3.3",
+    "bcrypt>=5",
+    "Jinja2>=3.1",
+    "weasyprint>=62.0",
+    "pypdf>=4.0",
+    "holidays>=0.40",
+    "openpyxl>=3.1",
+    "defusedxml>=0.7",
+]
+
+# Postgres backend is opt-in: `pip install lambda-erp[postgres]`. SQLite (the
+# default, used by tests and local dev) needs no extra driver. Select Postgres
+# at runtime by setting LAMBDA_ERP_DB to a postgresql:// connection URL.
+[project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.1"]
+# MSME document intelligence (OCR + cited extraction). Needs the Tesseract binary on the host.
+msme = ["docket-idp>=0.5,<0.6"]
+# Azure Blob document storage (MSME_STORAGE_BACKEND=azure_blob) with managed-identity authentication.
+azure = ["azure-storage-blob>=12.19", "azure-identity>=1.15"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# The distributable backend ships TWO top-level packages: the pure-Python
+# core (`lambda_erp`) and the FastAPI/extension layer (`api`, where
+# register_doctype / load_plugins / the document classes live). flit only
+# packages a single module matching the project name, so it would silently
+# drop `api`; hatchling lets us name both explicitly. frontend/tests/docs
+# are intentionally excluded from the distribution.
+[tool.hatch.build.targets.wheel]
+packages = ["lambda_erp", "api", "msme"]
+
+[tool.hatch.build.targets.sdist]
+include = ["lambda_erp", "api", "msme", "README.md", "LICENSE", "pyproject.toml"]

@@ -1,0 +1,61 @@
+{
+  "rule_id": "government-credit-schemes",
+  "disclaimer": "Assessments compare stated facts to published criteria. They are NOT lender decisions, NOT approvals and NOT official determinations.",
+  "schemes": [
+    {
+      "id": "pmmy-mudra",
+      "name": "Pradhan Mantri MUDRA Yojana (PMMY)",
+      "administrator": "MUDRA / Member Lending Institutions",
+      "application_route": "Apply to a Member Lending Institution (bank/NBFC/MFI) or via the MUDRA portal.",
+      "versions": [
+        {
+          "version": "pmmy-2015-limit-10L", "effective_from": "2015-04-08", "effective_to": "2024-10-23",
+          "criteria": [
+            {"id": "non_corporate_non_farm", "description": "Non-corporate, non-farm micro/small business (manufacturing, trading, services; allied activities included)", "fact": "non_corporate_non_farm", "op": "true"},
+            {"id": "loan_within_limit", "description": "Loan amount within PMMY limit of INR 10 lakh", "fact": "credit_facility_amount", "op": "lte", "value": 1000000}
+          ],
+          "notes": [],
+          "source": {"title": "PMMY launch 8 Apr 2015; limit INR 10 lakh", "primary_url": "https://www.mudra.org.in", "primary_url_status": "NOT_DEEP_LINKED", "verification": "SECONDARY_ONLY"}
+        },
+        {
+          "version": "pmmy-2024-tarun-plus", "effective_from": "2024-10-24", "effective_to": null,
+          "criteria": [
+            {"id": "non_corporate_non_farm", "description": "Non-corporate, non-farm micro/small business (manufacturing, trading, services; allied activities included)", "fact": "non_corporate_non_farm", "op": "true"},
+            {"id": "loan_within_limit", "description": "Loan amount within PMMY limit of INR 20 lakh", "fact": "credit_facility_amount", "op": "lte", "value": 2000000},
+            {"id": "tarun_plus_prior_repayment", "description": "Loans above INR 10 lakh (Tarun Plus) require successful repayment of a prior Tarun-category loan", "fact": "prior_tarun_loan_repaid", "op": "true",
+             "when": {"fact": "credit_facility_amount", "op": "gt", "value": 1000000}}
+          ],
+          "bands_inr": {"Shishu": 50000, "Kishor": 500000, "Tarun": 1000000, "Tarun Plus": 2000000},
+          "notes": ["Guarantee coverage for PMMY loans up to INR 20 lakh is stated to be under CGFMU."],
+          "source": {"title": "PIB: PMMY loan limit raised to INR 20 lakh, effective 24 Oct 2024",
+                     "primary_url": "https://static.pib.gov.in/WriteReadData/specificdocs/documents/2024/oct/doc20241029426401.pdf",
+                     "primary_url_status": "SEEN_IN_SEARCH", "verification": "PRIMARY_PIB"}
+        }
+      ],
+      "typical_documents": {"verification": "UNVERIFIED_TYPICAL", "items": ["Identity proof", "Address proof", "Business/enterprise proof (e.g. Udyam certificate)", "Bank statements", "Quotation or project estimate for the asset/working capital"]}
+    },
+    {
+      "id": "cgtmse",
+      "name": "Credit Guarantee Scheme for Micro & Small Enterprises (CGTMSE)",
+      "administrator": "CGTMSE (Ministry of MSME / SIDBI) via Member Lending Institutions",
+      "application_route": "No direct application to CGTMSE: request coverage through a Member Lending Institution (bank/NBFC) when applying for a collateral-free loan.",
+      "versions": [
+        {
+          "version": "cgtmse-revamp-2023-04-01", "effective_from": "2023-04-01", "effective_to": null,
+          "criteria": [
+            {"id": "udyam_registered", "description": "Valid Udyam Registration", "fact": "udyam_registered", "op": "true"},
+            {"id": "micro_or_small", "description": "Classified as Micro or Small enterprise", "fact": "msme_category", "op": "in", "value": ["Micro", "Small"]},
+            {"id": "sector", "description": "Manufacturing or service sector", "fact": "sector", "op": "in", "value": ["manufacturing", "service"]},
+            {"id": "collateral_free", "description": "Facility sought without collateral or third-party guarantee", "fact": "collateral_free_requested", "op": "true"}
+          ],
+          "notes": ["Guarantee cover is reported to be capped at INR 5 crore of credit; sources conflict on whether larger facilities are ineligible or only capped. Confirm with the lender."],
+          "guarantee_cover_cap_inr": 50000000,
+          "source": {"title": "Revamp of Credit Guarantee Scheme effective 1 Apr 2023 (ceiling INR 2 crore to INR 5 crore)",
+                     "primary_url": "https://www.cgtmse.in", "primary_url_status": "NOT_DEEP_LINKED", "verification": "SECONDARY_ONLY"}
+        }
+      ],
+      "unverified_details": ["Guarantee coverage percentages (sources report 75-90% depending on category) are deliberately NOT modelled.", "Annual guarantee fee schedule is deliberately NOT modelled.", "Trading-sector eligibility is not confirmed."],
+      "typical_documents": {"verification": "UNVERIFIED_TYPICAL", "items": ["Udyam registration certificate", "Lender's standard loan application documents", "Financial statements and bank statements as required by the lender"]}
+    }
+  ]
+}

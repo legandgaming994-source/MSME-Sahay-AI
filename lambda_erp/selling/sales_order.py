@@ -1,0 +1,183 @@
+"""
+Sales Order.
+
+Sales Order sits between Quotation and Invoice in the sales cycle:
+  Quotation -> Sales Order -> Delivery Note -> Sales Invoice
+
+Key behaviors:
+- Does NOT create GL entries (no financial impact yet)
+- Reserves stock (updates ordered_qty in Bin)
+- Tracks delivery and billing status (per_delivered, per_billed)
+- Can be converted to Sales Invoice via make_sales_invoice()
+"""
+
+from lambda_erp.model import Document
+from lambda_erp.utils import _dict, flt, getdate, nowdate
+from lambda_erp.database import get_db
+from lambda_erp.controllers.taxes_and_totals import calculate_taxes_and_totals
+from lambda_erp.controllers.defaults import (
+    set_default_currency, apply_external_source_defaults,
+    derived_pricing_fields, derived_line_pricing_fields,
+)
+from lambda_erp.controllers.item_price import set_item_defaults
+from lambda_erp.exceptions import ValidationError
+
+class SalesOrder(Document):
+    DOCTYPE = "Sales Order"
+    SUBMITTABLE = True
+    CHILD_TABLES = {
+        "items": ("Sales Order Item", None),
+        "taxes": ("Sales Taxes and Charges", None),
+    }
+    PREFIX = "SO"
+
+    LINK_FIELDS = {
+        "customer": "Customer",
+        "company": "Company",
+    }
+    CHILD_LINK_FIELDS = {
+        "items": {
+            "item_code": "Item",
+            "warehouse": "Warehouse",
+        },
+        "taxes": {
+            "account_head": "Account",
+            "cost_center": "Cost Center",
+        },
+    }
+
+    def validate(self):
+        """Validate sales order.
+
+        Mirrors the reference implementation's SalesOrder.validate() which calls the full controller
+        chain: SellingController -> StockController -> AccountsController.
+        """
+        if not self.customer:
+            raise ValidationError("Customer is required")
+        if not self.get("items"):
+            raise ValidationError("At least one item is required")
+        if not self.transaction_date:
+            self.transaction_date = nowdate()
+
+        apply_external_source_defaults(self)
+        self._set_customer_name()
+        set_default_currency(self, "Customer", "customer")
+        self._set_item_defaults()
+        self._validate_delivery_date()
+
+        from lambda_erp.controllers.pricing_rule import apply_pricing_rules
+        apply_pricing_rules(self)
+
+
+        # Calculate taxes and totals
+        calculate_taxes_and_totals(self)
+
+        self._set_status()
+
+    def _set_customer_name(self):
+        if not self.customer_name and self.customer:
+            db = get_db()
+            self.customer_name = db.get_value("Customer", self.customer, "customer_name")
+
+    def _set_item_defaults(self):
+        """Names, units and unsupplied rates. See controllers/item_price.py."""
+        set_item_defaults(self, "Customer", "customer")
+
+    def _validate_delivery_date(self):
+        if self.delivery_date and getdate(self.delivery_date) < getdate(self.transaction_date):
+            raise ValidationError("Expected delivery date cannot be before order date")
+
+    def _set_status(self):
+        """Set status based on delivery and billing."""
+        if self.docstatus == 0:
+            self._data["status"] = "Draft"
+        elif self.docstatus == 2:
+            self._data["status"] = "Cancelled"
+        elif self.docstatus == 1:
+            per_delivered = flt(self.per_delivered)
+            per_billed = flt(self.per_billed)
+
+            if per_delivered >= 100 and per_billed >= 100:
+                self._data["status"] = "Completed"
+            elif per_delivered > 0 and per_delivered < 100:
+                self._data["status"] = "To Deliver"
+            elif per_billed > 0 and per_billed < 100:
+                self._data["status"] = "To Bill"
+            else:
+                self._data["status"] = "To Deliver and Bill"
+
+    def _update_reserved_qty(self, direction=1):
+        from lambda_erp.workflow import refresh_order_progress
+        refresh_order_progress(self)
+
+    def update_delivery_status(self):
+        """Refresh progress from submitted vouchers, not caller-supplied counters."""
+        from lambda_erp.workflow import refresh_order_progress
+        with get_db().atomic():
+            refresh_order_progress(self)
+        self.reload()
+
+    def update_billing_status(self):
+        """Refresh progress from submitted vouchers, not caller-supplied counters."""
+        from lambda_erp.workflow import refresh_order_progress
+        with get_db().atomic():
+            refresh_order_progress(self)
+        self.reload()
+
+def make_sales_invoice(sales_order_name):
+    """Convert a Sales Order into a Sales Invoice.
+
+    This is the standard flow: Sales Order -> Sales Invoice.
+    """
+    from lambda_erp.accounting.sales_invoice import SalesInvoice
+
+    db = get_db()
+    so = SalesOrder.load(sales_order_name)
+
+    if so.docstatus != 1:
+        raise ValidationError("Sales Order must be submitted before creating Sales Invoice")
+
+    si = SalesInvoice(
+        **derived_pricing_fields(so, is_return=False),
+        customer=so.customer,
+        customer_name=so.customer_name,
+        company=so.company,
+        currency=so.currency,
+        conversion_rate=so.conversion_rate,
+        posting_date=nowdate(),
+        sales_order=so.name,
+    )
+
+    for item in so.get("items"):
+        unbilled_qty = flt(item.get("qty")) - flt(item.get("billed_qty"))
+        if unbilled_qty <= 0:
+            continue
+
+        si.append("items", _dict(
+            **derived_line_pricing_fields(item),
+            item_code=item.get("item_code"),
+            item_name=item.get("item_name"),
+            description=item.get("description"),
+            qty=unbilled_qty,
+            uom=item.get("uom"),
+            rate=item.get("rate"),
+            price_list_rate=item.get("price_list_rate"),
+            discount_percentage=item.get("discount_percentage"),
+            discount_amount=item.get("discount_amount"),
+            warehouse=item.get("warehouse"),
+            cost_center=item.get("cost_center"),
+            sales_order=so.name,
+            sales_order_item=item.get("name"),
+        ))
+
+    for tax in so.get("taxes") or []:
+        si.append("taxes", _dict(
+            charge_type=tax.get("charge_type"),
+            account_head=tax.get("account_head"),
+            description=tax.get("description"),
+            rate=tax.get("rate"),
+            tax_amount=0,
+            included_in_print_rate=tax.get("included_in_print_rate"),
+        ))
+
+    return si

@@ -1,0 +1,359 @@
+import { useState, useEffect } from "react";
+import { Link, useParams, useNavigate } from "react-router-dom";
+import { useTranslation } from "react-i18next";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { api } from "@/api/client";
+import { usePageTitle } from "@/lib/use-page-title";
+import { useBaseCurrency } from "@/hooks/use-base-currency";
+import { Button } from "@/components/ui/button";
+import { useConfirm } from "@/components/ui/dialog";
+import { DocPager } from "@/components/document/doc-pager";
+import { Card } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Select } from "@/components/ui/select";
+import type { FieldDef } from "@/lib/doctypes";
+import { getMasterConfig } from "@/lib/masters";
+import { BUILTIN_MASTER_FIELDS } from "@/lib/master-fields";
+import { LinkField } from "@/components/document/link-field";
+import { CompanySalesTaxField } from "@/components/company-sales-tax-field";
+
+const TYPE_LABELS: Record<string, string> = {
+  customer: "Customer",
+  supplier: "Supplier",
+  item: "Item",
+  warehouse: "Warehouse",
+  company: "Company",
+};
+
+const AUTO_NAME_TYPES = new Set(["customer", "supplier", "item", "warehouse"]);
+
+// ---------------------------------------------------------------------------
+// MasterFormPage
+// ---------------------------------------------------------------------------
+
+export default function MasterFormPage() {
+  const { type, name } = useParams<{ type: string; name: string }>();
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+  const isNew = !name || name === "new";
+  const config = getMasterConfig(type ?? "");
+  const label = config?.label ?? TYPE_LABELS[type ?? ""] ?? type ?? "";
+  const labelTr = t(`masters.${type}.one`, { defaultValue: label });
+  const fields = config?.fields ?? BUILTIN_MASTER_FIELDS[type ?? ""] ?? [];
+  const fieldLabel = (f: FieldDef) => t(`fields.${f.label}`, { defaultValue: f.label });
+
+  const [formData, setFormData] = useState<Record<string, any>>({});
+
+  // Fetch existing record
+  const { data: existing, isLoading } = useQuery({
+    queryKey: ["master", type, name],
+    queryFn: () => api.getMaster(type!, name!),
+    enabled: !!type && !!name && !isNew,
+  });
+
+  // Tab title: the record's display name (e.g. a customer's name) on an existing
+  // record, the type label on a new one. The display field is the "*_name" one
+  // (customer_name / item_name / …), not fields[0] which for some types is the ID.
+  const nameField = fields.find((f) => f.name.endsWith("_name"))?.name;
+  const displayName = nameField ? existing?.[nameField] : undefined;
+  usePageTitle(isNew ? labelTr : (displayName ?? name ?? labelTr));
+
+  useEffect(() => {
+    if (isNew) {
+      const defaults: Record<string, any> = {};
+      fields.forEach((f) => {
+        defaults[f.name] = f.default ?? "";
+      });
+      setFormData(defaults);
+    } else if (existing) {
+      setFormData(existing);
+    }
+  }, [isNew, existing, fields]);
+
+  // New masters with a default_currency field are pre-filled with the COMPANY
+  // base currency (a hardcoded "USD" default gave new customers USD in a CHF
+  // shop). Separate effect so the base-currency query resolving doesn't wipe
+  // other fields the user already typed; it only fills an untouched currency.
+  const companyCurrency = useBaseCurrency();
+  useEffect(() => {
+    if (!isNew || !companyCurrency) return;
+    if (!fields.some((f) => f.name === "default_currency")) return;
+    setFormData((prev: Record<string, any>) => {
+      const current = prev.default_currency;
+      if (current && current !== "USD") return prev; // user already chose one
+      if (current === companyCurrency) return prev;
+      return { ...prev, default_currency: companyCurrency };
+    });
+  }, [isNew, fields, companyCurrency]);
+
+  // Mutations
+  const createMut = useMutation({
+    mutationFn: (data: any) => api.createMaster(type!, data),
+    onSuccess: (result) => {
+      queryClient.invalidateQueries({ queryKey: ["masters", type] });
+      navigate(`/masters/${type}/${result.name}`, { replace: true });
+    },
+  });
+
+  const updateMut = useMutation({
+    mutationFn: (data: any) => api.updateMaster(type!, name!, data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["master", type, name] });
+      queryClient.invalidateQueries({ queryKey: ["masters", type] });
+    },
+  });
+
+  const deleteMut = useMutation({
+    mutationFn: () => api.deleteMaster(type!, name!),
+    onSuccess: (result) => {
+      queryClient.invalidateQueries({ queryKey: ["masters", type] });
+      if (result?.status === "disabled") {
+        navigate(`/masters/${type}`, {
+          replace: true,
+          state: {
+            notice: t("masterForm.disabledOnDelete", {
+              label: labelTr,
+              name,
+              reason: result.reason ?? "other records",
+            }),
+          },
+        });
+        return;
+      }
+      navigate(`/masters/${type}`, { replace: true });
+    },
+  });
+
+  const actionMut = useMutation({
+    mutationFn: ({ action, args }: { action: string; args: Record<string, any> }) =>
+      api.runAction(action, args),
+    onSuccess: (result, variables) => {
+      queryClient.invalidateQueries({ queryKey: ["master", type, name] });
+      queryClient.invalidateQueries({ queryKey: ["masters", type] });
+      const action = config?.actions?.find((item) => item.action === variables.action);
+      if (action?.resultPath) {
+        const path = action.resultPath.replace(/\{([^}]+)\}/g, (_match, key) =>
+          encodeURIComponent(String(result?.[key] ?? "")),
+        );
+        navigate(path);
+      }
+    },
+  });
+
+  const handleSave = () => {
+    if (missingRequiredFields.length > 0) return;
+    const payload =
+      type === "company" && !formData.name
+        ? { ...formData, name: formData.company_name }
+        : formData;
+    if (isNew) {
+      createMut.mutate(payload);
+    } else {
+      updateMut.mutate(payload);
+    }
+  };
+
+  const confirm = useConfirm();
+  const handleDelete = async () => {
+    if (await confirm({
+      title: t("masterForm.deleteConfirm", { label: labelTr }),
+      confirmLabel: t("common.delete", { defaultValue: "Delete" }),
+      danger: true,
+    })) {
+      deleteMut.mutate();
+    }
+  };
+
+  const setField = (fieldName: string, value: any) => {
+    setFormData((prev) => ({ ...prev, [fieldName]: value }));
+  };
+
+  if (!isNew && isLoading) {
+    return <p className="text-fg-muted">{t("common.loading")}</p>;
+  }
+
+  const saving = createMut.isPending || updateMut.isPending;
+  const missingRequiredFields = fields.filter((field) => {
+    if (!field.required || field.readOnly) return false;
+    if (isNew && field.name === "name" && (config?.autoName || AUTO_NAME_TYPES.has(type ?? ""))) return false;
+    const value = formData[field.name];
+    return value === undefined || value === null || String(value).trim() === "";
+  });
+
+  return (
+    <div className="space-y-6">
+      {/* Header: prev/next through the master list on the left, actions right */}
+      <div className="flex items-center justify-between">
+        {!isNew ? (
+          <DocPager kind="master" slug={type!} name={name!} onSave={handleSave} />
+        ) : (
+          <div />
+        )}
+        <div className="flex gap-2">
+          <Button onClick={handleSave} disabled={saving || missingRequiredFields.length > 0}>
+            {saving ? t("common.saving") : t("common.save")}
+          </Button>
+          {!isNew && config?.actions
+            ?.filter((action) => !action.visibleWhen || action.visibleWhen(formData))
+            .map((action) => (
+              <Button
+                key={action.action}
+                variant="secondary"
+                disabled={actionMut.isPending}
+                onClick={() => actionMut.mutate({
+                  action: action.action,
+                  args: action.buildArgs?.(formData) ?? { name },
+                })}
+              >
+                {t(`actions.${action.action}`, { defaultValue: action.label })}
+              </Button>
+            ))}
+          {!isNew && (
+            <Button
+              variant="danger"
+              onClick={handleDelete}
+              disabled={deleteMut.isPending}
+            >
+              {t("common.delete")}
+            </Button>
+          )}
+        </div>
+      </div>
+
+      {/* Error display */}
+      {(createMut.error || updateMut.error || deleteMut.error || actionMut.error) && (
+        <div className="rounded-lg bg-rose-50 p-4 text-sm text-rose-700 ring-1 ring-rose-200">
+          {(createMut.error ?? updateMut.error ?? deleteMut.error ?? actionMut.error)?.message ??
+            t("common.errorOccurred")}
+        </div>
+      )}
+      {missingRequiredFields.length > 0 && (
+        <div className="rounded-lg bg-amber-50 p-4 text-sm text-amber-800 ring-1 ring-amber-200">
+          {t("masterForm.required", { fields: missingRequiredFields.map(fieldLabel).join(", ") })}
+        </div>
+      )}
+      {formData.disabled === 1 && (
+        <div className="rounded-lg bg-amber-50 p-4 text-sm text-amber-800 ring-1 ring-amber-200">
+          {t("masterForm.disabledNotice", { label: labelTr })}
+        </div>
+      )}
+
+      {/* Form fields */}
+      <Card>
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          {fields.map((field) => {
+            if (type === "company" && field.name === "default_sales_tax_template") {
+              return (
+                <CompanySalesTaxField
+                  key={field.name}
+                  company={isNew ? undefined : name}
+                  value={formData[field.name] ?? ""}
+                  onChange={(value) => setField(field.name, value)}
+                />
+              );
+            }
+            // Name field is read-only on edit
+            const isNameField = field.name === "name" && !isNew;
+            const isReadOnly = isNameField || field.readOnly;
+            const isRequired = field.required && !(isNew && field.name === "name" && (config?.autoName || AUTO_NAME_TYPES.has(type ?? "")));
+            const linkedHref = isReadOnly && formData[field.name]
+              ? config?.columnLinks?.[field.name]?.(formData[field.name], formData)
+              : null;
+
+            if (linkedHref) {
+              return (
+                <div key={field.name}>
+                  <label className="mb-1.5 block text-sm font-medium text-fg">
+                    {fieldLabel(field)}
+                  </label>
+                  <Link className="py-2 text-sm text-sky-600 hover:underline" to={linkedHref}>
+                    {String(formData[field.name])}
+                  </Link>
+                </div>
+              );
+            }
+
+            if (field.type === "link" && field.linkDoctype) {
+              return <LinkField key={field.name} label={fieldLabel(field)} value={formData[field.name] ?? ""}
+                linkDoctype={field.linkDoctype} readOnly={!!isReadOnly}
+                onChange={(value) => setField(field.name, value)} />;
+            }
+
+            if (field.type === "select" && field.options) {
+              // A value saved through the API/chat can lie outside the hardcoded
+              // option list (e.g. stock_uom "Stück") — a controlled <select> would
+              // then silently render the "Select..." placeholder as if the field
+              // were unset. Surface the stored value as an extra option so the GUI
+              // shows what the backend actually holds.
+              const current = formData[field.name];
+              const options =
+                typeof current === "string" && current !== "" && !field.options.includes(current)
+                  ? [...field.options, current]
+                  : field.options;
+              return (
+                <div key={field.name}>
+                  <Select
+                    label={fieldLabel(field)}
+                    options={options}
+                    value={formData[field.name] ?? ""}
+                    required={isRequired}
+                    disabled={isReadOnly}
+                    onChange={(e) => setField(field.name, e.target.value)}
+                  />
+                </div>
+              );
+            }
+
+            if (field.type === "textarea") {
+              return (
+                <div key={field.name} className="sm:col-span-2">
+                  <label className="mb-1.5 block text-sm font-medium text-fg">
+                    {fieldLabel(field)}
+                  </label>
+                  <textarea
+                    className="block w-full rounded-lg bg-surface px-3 py-2 text-sm text-fg ring-1 ring-line transition-all placeholder:text-fg-muted/70 focus:outline-none focus:ring-2 focus:ring-brand/30 disabled:bg-surface-subtle disabled:text-fg-muted"
+                    rows={3}
+                    value={formData[field.name] ?? ""}
+                    required={isRequired}
+                    readOnly={isReadOnly}
+                    disabled={isReadOnly}
+                    onChange={(e) => setField(field.name, e.target.value)}
+                  />
+                </div>
+              );
+            }
+
+            const inputType =
+              field.type === "number" || field.type === "currency"
+                ? "number"
+                : field.type === "date"
+                  ? "date"
+                  : "text";
+
+            return (
+              <Input
+                key={field.name}
+                label={fieldLabel(field)}
+                type={inputType}
+                step={field.type === "currency" ? "0.01" : undefined}
+                required={isRequired}
+                readOnly={isReadOnly}
+                disabled={isReadOnly}
+                value={formData[field.name] ?? ""}
+                onChange={(e) =>
+                  setField(
+                    field.name,
+                    inputType === "number"
+                      ? parseFloat(e.target.value) || 0
+                      : e.target.value,
+                  )
+                }
+              />
+            );
+          })}
+        </div>
+      </Card>
+    </div>
+  );
+}

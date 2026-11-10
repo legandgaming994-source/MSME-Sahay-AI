@@ -1,0 +1,184 @@
+import { useEffect, useState } from "react";
+import { Outlet, useLocation, useNavigate } from "react-router-dom";
+import { useTranslation } from "react-i18next";
+import type { TFunction } from "i18next";
+import { ArrowLeft } from "lucide-react";
+import { ChatProvider, useChat } from "@/components/chat/chat-provider";
+import { DialogProvider } from "@/components/ui/dialog";
+import { Sidebar, FLASH_STYLES } from "@/components/layout/sidebar";
+import { useAuth } from "@/contexts/auth-context";
+import { useMySettings } from "@/hooks/use-my-settings";
+import { cn } from "@/lib/utils";
+import { getListContext } from "@/lib/doc-list-context";
+
+const titleCase = (slug: string) =>
+  slug.replace(/-/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+
+// The page title shown in the header. Looks up a translated label by route;
+// any slug without a translation falls back to a title-cased version of itself
+// (so newly-added doctypes still get a sensible English title).
+function deriveTitle(pathname: string, t: TFunction): string {
+  const parts = pathname.split("/").filter(Boolean);
+
+  if (parts[0] === "setup") return t("titles.setup");
+  if (parts[0] === "tutorial") return t("titles.tutorial");
+  if (parts[0] === "chat") return t("titles.chat");
+  if (parts[0] === "accounting" && parts[1] === "bank-statements") return t("bankStatements.title");
+  if (parts[0] === "accounting" && parts[1] === "bank-reconciliation") return t("bankReconciliation.title");
+
+  if (parts[0] === "reports") {
+    const slug = parts[1] || "";
+    return t(`titles.${slug}`, { defaultValue: slug ? titleCase(slug) : t("titles.reports") });
+  }
+
+  if (parts[0] === "masters") {
+    const type = parts[1] || "";
+    const cap = type.charAt(0).toUpperCase() + type.slice(1);
+    const one = t(`masters.${type}.one`, { defaultValue: cap });
+    if (parts[2] === "new") return t("header.new", { label: one });
+    if (parts[2]) return `${one}: ${decodeURIComponent(parts[2])}`;
+    return t(`masters.${type}.other`, { defaultValue: `${cap}s` });
+  }
+
+  if (parts[0] === "app") {
+    const slug = parts[1] || "";
+    const cap = titleCase(slug);
+    const one = t(`doctypes.${slug}.one`, { defaultValue: cap });
+    if (parts[2] === "new") return t("header.new", { label: one });
+    if (parts[2]) return `${one}: ${decodeURIComponent(parts[2])}`;
+    return t(`doctypes.${slug}.other`, { defaultValue: `${cap}s` });
+  }
+
+  return t("titles.dashboard");
+}
+
+// Where the header back button leads. Only pages with a natural "up" target
+// get one: doctype/master detail + new forms go to their list, the opening
+// balances page goes back to setup. Top-level pages (lists, dashboard,
+// reports, admin) have no parent list, so they show no back button.
+function deriveBackPath(pathname: string): string | null {
+  const parts = pathname.split("/").filter(Boolean);
+  if ((parts[0] === "app" || parts[0] === "masters") && parts.length > 2) {
+    return `/${parts[0]}/${parts[1]}`;
+  }
+  if (parts[0] === "setup" && parts.length > 1) return "/setup";
+  return null;
+}
+
+export function AppShell() {
+  return (
+    <DialogProvider>
+      <ChatProvider>
+        <AppShellContent />
+      </ChatProvider>
+    </DialogProvider>
+  );
+}
+
+function AppShellContent() {
+  const { pathname } = useLocation();
+  const navigate = useNavigate();
+  const { user, logout } = useAuth();
+  const { navigationFlash } = useChat();
+  const { t, i18n } = useTranslation();
+
+  // Apply the user's saved language (per-user server pref) once it loads, so the
+  // choice follows their account across devices — localStorage seeded the initial
+  // language synchronously; this reconciles it with the server. No-op when they
+  // already match (so a manual switch via LanguageSelect never fights this).
+  const { settings: mySettings } = useMySettings();
+  useEffect(() => {
+    const lang = mySettings["language"];
+    if (lang && lang !== (i18n.language || "").split("-")[0]) {
+      i18n.changeLanguage(lang);
+    }
+  }, [mySettings, i18n]);
+
+  const pageTitle = deriveTitle(pathname, t);
+  const backPath = deriveBackPath(pathname);
+
+  const handleBack = () => {
+    if (!backPath) return;
+    // The large arrow means "back to the parent list". Browser history is
+    // wrong after DocPager navigation because it merely opens the previous
+    // record again. Restore the list's remembered filters deterministically;
+    // the small chevrons remain the only previous/next-record controls.
+    const parts = pathname.split("/").filter(Boolean);
+    let search = "";
+    if (parts[0] === "app" && parts[1]) {
+      search = getListContext(parts[1])?.search || "";
+    } else if (parts[0] === "masters" && parts[1]) {
+      search = getListContext(`master:${parts[1]}`)?.search || "";
+    }
+    navigate(`${backPath}${search}`);
+  };
+  const [mobileOpen, setMobileOpen] = useState(false);
+
+  // Auto-close the mobile sidebar on navigation
+  useEffect(() => {
+    setMobileOpen(false);
+  }, [pathname]);
+
+  // When a tool fires a navigation flash and the sidebar is hidden (mobile),
+  // pulse the hamburger button in the group's flash color instead.
+  const flashStyle = navigationFlash ? FLASH_STYLES[navigationFlash.group] : null;
+
+  return (
+    <div className="flex h-dvh bg-surface-muted">
+      <Sidebar isMobileOpen={mobileOpen} onClose={() => setMobileOpen(false)} />
+      {/* Mobile backdrop — only shown when sidebar is open on small screens */}
+      {mobileOpen && (
+        <div
+          onClick={() => setMobileOpen(false)}
+          className="fixed inset-0 z-30 bg-black/40 md:hidden"
+          aria-hidden="true"
+        />
+      )}
+      <div className="flex flex-1 flex-col overflow-hidden md:ml-64">
+        <header className="flex h-10 shrink-0 items-center justify-between border-b border-gray-200 bg-white px-4 md:px-6">
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => setMobileOpen(true)}
+              className={cn(
+                "rounded p-1 text-gray-500 transition-all duration-300 hover:bg-gray-100 hover:text-gray-900 md:hidden",
+                flashStyle,
+              )}
+              aria-label={t("header.openMenu")}
+            >
+              <svg viewBox="0 0 20 20" fill="currentColor" width="22" height="22">
+                <path d="M6.835 4c-.451.004-.82.012-1.137.038-.386.032-.659.085-.876.162l-.2.086c-.44.224-.807.564-1.063.982l-.103.184c-.126.247-.206.562-.248 1.076-.043.523-.043 1.19-.043 2.135v2.664c0 .944 0 1.612.043 2.135.042.515.122.829.248 1.076l.103.184c.256.418.624.758 1.063.982l.2.086c.217.077.49.13.876.162.316.026.685.034 1.136.038zm11.33 7.327c0 .922 0 1.654-.048 2.243-.043.522-.125.977-.305 1.395l-.082.177a4 4 0 0 1-1.473 1.593l-.276.155c-.465.237-.974.338-1.57.387-.59.048-1.322.048-2.244.048H7.833c-.922 0-1.654 0-2.243-.048-.522-.042-.977-.126-1.395-.305l-.176-.082a4 4 0 0 1-1.594-1.473l-.154-.275c-.238-.466-.34-.975-.388-1.572-.048-.589-.048-1.32-.048-2.243V8.663c0-.922 0-1.654.048-2.243.049-.597.15-1.106.388-1.571l.154-.276a4 4 0 0 1 1.594-1.472l.176-.083c.418-.18.873-.263 1.395-.305.589-.048 1.32-.048 2.243-.048h4.334c.922 0 1.654 0 2.243.048.597.049 1.106.15 1.571.388l.276.154a4 4 0 0 1 1.473 1.594l.082.176c.18.418.262.873.305 1.395.048.589.048 1.32.048 2.243zm-10 4.668h4.002c.944 0 1.612 0 2.135-.043.514-.042.829-.122 1.076-.248l.184-.103c.418-.256.758-.624.982-1.063l.086-.2c.077-.217.13-.49.162-.876.043-.523.043-1.19.043-2.135V8.663c0-.944 0-1.612-.043-2.135-.032-.386-.085-.659-.162-.876l-.086-.2a2.67 2.67 0 0 0-.982-1.063l-.184-.103c-.247-.126-.562-.206-1.076-.248-.523-.043-1.19-.043-2.135-.043H8.164L8.165 4z"/>
+              </svg>
+            </button>
+            {backPath && (
+              <button
+                onClick={handleBack}
+                className="-ml-1 rounded p-1 text-gray-500 hover:bg-gray-100 hover:text-gray-900"
+                aria-label={t("header.back")}
+              >
+                <ArrowLeft className="h-5 w-5" />
+              </button>
+            )}
+            <h1 className="text-base font-semibold text-gray-500 md:text-lg">{pageTitle}</h1>
+          </div>
+          <div className="flex items-center gap-3">
+            <span className="hidden text-sm text-gray-500 sm:inline">
+              {user?.full_name}
+              <span className="ml-1.5 rounded bg-gray-100 px-1.5 py-0.5 text-xs font-medium text-gray-600">
+                {user?.role}
+              </span>
+            </span>
+            <button
+              onClick={logout}
+              className="text-sm text-gray-500 hover:text-gray-700"
+            >
+              {t("header.logout")}
+            </button>
+          </div>
+        </header>
+        <main className="flex-1 overflow-auto p-4 md:p-6">
+          <Outlet />
+        </main>
+      </div>
+    </div>
+  );
+}

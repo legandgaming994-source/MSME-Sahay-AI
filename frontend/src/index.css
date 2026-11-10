@@ -1,0 +1,115 @@
+/* Self-host Inter so every consumer of this stylesheet inherits the font the
+   Tailwind preset's `fontFamily.sans` asks for. Shipped via exports["./styles.css"]
+   → src/index.css, with @fontsource/inter as a runtime dependency, so downstream
+   apps (e.g. lambda-erp-internal) get Inter without adding their own <link>.
+   Must precede the @tailwind directives (CSS requires @import before other rules). */
+@import "@fontsource/inter/400.css";
+@import "@fontsource/inter/500.css";
+@import "@fontsource/inter/600.css";
+@import "@fontsource/inter/700.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ───────────────────────────────────────────────────────────────────
+   Design tokens. Values are space-separated HSL components so they
+   plug into Tailwind via `hsl(var(--token) / <alpha-value>)` and
+   support opacity modifiers like `bg-brand/90`.
+
+   Anchored to the Lambda logo gradient: brand sits between the cyan
+   (#66D4FF) and pink (#ff6eb4) gradient stops.
+   ─────────────────────────────────────────────────────────────────── */
+:root {
+  /* Brand */
+  --brand: 220 78% 57%;          /* ≈ #2f6ff0 — saturated cobalt blue */
+  --brand-fg: 0 0% 100%;
+
+  /* Surfaces */
+  --surface: 0 0% 100%;          /* primary card / panel */
+  --surface-muted: 220 14% 98%;  /* page background — slightly cooler than white */
+  --surface-subtle: 220 14% 96%; /* hovered rows, secondary cards, sidebar active */
+
+  /* Lines & text */
+  --border: 220 13% 91%;
+  --text: 222 47% 11%;
+  --text-muted: 220 9% 46%;
+}
+
+@layer base {
+  body {
+    /* `bg-surface-muted` and `text-fg` are the new defaults but applying
+       them at the body level avoids touching every page component on
+       day 1. Tailwind's `bg-gray-50` on <body> is replaced here. */
+    @apply bg-surface-muted text-fg antialiased;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11"; /* Inter polish */
+  }
+
+  /* Fluid easing app-wide. Hover/transition properties feel less
+     mechanical with this curve. */
+  * {
+    transition-timing-function: cubic-bezier(0.16, 1, 0.3, 1);
+  }
+}
+
+/* iOS Safari auto-zooms when a focused input/textarea has font-size
+   below 16px and doesn't zoom back out, making the whole page feel
+   broken after the keyboard closes. 16px is the minimum that
+   suppresses it. !important is needed because most of our inputs
+   use Tailwind's `text-sm` (14px), which is a class selector and
+   beats a plain element selector on specificity. Mobile-only — desktop
+   keeps its 14px. */
+@media (max-width: 768px) {
+  input,
+  textarea,
+  select {
+    font-size: 16px !important;
+  }
+}
+
+/* Sidebar Lambda ERP logo — PNG silhouette used as a mask with an animated
+   multi-colour gradient showing through. */
+.lambda-logo-icon {
+  width: 70px;
+  height: 15px;
+  flex-shrink: 0;
+  background: linear-gradient(135deg, #cbd5e1, #b0bacb, #c2ccd8, #94a3b8, #cbd5e1);
+  background-size: 300% 300%;
+  animation: lambda-logo-gradient 12s ease infinite;
+  -webkit-mask-image: url('./logo_lad_erp.png');
+  -webkit-mask-size: contain;
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+  mask-image: url('./logo_lad_erp.png');
+  mask-size: contain;
+  mask-repeat: no-repeat;
+  mask-position: center;
+}
+
+@keyframes lambda-logo-gradient {
+  0%   { background-position: 0% 50%; }
+  50%  { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
+/* Thin, Claude.ai-style scrollbar applied app-wide. Firefox honours
+   `scrollbar-width` / `scrollbar-color`; Chromium/Safari need the
+   `::-webkit-scrollbar-*` pseudo-elements to match. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(31, 31, 30, 0.35) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background-color: rgba(31, 31, 30, 0.35);
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(31, 31, 30, 0.5);
+}

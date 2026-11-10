@@ -1,0 +1,1994 @@
+# Changelog
+
+All notable changes to Lambda ERP are recorded here.
+
+The two packages released from this monorepo share one version and ship
+together: **`lambda-erp`** (PyPI, backend) and
+**`@lambda-development/erp-core`** (npm, frontend).
+
+This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
+and [Semantic Versioning](https://semver.org/spec/v2.0.0.html). The extension
+seams (registries, hooks, and the public package imports) are the
+semver-governed public surface — a breaking change to a seam is a major bump.
+
+## [Unreleased]
+
+## [1.1.10] - 2026-10-16
+
+- PDFs print the item name written on each line instead of replacing it with
+  the Item master's name. One generic article can now carry its own wording
+  per line (e.g. "Phase 1: Prozessaufnahme" under a project service) in
+  quotations, invoices and combined proposals. The master name only fills a
+  line without a name. Renaming an item no longer rewrites the lines of
+  existing documents' PDFs.
+- Stop offering `get_erp_context` to the native ERP chat. Its system prompt
+  already contains the same workflow guidance, and the model was re-fetching
+  about 4k tokens of duplicate context on most turns. MCP and other direct
+  clients keep the tool unchanged.
+
+## [1.1.9] - 2026-10-15
+
+- Print and require the document state in PDFs only when it is not final:
+  Draft, Cancelled or Discarded. An issued (submitted) invoice, order or
+  quotation no longer carries a "Submitted" line, and custom `document.html`
+  and `proposal.html` layouts no longer fail with `pdf_render_incomplete` when
+  they omit it. Layouts receive `pdf_state_notice` (empty for final
+  documents); `pdf_status` stays available.
+- Add `register_pdf_state_labels()` (`api.pdf`) so a deployment can print its
+  own notice, e.g. `{"Draft": "Entwurf"}`. The rendered-text check then
+  requires that label.
+
+## [1.1.8] - 2026-10-01
+
+- Switch the main ERP chat to GPT-6.1 Sol, retaining reasoning effort `low`.
+  Increase the Sol report specialist to `medium`. Production use of GPT-6 Luna
+  exposed an unsupported transfer of a person's identity between unrelated
+  CRM leads. We consider this insufficiently reliable for our current
+  write-capable CRM workflows and are replacing Luna for that workload;
+  this is an operational decision, not a general benchmark of the model.
+- Require evidence for every written fact, including free-text notes. On a
+  company or lead change, re-establish relationships instead of carrying over
+  people from the previous topic. An unsigned team message must not be
+  attributed to a known contact without evidence. Share these rules with
+  direct clients through ERP discovery, and keep dates and time zones
+  consistent between structured fields and text.
+- Keep Sol 6.1 requests on the supported Responses API, including step-limit
+  summaries, and account for the cost of those summaries.
+- Add request/cost regression tests and an opt-in, synthetic model evaluation
+  covering unsigned team replies, unrelated contacts and explicit senders.
+
+## [1.1.7] - 2026-09-29
+
+- Default the ERP chat orchestrator to GPT-6 Luna using the Responses API with
+  reasoning effort `low`; use GPT-6.1 Sol for the separate report specialist.
+- Register verified Standard short- and long-context pricing for GPT-6 Astra,
+  Sol, Luna and GPT-6.1 Sol, and correct the existing GPT-5.6 Terra rates.
+  Existing stored costs are not recalculated.
+- Document pricing sources and accounting limits, and test cached-token billing,
+  the 272K context threshold, and both orchestrator API request paths.
+
+## [1.1.6] - 2026-09-28
+
+- Add read-only `get_erp_context` discovery for direct ERP clients, including
+  live document/master registries, custom extension links and PDF requirements.
+- Share workflow guidance between native chat and direct clients: inspect fields,
+  resolve ambiguous records, distinguish draft creation from submission, verify
+  generated PDF artifacts, and check write outcomes before retrying.
+- Expose discovery through the permission-filtered MCP catalogue without
+  requiring the Chat API or invoking an ERP model.
+
+## [1.1.5] - 2026-09-28
+
+- Clarify ChatGPT setup: open Plugins in the main sidebar, then Add (+) and
+  Create MCP App. Explain when to check developer mode and skip that step
+  when it is already enabled.
+- Include Settings before Connectors in the Claude Desktop setup instructions.
+- Update English, German and French instructions and the app connection guide.
+
+## [1.1.4] - 2026-09-26
+
+- Fix MCP sign-in discovery for connectors that send a newer protocol version
+  before authentication. Negotiate supported versions during initialization and
+  validate the version header on subsequent calls.
+
+## [1.1.3] - 2026-09-26
+
+- Add OAuth account linking for remote MCP connectors, including dynamic client
+  registration, explicit consent, S256 PKCE, hashed resource-bound tokens,
+  rotating refresh tokens, and shared connection revocation / role enforcement.
+- Replace the API key notice with app-specific setup cards for ChatGPT, Claude
+  Desktop, Claude Code CLI, Codex CLI, and custom integrations. Show permission
+  choices, copy feedback, last use, and the required API enablement state.
+- Preserve pending connector approval across password and social sign-in; provide
+  English, German and French setup and consent screens.
+- Keep existing API keys compatible, add OAuth discovery and MCP tool annotations,
+  and return the correct response when an MCP event stream is unavailable.
+- Show newly created API keys directly above the creation form, so they remain
+  visible even when many keys already exist.
+
+## [1.1.2] - 2026-09-22
+
+- Add a customer website field to the master form, REST and chat interfaces,
+  with a migration for existing installations.
+- Use canonical master IDs consistently in chat guidance and expose registered
+  aliases through field discovery. Resolve aliases in result projections,
+  filters, search, sorting and navigation; reject contradictory identifiers
+  and remove misleading warnings for valid extension inputs.
+- Accept both explicit IN/NOT IN filters and existing literal value lists in
+  analytics datasets. Reject malformed nested filters and invalid date ranges
+  instead of silently producing empty or unfiltered results. Empty IN lists
+  match no records. Apply the same validation to custom report drafts and
+  document the filter contract in tool descriptions.
+- Cover the SimplyGo stock lookup across MCP and REST on SQLite and PostgreSQL;
+  make the migration regression independent of a fixed migration count.
+
+## [1.1.1] - 2026-09-22
+
+- Return canonical `view_url` values from document and master chat/MCP tools,
+  including list/search and batch results. Encode record names and respect
+  plugin parent-page routing; return null when no destination is available.
+- Instruct web chat to copy the returned record URL exactly instead of building
+  links itself, preventing mistakes such as adding `#` before `/app/...`.
+  External API chat continues to refer to records by their identifiers.
+- Cover record links, parent pages, conversions, URL encoding, and unchanged
+  document/master REST data in regression tests.
+
+## [1.1.0] - 2026-09-22
+
+- Add a Price List / Item Price layer for base prices. Resolution runs explicit
+  rate, then a party-specific Item Price, then the list price, then
+  `Item.standard_rate`, so deployments with no price lists configured price
+  exactly as before. Price lists are per-currency and are matched, never
+  converted, and a list only applies to the side of the business it is marked
+  for. `Customer.default_price_list` now resolves against real data instead of
+  pointing at nothing, and `price_list_rate` is populated, which gives
+  percentage discounts a defined base.
+- Match Pricing Rules on more than `item_code`: `apply_on` (item code or item
+  group), `applicable_for` (customer, customer group, territory or supplier),
+  a maximum quantity and an amount band. Among matching rules the highest
+  priority wins, then the most specific match, so a rule naming one customer
+  beats one naming their group without anyone setting a priority. Existing
+  rules are backfilled to their current matching behaviour.
+- Let a document declare `ignore_pricing_rule` when its rates were agreed
+  elsewhere. Previously the only way to protect a supplied rate was to send
+  zero, which the engine reads as an explicit free line, and because pricing
+  runs inside `validate()` the overwrite repeated on every later draft save.
+  A per-item flag covers documents where only some lines are externally priced.
+- Record `external_source` / `external_reference` on documents and
+  `external_line_reference` on their lines, with a unique index so an
+  integration retrying an uncertain outcome finds the existing document instead
+  of creating a second one. An externally-sourced document defaults to
+  `ignore_pricing_rule` and refuses `update_stock=1`, since the upstream system
+  already recorded the goods movement — the existing double-shipment guard only
+  sees the sales-order-to-delivery-note path and cannot catch that case.
+- Apply pricing rules to POS Invoice, which was the only selling document that
+  skipped them, and derive a document's trade side from its type rather than
+  from whether a party field happens to be populated.
+- Persist the `pricing_rule` stamp on transaction lines. The engine has always
+  set it, but no line table had the column so it was silently dropped on insert.
+- Replace the six near-identical `_set_item_defaults` implementations with one
+  shared resolver. Rate resolution no longer depends on whether the caller
+  supplied `item_name`.
+
+- Add Price List and Item Price screens, customer/company default-list selectors,
+  and the expanded Pricing Rule form. A blank transaction rate resolves on save;
+  an explicit zero remains a free line.
+- Preserve pricing protection through quotation/order/invoice conversions and
+  historical prices on sales, purchase and POS returns. Derived documents keep
+  source and line provenance but require a fresh external document reference.
+- Apply external-source defaults to quotations and orders as well as invoices;
+  persist bill-only stock policy even for POS's stock-updating database default.
+- Preserve income cost centres per line in Sales Invoice and POS Invoice GL
+  posting, returns and cancellation. Historical ledger entries are unchanged.
+- Reject malformed/changed external document identities and duplicate line
+  identities. Reconcile external unique indexes in migration 36 and fail startup
+  visibly on failed migrations from version 32 onwards.
+- Keep discount bases stable across repeated saves, and test pricing, provenance,
+  cost centres and legacy-schema upgrades against SQLite and PostgreSQL.
+- Document the ERP primitives and remaining connector responsibilities in
+  `docs/pricing-and-external-sources.md`.
+
+## [1.0.2] - 2026-09-15
+
+- Add shared relative/absolute timestamp filters to document and master lists,
+  exposed through REST, chat and MCP. Return resolved windows, totals, pagination
+  and warnings for records with missing or invalid timestamps.
+- Compare timestamps as instants on SQLite and PostgreSQL, with PostgreSQL expression indexes,
+  and capture creation/modification times for core masters without inventing
+  timestamps for historical records.
+- Normalize document timestamps before plugin validation and persistence to prevent
+  the CRM duplicated-clock bug. Include a separate, review-first maintenance script
+  for existing malformed Activity timestamps; no automatic data repair is performed.
+- Support IN/NOT IN filters and guide chat to use exact elapsed-hour windows,
+  distinguish prepared/scheduled/sent outreach and disclose coverage limitations.
+- Keep the aggregate activity-feed design deferred: these lists summarize current
+  records, not a complete history of edits or deletions. See docs/time-filters.md.
+
+## [1.0.1] - 2026-09-14
+
+- Add a company-form selector for the default sales tax template, scoped to the company, with an explicit no-automatic-tax option and guidance in German, English and French.
+- Validate company ownership and Sales type when selecting a default through the existing master APIs/chat. Existing documents are unchanged.
+
+## [1.0.0] - 2026-09-11
+
+### PDF output contracts
+- Give every document type an explicit PDF profile. Reservations, logistics,
+  payments, journal entries and record overviews no longer fall back to empty
+  commercial documents or invented USD/zero totals. Unsupported profiles hide
+  the PDF action and return an actionable error.
+- Validate print data and extracted content of the generated PDF through one
+  renderer shared by the UI, REST, MCP and chat. Print document state; keep
+  historical records printable without re-running posting or availability rules.
+- Generate owner-scoped immutable PDF files with hashes, seven-day download
+  expiry and structured errors. Chat attachments require successful generation;
+  links invented in prose no longer count as generated files.
+- Include quantities, rates, tax totals and recurring totals in proposals;
+  support long record notes and reject broken templates/providers/appendices.
+- **Plugin compatibility:** registering a new doctype requires `pdf_profile=`
+  (`PDFProfile` or `DisabledPDF`). Existing core overrides inherit their profile.
+  PDF context provider failures now fail the export. See `docs/pdf-output.md`.
+
+## [0.8.34] - 2026-09-11
+
+### Workflow validation follow-up
+- Reject ineffective/incomplete stock entries and inconsistent order/line
+  references. Validate subscription plans/intervals and proposal recipients
+  before downstream work; subscription billing uses an atomic period advance.
+- Route document-backed master writes through document validation/hooks, reject
+  unknown master fields and invalid declared links, and classify missing fields
+  separately from duplicate records. Preserve warnings in batch results.
+- Add composable database transactions for plugin workflows, expanded prompt
+  metadata and REST master-field discovery. The internal companion change
+  validates/atomically merges Leads and validates new call/email activities.
+
+### Fixed
+- Require a machine or explicit pool allocation for active reservations, a
+  customer or internal purpose, and a usable asset in the correct yard before
+  dispatch. Display pool bookings in the fleet calendar with an assignment
+  warning instead of hiding them.
+- Reject missing document companies, invalid item quantities, missing stock
+  warehouses and incomplete payment references on save and submit. Reject
+  unknown document input fields instead of silently discarding them; plugins
+  can declare supported transient fields.
+
+### Added
+- Shared required-field metadata for REST, MCP and generated chat prompts;
+  structured chat tool errors/warnings and persisted tool-call audit records.
+  See [compatibility and deployment notes](docs/document-validation.md).
+
+### Further integrity fixes
+- Protect voucher identity and reject stale or repeated lifecycle operations.
+  Enforce cumulative return, fulfillment and billing quantities, preserve explicit
+  zero prices, and post/reverse stock movements at their actual ledger value.
+- Validate invoice settlements and company/party/account relationships across
+  payments, journals, documents and active reservations.
+- Serialize rental availability changes and protect booked assets and vouchers.
+  Make subscription billing atomic, prevent client edits to billing progress,
+  and complete final/overdue periods without duplicate billing.
+- Prevent structural edits that reinterpret referenced masters. Protect bank
+  reconciliation fields, scope pricing rules by company and transaction side,
+  validate budget actions, and reject new business for disabled customers.
+
+### Compatibility
+- Migrations 27–29 add explicit reservation allocation, rebuild derived stock
+  planning/order counters, and persist subscription discard/invoice links.
+  Existing financial and stock ledger entries are not rewritten; missing
+  historical relationships are not guessed.
+- Invalid legacy drafts must be completed before subsequent writes or posting.
+  Custom document types must explicitly declare submit/cancel support and any
+  supported transient inputs. Deploy the companion internal plugin fixes with
+  this version. See [validation and migration notes](docs/document-validation.md).
+
+## [0.8.33] - 2026-09-07
+
+### Fixed
+- Remove the report specialist's `intent` control field before passing its
+  validated result to strict report-draft persistence. Intent-only report
+  requests from chat now create the draft instead of failing downstream with
+  `Extra inputs are not permitted`.
+
+## [0.8.32] - 2026-09-07
+
+### Fixed
+- Normalize harmless model-invented report presentation fields before a final
+  strict canonical validation, and retry substantive report-schema errors once
+  inside the specialist with precise validation feedback. This prevents an
+  otherwise valid report request from failing with `Extra inputs are not
+  permitted` and avoids re-running the full chat orchestrator for a correction.
+- Log report-specialist response IDs and validation field paths without logging
+  report contents, so provider failures can be diagnosed without exposing
+  business data.
+
+## [0.8.31] - 2026-09-07
+
+### Changed
+- Run the custom-report specialist on OpenAI GPT-5.6 Terra using the existing
+  `OPENAI_API_KEY`, matching the chat orchestrator. Remove the Anthropic SDK,
+  runtime credential, model setting, and Terraform secret wiring.
+- Record report-specialist usage as OpenAI spend and associate it with the chat
+  session that requested the report.
+
+### Added
+- Add safe `gl_entries` and `bank_transactions` semantic datasets so custom
+  analytics can distinguish accounting income/expenses from bank cash flows
+  even when no sales or purchase invoices exist.
+- Add multi-series bar and line charts to the declarative report language while
+  retaining the existing single-`y` version-1 chart format.
+
+### Fixed
+- Prevent the report workflow from concluding that a period has no financial
+  activity merely because its invoice datasets are empty.
+- Support monthly income-versus-expense reports with side-by-side bars instead
+  of repeatedly generating a specification the single-series schema rejects.
+
+### Compatibility
+- No database migration, user reauthentication, API-key rotation, or MCP
+  reconfiguration is required. Existing version-1 report drafts remain valid.
+
+## [0.8.30] - 2026-09-07
+
+### Security
+- Keep semantic-report measure aliases out of generated SQL and map internal
+  result identifiers back to caller-facing labels after the query.
+- Distinguish browser sessions, API keys, and the public demo with
+  request-scoped authentication principals. API keys retain their existing
+  business REST, chat, and MCP access but can no longer set credentials, link
+  OAuth identities, or administer users, invites, API keys, and auth settings.
+- Bind OAuth login/link state to an expiring, single-use server transaction and
+  an HttpOnly browser verifier cookie.
+- Replace stored custom-report JavaScript with a strictly validated,
+  declarative version-1 report language and a non-evaluating browser
+  interpreter.
+- Revalidate live roles, enabled users, and API-key revocation before every
+  WebSocket message and again at chat tool execution.
+- Hide company contact/tax metadata from unauthenticated setup checks and
+  verify chat-session access before reading attachment upload bodies.
+- Refresh frontend dependency locks to versions with no reported npm audit
+  vulnerabilities.
+
+### Compatibility
+- Existing users, session cookies, API-key tokens, REST integrations, chat API
+  clients, and MCP connections require no migration, rotation, or reconnect.
+- Password, first-user, public, invite, and OAuth signup/login flows continue to
+  issue the existing session cookie. Legacy custom-report drafts are left
+  intact but intentionally inert and can be recreated in the new format.
+- Add synthetic SQLite and PostgreSQL regression coverage for the security
+  boundaries and compatibility guarantees above.
+
+## [0.8.29] - 2026-09-06
+
+### Security
+- Enforce a shared role policy at chat and MCP tool execution, including
+  document and master changes and currency revaluation. Unknown tools and
+  unknown caller roles are denied by default.
+- Filter chat tools by caller permissions while preserving the separate
+  document-write, master-data, administrator, and public-demo permissions.
+- Add regression checks on SQLite and PostgreSQL and a private reporting policy.
+
+## [0.8.28] - 2026-09-05
+
+### Fixed
+- The chat reconciliation tool now uses one unambiguous transaction list for
+  both individual and grouped matches, preventing the agent from mistaking the
+  two-item minimum of a group for a restriction on individual matches.
+
+## [0.8.27] - 2026-09-05
+
+### Added
+- Bank reconciliation can now match a unique, exact group of same-day bank
+  transactions to one consolidated voucher movement on the same account and
+  currency through the web UI, REST API, and chat tools.
+
+### Changed
+- Grouped reconciliations are created and reversed atomically and retain one
+  audit row per imported bank transaction.
+- Reconciliation prompts show every grouped transaction and the combined total
+  before confirmation.
+
+## [0.8.26] - 2026-09-05
+
+### Fixed
+- The multi-account bank-reconciliation migration now uses portable SQL that
+  passes the full SQLite and PostgreSQL validation workflow.
+
+## [0.8.25] - 2026-09-05
+
+### Added
+- ERP chat messages now render Markdown tables, including alignment markers,
+  inline formatting, and horizontal scrolling for wide tables.
+- The table renderer tolerates harmless blank lines between model-generated
+  header, delimiter, and data rows.
+
+### Changed
+- One submitted voucher can reconcile multiple imported bank transactions when
+  they refer to distinct bank-account movements, supporting multi-bank Journal
+  Entries without permitting the same bank leg to be reused.
+- Cancelling a voucher releases every active bank transaction linked to it.
+
+### Fixed
+- Reconciliation suggestions no longer hide an available bank leg merely
+  because another bank account in the same voucher is already reconciled.
+- Existing `0.8.24` reconciliation records are backfilled during migration and
+  moved from voucher-wide uniqueness to voucher-and-bank-account uniqueness.
+
+## [0.8.24] - 2026-09-05
+
+### Added
+- Auditable bank reconciliation for imported CAMT transactions, including
+  deterministic invoice and exact-voucher suggestions.
+- Confirmed reconciliation can create and submit invoice Payment Entries,
+  classify other movements through Journal Entries, or link an existing exact
+  posting without duplicating it.
+- Bank reconciliation is available through a dedicated accounting page, chat,
+  REST, and MCP, with manager-only permissions and masked counterparty IBANs.
+- Reconciliation undo cancels vouchers created by the workflow or safely
+  unlinks pre-existing vouchers, while preserving the audit history.
+
+### Changed
+- Imported Bank Transactions are immutable evidence and can only be matched
+  through the reconciliation workflow.
+- CI now exercises reconciliation end to end on SQLite and PostgreSQL.
+
+### Fixed
+- The large back arrow on document and master detail pages now always returns
+  to the remembered list view instead of revisiting a previous record after
+  next/previous navigation.
+
+## [0.8.23] - 2026-09-04
+
+### Fixed
+- The chat attachment picker now accepts CAMT XML and ZIP files on browsers
+  that report ZIP uploads as `application/x-zip-compressed`.
+- The CAMT import upload area now implements actual drag-and-drop, including a
+  visible drop state and a clear error for unsupported files.
+
+## [0.8.22] - 2026-09-04
+
+### Added
+- CAMT.053 bank-statement preview and import for XML and ZIP files, with
+  bounded safe parsing for schema versions `.04` and `.08`.
+- Bank Account mappings connect external IBANs to company ledger accounts.
+- Imported statement entries retain transaction details, structured payment
+  references, counterparties, exchange information, and a private audit copy
+  of the source XML without posting anything to the general ledger.
+- Bank statements can be previewed and imported from the accounting UI or
+  through confirmed chat tools. XML and ZIP files are supported as ordinary
+  chat attachments without injecting their raw contents into model context.
+- Regression coverage for SQLite and PostgreSQL, existing-database upgrades,
+  unsafe XML and ZIP input, audit-source retention, and duplicate imports.
+
+### Changed
+- Bank-transaction deduplication uses stable bank references and bounded
+  set-based lookups, including repeated files and references in one request.
+- Bank-statement importing is restricted to authenticated managers and
+  administrators; previews mask account identifiers.
+
+## [0.8.21] - 2026-08-29
+
+### Added
+- MCP clients can inspect document schemas through `get_document_fields` and
+  discover searchable text fields for registered masters.
+- Master searches over MCP support typed filters, case-insensitive substring
+  matching, sorting, pagination, and result-field projection.
+
+### Changed
+- REST and MCP master searches now use the same validated query path and
+  therefore return consistent filtered and ordered results.
+- Free-text document searches derive safe default fields from the document
+  schema when callers do not explicitly provide search fields.
+- The REST API documentation now describes search operators, sorting,
+  pagination, field projection, and the distinction between list search and
+  autocomplete endpoints.
+
+## [0.8.20] - 2026-08-28
+
+### Added
+- Master and document lists now share a field-aware search control with
+  discoverable `field:value` filters, data-backed value suggestions, removable
+  filter chips, explicit search submission, and shareable URL state. Separate
+  master-filter dropdowns are consolidated into the same control. Text-field
+  filters use explicit, case-insensitive `field__contains=value` URL parameters;
+  non-text fields and legacy plain parameters retain exact matching.
+
+## [0.8.19] - 2026-08-28
+
+### Added
+- Accounting reports now display their applied reporting period prominently.
+- Regression coverage for inclusive report end dates, signed contra balances,
+  and pure base-currency revaluation entries.
+
+### Changed
+- Date presets use local calendar dates consistently and their labels are
+  translated in English, German, and French.
+- Profit and Loss reports preserve signed income and expense balances so
+  contra-income and contra-expense accounts contribute correctly.
+
+### Fixed
+- Explicit zero account-currency amounts on journal lines are preserved,
+  allowing base-currency valuations without artificial foreign-currency
+  movements.
+- Local calendar dates no longer shift by one day through UTC conversion in
+  positive-offset timezones.
+
+## [0.8.17] - 2026-08-21
+
+### Added
+- Master lists now support validated server-side column sorting with the same
+  persisted header controls as document lists.
+
+### Changed
+- The Rentals sidebar group now uses a calendar-range icon instead of a
+  forklift, matching its reservation and availability purpose.
+
+### Fixed
+- Master detail previous/next navigation now follows the originating list's
+  search, filters, and sort order instead of reverting to internal-id order.
+- Registered master date and datetime columns now use the standard localized
+  list formatting instead of displaying raw database values.
+
+## [0.8.16] - 2026-08-20
+
+### Added
+- Registered masters can configure the minimum digit width of sequential ids,
+  allowing conventions such as `FIDX-0001` without custom naming code.
+
+## [0.8.15] - 2026-08-20
+
+### Changed
+- Master list pages now show the same pagination controls above and below the
+  table as document lists, including direct page-number entry.
+
+## [0.8.14] - 2026-08-20
+
+### Added
+- Registered masters can opt into opaque random prefixed ids, keeping automatic
+  naming constant-time for high-volume reference indexes.
+
+## [0.8.13] - 2026-08-20
+
+### Added
+- **Deployment-registered business actions.** Plugins can register one
+  role-gated handler and JSON Schema for consistent REST, ERP chat, and MCP
+  exposure; frontend master configurations can render the corresponding action.
+- **Configurable plugin master pages.** The frontend master registry supports
+  fields, projected list columns, filters, search fields, links, and actions.
+
+### Changed
+- Registered masters can provide chat metadata and safe-delete reference checks.
+- Master lists support a strict `fields` projection, and tables with audit
+  columns receive automatic creation/modified timestamps through master CRUD.
+
+## [0.8.12] - 2026-08-19
+
+### Changed
+- **Opening Balances is now admin-only** in the UI — the sidebar entry is hidden
+  from non-admins and the page redirects them home. The import endpoints were
+  already admin-gated server-side.
+
+## [0.8.11] - 2026-08-19
+
+### Fixed
+- **Master list pages are now fully translated** (de/fr) — the Columns/New
+  buttons, column selector, filter labels, search box, and pagination controls
+  were hardcoded English.
+
+## [0.8.10] - 2026-08-19
+
+### Added
+- **Column selector on master list pages.** Master lists (Customer, Item, …) now
+  have the same "Columns" picker as document lists, persisted per master type
+  per user (cross-device). Default shows all columns.
+
+## [0.8.9] - 2026-08-19
+
+### Added
+- **Search + field filters on master list pages.** Master lists (Customer, Item,
+  Supplier, …) previously had only pagination. They now have a free-text search
+  box (matches the master's text columns) and per-master field-filter dropdowns
+  (e.g. customer group/territory, item group/UoM), served by a new
+  `GET /masters/{type}/filter-values` endpoint. Master counts are now cached
+  (invalidated on write) like document counts.
+
+## [0.8.8] - 2026-08-19
+
+### Fixed
+- **Document lists load again — the `fields` projection is advisory.** 0.8.7's
+  column projection rejected any requested field the doctype didn't have with a
+  400, but the frontend appends display-only fields (currency, party_type) that
+  not every doctype has — so lists lacking them (e.g. Quotation) failed to load.
+  Unknown projection columns are now dropped silently.
+
+## [0.8.7] - 2026-08-19
+
+### Fixed
+- **Cached list counts now invalidate on writes.** 0.8.6 cached the exact list
+  total per filter-set but served it stale after a create/delete within the TTL.
+  The cache now keys on a process write-generation (bumped on every non-SELECT
+  statement, both backends), so a mutation refreshes the count immediately; the
+  TTL only backstops cross-replica writes. The page-jump total stays exact.
+
+## [0.8.6] - 2026-08-19
+
+### Performance
+- **Large list views no longer slow down with table size (all doctypes).** Lists
+  default to `ORDER BY creation DESC` + a `count(*)` total, but tables shipped
+  with only a `name` primary key — so a big table did a full sequential scan +
+  sort on every load (measured at 89K rows: ~341 ms list + ~147 ms count; the
+  same list on an indexed column: 0.26 ms).
+  - **Index reconcile:** `Database._ensure_list_indexes()` runs after migrations
+    and creates a `creation` index on every table that has the column — core,
+    plugin, and future doctypes — back-filling existing tables on deploy.
+  - **Column projection:** the documents list projects to the columns the view
+    actually renders (`fields` param) instead of `SELECT *`.
+  - **Cached exact counts:** the list total is cached ~60 s per (doctype,
+    filters), keeping the page-jump total exact while collapsing repeated counts
+    on paging. `services.invalidate_count_cache()` clears it after bulk writes.
+
+## [0.8.5] - 2026-08-18
+
+### Added
+- **Cancel a reservation from the UI.** Reservations had no removal control —
+  they don't submit, so neither Discard nor Cancel ever showed. The document
+  form now has a **"Cancel booking"** button that sets the reservation's status
+  to `Cancelled`, which frees the calendar slot while keeping the row for audit
+  (the ERP has no hard delete for documents). Exposed via a generic `softCancel`
+  doctype-config option so other doctypes can adopt the same pattern.
+
+### Fixed
+- **Reservation status option "On Hire" → "Out".** The reservation status
+  dropdown offered "On Hire", but the backend only accepts
+  Reserved/Out/Returned/Cancelled — so choosing it made the save fail. It now
+  sends `Out` (localised label). The Asset status "On Hire" is correct and
+  unchanged.
+
+## [0.8.4] - 2026-08-18
+
+### Fixed
+- **Chat now links a reservation to its hiring customer.** The chat agent's
+  Assets & Reservations guidance never mentioned the `party` field, so "reserve
+  the 17t for Hans Meisterhans" booked the machine but left the customer blank.
+  The prompt now tells the agent to resolve the customer name to a record
+  (`search_masters`) and set `party` / `party_type` — a named customer with no
+  `party` is treated as a bug, not a valid booking. Prompt-only; no model change.
+
+## [0.8.3] - 2026-08-17
+
+### Added
+- **Company default tax templates, auto-applied on document creation.** Each
+  `Company` now carries a `default_sales_tax_template` and
+  `default_purchase_tax_template` (migration 22). When a document with a taxes
+  table is created and the caller **omits** `taxes` entirely, `create_document`
+  seeds `taxes[]` from the matching company default — so invoices, quotations and
+  orders pick up the right tax without the caller (or the chat model) having to
+  remember it. An explicit `taxes: []` is still honoured as a deliberately
+  tax-free document (export, reverse-charge, exempt); nothing is forced.
+- **Swiss setup wires the 8.1% MWST default.** The CH accounting pack now points
+  `default_sales_tax_template` at *"MWST Normalsatz 8.1%"*, so new Swiss sales
+  documents get VAT automatically. Purchase Vorsteuer stays manual (it varies by
+  goods vs. investment, so there is no single sensible default).
+
+## [0.8.2] - 2026-08-17
+
+### Fixed
+- **`search_masters` accepts the identity alias in `fields`.** `item_code` is the
+  identity everywhere else (create_master, document lines) but the real column is
+  the `name` PK — so `fields=["item_code"]` errored ("None of fields … exist").
+  The alias now resolves to `name`, and when no requested field resolves the
+  search degrades to the default text search instead of erroring.
+- **Sidebar scrolls as a whole when the chat list is short.** The chat list's
+  `overscroll-contain` blocked wheel-chaining to the parent nav, so scrolling
+  over a short (non-scrolling) chat list did nothing. A short list now scrolls
+  the whole sidebar; a long list keeps its own capped scrollbar.
+
+## [0.8.1] - 2026-08-17
+
+### Fixed
+- **Reservation From/To now display and support exact times.** They store a
+  datetime (`YYYY-MM-DD HH:MM:SS`) but were typed as `date`, so a `<input
+  type="date">` couldn't show a value with a time component (blank) and was
+  day-only. Added a `datetime` field type (`datetime-local`); hires can be set
+  to the minute (e.g. 14:27→16:24) — the backend already stored/overlapped on
+  the full timestamp. `_datetime` list columns format with the time too.
+
+### Added
+- **Rental UI i18n (en/de/fr):** the Rentals nav group + items, the fleet
+  calendar (Yard, Machine type, controls, legend, states), Asset/Reservation
+  field labels, select option values (status/party) with the stored value kept,
+  and field hints (scoped per doctype).
+
+## [0.8.0] - 2026-08-17
+
+### Added
+- **Rental UI, phase 1.** Builds on the 0.7.0
+  `Asset` + `Reservation` primitives:
+  - **`GET /api/availability`** — is an item free over a window? Returns pool
+    capacity, committed, available qty, the free units, and the overlapping
+    hires. Read-only; wraps the single canonical overlap rule.
+  - **`GET /api/availability/calendar`** — the fleet-timeline feed: asset lanes
+    plus the reservations overlapping a window (bars), scoped optionally by yard
+    / item.
+  - **Frontend:** `Asset` and `Reservation` are now first-class in the UI (list
+    + form pages, a "Rentals" nav group), and a **fleet availability calendar**
+    (`/rentals/calendar`) — a resource timeline of machines × time with
+    reservation bars — visualises "when is what rented out". No new runtime
+    dependency.
+
+## [0.7.1] - 2026-08-13
+
+### Fixed
+- **Chat document search now matches the record you asked for.** `list_documents`
+  free-text `search` silently no-op'd when the model didn't also pass
+  `search_fields` — it returned the newest N rows instead of searching, so e.g. a
+  CRM lead lookup by a value in `tags` reported "no match" even though the lead
+  existed. The chat handler now defaults `search_fields` to the doctype's
+  registered chat fields (`register_chat_doctype(..., fields=[...])`) when the
+  caller omits them, mirroring how `search_masters` already auto-searches a
+  master's text columns. The frontend is unaffected — it always sends its own
+  `search_fields` from the per-view config.
+- **Free-text search no longer 500s on a non-text column.** `_search_clause` now
+  `CAST`s each searched column to text before `LOWER(...)`, so naming (or
+  defaulting to) an int/bool column can't raise `function lower(integer) does not
+  exist` on Postgres. Matches the master-search path.
+
+## [0.6.25] - 2026-08-07
+
+### Added
+- **Sort now persists per-user.** Clicking a column header saves that sort as the
+  doctype's default (`sort.<doctype>` in the per-user store), so it survives a
+  fresh revisit — not just back/forward. The URL still wins when present (shareable
+  links), falling back to the saved default, then the backend's creation-DESC.
+
+### Changed
+- List sort indicators and the "Columns" button now use lucide SVG icons
+  (chevrons for sort direction; a sliders icon on the column picker) instead of
+  text arrows.
+
+## [0.6.24] - 2026-08-07
+
+### Added
+- **Sortable list columns.** Every doctype/master list header is now clickable to
+  sort by that column (`order_by`/`order` in the URL, validated server-side; ▲/▼
+  indicator; date columns default newest-first). Sort by Next action date, Last
+  contacted, **Last modified**, etc.
+- **Per-user column picker.** A "Columns" popover on each list lets each user pick
+  which columns they see (built from the doctype's fields + `name` + system
+  `modified`/`creation`), persisted **server-side per user**. Falls back to the
+  doctype's `listColumns` default.
+- **Per-user preferences store.** New `User Preference` table + current-user-scoped
+  `GET`/`PUT /auth/my-settings` (merge-upsert, not admin-gated) — distinct from the
+  global admin-only `/auth/settings`. Portable across SQLite + Postgres. Consumers:
+  `columns.<doctype>` and `language`.
+- **Language now follows the account.** `LanguageSelect` saves the choice to the
+  per-user store and the app applies it on load, so language syncs across devices
+  (localStorage remains the fast pre-auth seed).
+
+## [0.6.23] - 2026-08-04
+
+### Added
+- **Chat tab title = the chat's own name.** The chat page sets `document.title`
+  to the session's (auto-generated) title, so a bookmarked chat keeps that string.
+- **Tab titles across the rest of the app.** Every remaining custom page now sets
+  its title via `usePageTitle` — all 8 report pages (incl. Chart of Accounts),
+  the dashboard, and the entry pages (setup, tutorial, admin, proposal form) —
+  using the same `titles.*` labels the header shows. Combined with the generic
+  document/master list+detail wiring, the whole app now has meaningful tab titles.
+
+## [0.6.22] - 2026-08-04
+
+### Fixed
+- **DB integrity violations return a clear 409, not an opaque 500.** A unique /
+  foreign-key violation (e.g. saving a duplicate lead UID) had no exception
+  handler, so it surfaced as "Internal Server Error" — which a form could show as
+  a stray red line or effectively swallow ("nothing saved, no warning"). Now
+  mapped to `409` with the colliding field/value: *A record with uid = "…" already
+  exists.* (Portable across psycopg / sqlite.)
+- Page-title separator is now a plain hyphen: `Name - Lambda ERP`.
+
+## [0.6.21] - 2026-08-04
+
+### Fixed
+- **Master search is now case-insensitive.** Postgres `LIKE` is case-sensitive, so
+  searching "plus medica" missed "Plus Medica AG" — now `LOWER(...) LIKE LOWER(...)`
+  (portable). Also fixes the CRM lead→customer dedup missing an existing customer.
+
+### Added
+- **Smart browser-tab titles** via a new `usePageTitle` hook. Detail pages show the
+  record's name (`Plus Medica AG — Lambda ERP`, `SINV-0042 — Lambda ERP`); list /
+  overview pages show the section (`Customer — Lambda ERP`); home stays the app
+  name. Wired into the generic document/master list + detail pages; the app name
+  comes from branding (white-label safe). Custom pages call `usePageTitle(...)`.
+
+## [0.6.20] - 2026-08-04
+
+### Fixed
+- **Chat attachment chips show the real file type** (PDF / DOCX / XLSX / …) from
+  the filename instead of always reading "PDF", and use the neutral surface
+  colour instead of the off-palette salmon.
+
+## [0.6.19] - 2026-08-03
+
+### Changed
+- **Chat sidebar: the chat list scrolls within a capped height** (~15 chats)
+  instead of growing unbounded and pushing the nav groups below it down the
+  sidebar. "New chat" stays pinned above the scrollable list.
+
+## [0.6.18] - 2026-08-03
+
+### Changed
+- **The Responses API is now the default chat orchestrator** (`ERP_CHAT_API`
+  defaults to `responses`; verified on dev). Office attachments are read directly,
+  and the loop reasons natively during tool calls. Set `ERP_CHAT_API=chat` to fall
+  back to the legacy Chat Completions path (instant, no redeploy).
+
+## [0.6.17] - 2026-08-03
+
+### Added
+- **Responses API path for the chat orchestrator, behind the `ERP_CHAT_API` flag**
+  (default `chat`). Setting `ERP_CHAT_API=responses` routes the main reasoning loop
+  through OpenAI's Responses API (`/v1/responses`) instead of Chat Completions —
+  which is what actually lets the model read Office attachments (`input_file` by
+  `file_id`; Chat Completions is PDF-only, even by `file_id`) and enables native
+  reasoning during tool calls (no `reasoning_effort="none"` hack). Conversation
+  state stays Chat-Completions-shaped; the translation happens only at the single
+  orchestrator call boundary and the Responses output is shimmed back into
+  Chat-shaped objects, so cost/booking and the whole tool loop are unchanged. The
+  default (`chat`) path is byte-for-byte identical.
+
+### Changed
+- On the default Chat backend an Office attachment now degrades to a short text
+  note (that backend only reads PDFs/images) instead of triggering a hard 400.
+
+## [0.6.16] - 2026-08-03
+
+### Changed
+- **Office chat attachments now reach the model via the OpenAI Files API** (upload
+  → `file_id`) instead of an inline base64 `file_data`. OpenAI only accepts PDF
+  inline, but reads Excel/Word/PowerPoint/OpenDocument fine by `file_id` — this
+  fixes the `400 unsupported MIME type` on `.xlsx`/`.docx`. The upload is cached
+  per attachment and **reused across turns**, and carries a **30-day
+  `expires_after`** so OpenAI reclaims the file automatically (re-uploaded on
+  demand if referenced after expiry — the bytes stay in our storage). No separate
+  file fee: the per-use cost is the file's tokens, already billed.
+- **Upload returns a non-blocking `warning`** when a spreadsheet has a sheet over
+  ~1,000 rows (the model's per-sheet augmentation limit), surfaced in the chat UI
+  so the user knows results may be partial.
+
+### Added
+- `Chat Attachment.openai_file_id` / `openai_file_expires_at` columns (migration 20).
+- `openpyxl` dependency (read-only spreadsheet row-count for the warning).
+
+## [0.6.15] - 2026-08-03
+
+### Fixed
+- **Chat attachment uploads 500'd in a containerized deploy** (`[Errno 13]
+  Permission denied .../site-packages/uploads`). `UPLOAD_ROOT` was computed
+  relative to the module file, which resolves under read-only `site-packages`
+  when the package is pip-installed — so *every* upload (PDF included) failed.
+  It now defaults to the OS temp dir and honors `LAMBDA_ERP_UPLOAD_DIR` for a
+  persistent/mounted location.
+
+## [0.6.14] - 2026-08-03
+
+### Added
+- **`batch_update_documents` tool** (MCP + chat) — update many documents of the
+  SAME doctype in one call instead of one `update_document` per record. Pass
+  `updates: [{name, data}]` (max 200). Best-effort and per-item: each record is
+  saved independently (its own hooks fire), so one failure doesn't undo the
+  rest; returns `{updated, failed, results:[{name, ok, error?}]}`. Manager+ only.
+  Because it reuses `update_document`, plugin save-hooks still run — e.g. a lead
+  update carrying a transient `_note` logs its timeline Activity here too.
+- **`list_documents` filter operators** — a filter value may now be an operator
+  array for comparisons and NULL checks: `{"grand_total": [">", 100]}`,
+  `{"fit": ["!=", "A"]}`, `{"fit": ["is null"]}`, `{"main_email": ["is not null"]}`.
+  Operators are whitelisted (`=, !=, >, <, >=, <=, like, not like, is null,
+  is not null`) and never interpolated from raw input.
+- **`list_documents` `offset` and `fields`** — `offset` pages past `limit`;
+  `fields` returns only the named columns (plus `name`) to keep results lean.
+- **Office & document chat attachments** — upload Excel / Word / OpenDocument /
+  CSV files (`xlsx, xls, ods, docx, doc, odt, pptx, ppt, odp, csv, txt`) in the
+  chat. The model reads them directly via the `file` content part (raw bytes, no
+  server-side conversion), so you can e.g. hand it a spreadsheet of companies and
+  have it cross-check them against the CRM. Existing 10 MB cap applies.
+
+### Security
+- **List filters and `order_by` are validated against the doctype's real columns**
+  before reaching SQL (in the chat/MCP path), closing a key-interpolation seam and
+  returning a clean error instead of a 500.
+
+## [0.6.13] - 2026-07-31
+
+### Changed
+- **MCP settings snippet: default the Claude `mcp add` to `--scope user`.** The
+  API-keys page suggested a bare `claude mcp add`, which registers the server in
+  the **local** (this-project-only) scope. The recommended command is now
+  `--scope user` so the ERP MCP server is available across all the user's
+  projects, not just where they ran it.
+
+## [0.6.12] - 2026-07-31
+
+### Added
+- **MCP endpoint (`POST /api/mcp`)** — the ERP's fine-grained tool surface for
+  LLM agents (Claude, Codex, …) over MCP's Streamable HTTP (JSON-RPC 2.0). It
+  reuses the chat's `build_tools()` schemas and `TOOL_HANDLERS` (so every write
+  runs `validate()`), and authenticates with the **same Bearer API keys as REST**
+  via `get_current_user` — the key acts as its user at the key's role (viewer =
+  read-only, manager = writes, admin = deletes), gated by the same
+  `rest_api_enabled` flag. No separate credential. Chat-session-only tools are
+  excluded. Because the tool list is built from the live registries, a plugin's
+  doctypes/masters (e.g. the internal CRM) are exposed automatically — the MCP
+  surface is modular by construction. The API-keys settings page shows the MCP
+  URL and ready-to-paste Claude/Codex config right after a key is created.
+  `tests/test_mcp.py` covers it (SQLite + Postgres in CI).
+
+## [0.6.11] - 2026-07-30
+
+### Added
+- **`ConfirmButton` gains `size` and `cancelSide` props.** For a right-aligned
+  trigger (e.g. a toolbar delete button) the armed group keeps its right edge,
+  so Cancel must sit on the **right** to land under a double-click — pass
+  `cancelSide="right"`. `size="md"` renders normal-height armed buttons to match
+  a full-size labelled trigger (default `size="sm"` keeps the compact style for
+  icon triggers). Defaults are unchanged, so existing usages render identically.
+
+## [0.6.10] - 2026-07-30
+
+### Added
+- **Shared confirm/prompt dialogs — no more `window.confirm`/`prompt`.**
+  `<DialogProvider>` (mounted by `AppShell`) + the `useConfirm()` / `usePrompt()`
+  hooks give styled, on-brand modals in place of the browser's native dialogs;
+  all core submit/cancel/delete/discard prompts now use them. Also
+  **`<ConfirmButton>`** — an inline arm-to-confirm for low-stakes in-row actions:
+  first click splits the control into *Cancel | Confirm* with Cancel taking the
+  trigger's spot, so an accidental double-click cancels (nothing happens); it
+  auto-collapses. All exported from the package.
+- **Pagination on top of the list too, with a typeable page number.** The
+  `DocumentList` pager now renders above *and* below the table (no scrolling to
+  the bottom to page long lists), and the current page is an editable field —
+  type a number + Enter to jump (clamped to 1..last).
+
+## [0.6.9] - 2026-07-29
+
+### Fixed
+- **Dates no longer force US format.** `formatDate` hardcoded the `"en-US"`
+  locale (and an English short month), so every deployment showed US-style
+  dates regardless of the viewer. It now formats numeric, day/month per the
+  configured locale, defaulting to the **viewer's browser locale**. A
+  deployment can pin it with the new **`setDateLocale(locale)`** (e.g.
+  `setDateLocale("de-CH")` for `DD.MM.YYYY` everywhere). `setDateLocale` and
+  `formatDate` are exported from the package.
+  Note: native `<input type="date">` pickers still render in the browser/OS
+  locale — that's the platform, not this formatter.
+
+## [0.6.8] - 2026-07-29
+
+### Added
+- **Free-text search on the document list.** A doctype config may declare
+  `searchFields: string[]` — columns matched case-insensitively (substring)
+  by a **debounced** search box above the list (commits to the URL `q` after a
+  pause, so it doesn't refetch on every keystroke). The list/count/adjacent
+  endpoints take `search` + `search_fields` (a CSV validated to real columns);
+  search is ANDed with the other filters, and prev/next (`DocPager`) steps
+  through the searched result set too. Omit `searchFields` for no search box.
+- **`register_search_expansion(doctype_slug, fn)` seam.** Lets a plugin match a
+  doctype by a **related table the core doesn't know** — `fn(query, db)` returns
+  the PK names to also include, OR-ed into the search (`name IN (...)`). E.g. the
+  internal CRM finds a Lead by one of its Contacts. `tests/test_search.py`
+  covers same-table search, the expansion seam, count parity, and adjacent.
+
+## [0.6.7] - 2026-07-29
+
+### Fixed
+- **Timestamps are now timezone-aware UTC (`now()`).** `now()` returned a naive
+  ISO string (no zone), so a client parsing it (`new Date(...)`) read it as
+  *browser-local* and rendered a UTC-server timestamp shifted by the viewer's
+  offset — e.g. a note stamped server-side showed ~2h behind in Zürich, while a
+  record whose timestamp the frontend set via `toISOString()` (with `Z`) showed
+  correctly. `now()` now returns `datetime.now(timezone.utc).isoformat()`
+  (`…+00:00`), making every stored `creation`/`modified`/`occurred_at` an
+  unambiguous instant that round-trips correctly. `nowdate()` is unchanged
+  (date-only fields stay zone-free). Existing rows keep their stored (naive)
+  value — only newly written timestamps carry the zone. `tests/test_utils_now.py`
+  guards the format.
+
+## [0.6.6] - 2026-07-29
+
+### Added
+- **Config-driven list filters (`listFilters`).** A doctype config may now
+  declare `listFilters: string[]` — field names (each a `type: "select"`
+  field) rendered as dropdowns above the list, their selection sent as a plain
+  column filter (`status=Contacted`, `fit=A`). When set, these replace the
+  built-in Draft/Submitted/Cancelled status dropdown — the right call for
+  non-submittable doctypes whose `status` is a business field, not a docstatus.
+  Omit it to keep the default status filter (every existing doctype unchanged).
+  Uses the ad-hoc column-filter path added in 0.6.0; no backend change needed.
+
+### Fixed
+- **Date-range filters now work on any doctype with a declared `dateField`.**
+  The list/count/adjacent endpoints filtered `from_date`/`to_date` against a
+  hardcoded server-side `DATE_FIELDS` map that only knew the built-in core
+  doctypes, so a plugin doctype's date pickers were silently ignored. The
+  frontend now sends its declared `dateField` as a `date_field` query param;
+  the backend honors it when it names a real column (falling back to the map
+  otherwise, and degrading to *no* date filter — never a 400 — for a synthetic
+  `dateField`). `date_field` is validated against live columns before it ever
+  touches SQL. Covers list, count, and prev/next (`DocPager`) alike.
+
+## [0.6.5] - 2026-07-29
+
+### Added
+- **Prev/next navigation (`DocPager`) on master detail pages.** The same ‹ / ›
+  buttons + keyboard shortcuts documents got in 0.6.4 now work on Customer /
+  Supplier / Item / Warehouse / Company (and any plugin-registered master):
+  `DocPager` takes `kind="master"`, backed by a new
+  `GET /masters/{type}/{name}/adjacent` keyset endpoint (name ASC — the list's
+  order; `include_disabled` defaults true for 1:1 stepping with the list).
+  The master list stashes its URL (`master:{type}` context) so Esc/`u` returns
+  to the exact page you left.
+
+### Fixed
+- **Master lists are now deterministically ordered (`ORDER BY name`).** The
+  list endpoint had no ORDER BY, so Postgres returned pages in arbitrary
+  order — OFFSET pagination could repeat/skip rows.
+- **Postgres connections no longer sit "idle in transaction" after reads.**
+  With `autocommit=False`, even a plain SELECT opens a transaction, and nothing
+  ended it — so every pooled request thread (and the chat websocket) left an
+  open transaction pinning `ACCESS SHARE` locks on each table it had read.
+  Those idle locks starved the lock-safe plugin migrations (`ensure_column`/
+  `drop_column`) of their `ACCESS EXCLUSIVE` lock on **every** boot: the ALTERs
+  timed out forever, columns were never added, and — because `_persist()` only
+  writes columns that exist — the UI's saves returned 200 while silently
+  dropping edits to the missing fields (observed in production). `_PgConn` now
+  rolls back immediately after a read when no write is pending and no explicit
+  transaction (submit/cancel) is active, so connections never idle inside a
+  transaction. Write atomicity is unchanged. Regression-tested in
+  `tests/test_txn_release.py`, including the migration-starvation scenario.
+
+## [0.6.4] - 2026-07-28
+
+### Added
+- **Prev/next record navigation (`DocPager`) on every document detail page.**
+  ‹ / › buttons step to the adjacent record, following the **same order and
+  filters as the list you came from** (v2): a new `GET /documents/{slug}/{name}/
+  adjacent` endpoint does indexed keyset queries (default creation DESC, `name`
+  tie-break), and `DocumentList` stashes its filters/URL per doctype (a
+  sessionStorage-backed `doc-list-context` store) for the detail page to read.
+  Keyboard: `j`/`→` next, `k`/`←` prev, `Esc`/`u` back to the list (gated so
+  they don't fire while typing), `Cmd/Ctrl+S` save. `DocPager`, `setListContext`,
+  `getListContext`, and `api.adjacentDocument` are exported so a deployment's
+  custom detail page reuses the exact same behavior.
+
+## [0.6.3] - 2026-07-28
+
+### Added
+- **`register_chat_doctype` gained a `page` argument**, so the chat emits the
+  right *view link* for a doctype instead of assuming everything has an
+  `/app/{slug}/{name}` page. `page="self"` (default) → its own page;
+  `page="<link_field>"` → no page of its own, opens via that `LINK_FIELD`'s
+  parent (e.g. a contact opens via its lead: `/app/lead/{lead_id}`); `page=None`
+  → no link. `build_system_prompt` now renders a per-doctype "open at …" rule.
+- **`GET /api/chat-doctypes`** — public metadata (description, fields, resolved
+  `page`) for chat-doctypes. The frontend `bootstrap()` reads it and
+  **auto-registers redirects** for page-less doctypes: a `/app/{slug}/{name}`
+  link looks up the record's parent and redirects to the parent's page, so
+  chat-generated links to page-less records resolve with no per-deployment code.
+
+## [0.6.2] - 2026-07-28
+
+### Changed
+- **`db.ensure_column` is now lock-safe, and there's a matching `db.drop_column`.**
+  Plugin migrations `ALTER` tables in the app lifespan, before it serves — and
+  during a rolling deploy the old revision is still querying those tables, so an
+  unbounded `ALTER` blocks on the lock indefinitely and crash-loops the new
+  revision (its startup probe never passes). On Postgres both helpers now bound
+  the wait with `lock_timeout` + retry, so the `ALTER` catches a gap in traffic
+  or **fails fast** (the migration runner retries next boot) instead of hanging;
+  SQLite runs directly. `drop_column` is the idempotent, lock-safe counterpart
+  to `ensure_column`. Existing `ensure_column` callers get the protection for
+  free.
+
+## [0.6.1] - 2026-07-28
+
+### Added
+- **`register_chat_doctype` — teach the AI chat about a plugin doctype.** The
+  document tools (`create_document`/`update_document`/`list_documents`/
+  `get_document`) already accept any registered doctype and run its `validate()`,
+  but the chat had no idea what a custom doctype *is* or how it links.
+  `api.services.register_chat_doctype(slug, *, description, fields=None)` makes
+  `build_system_prompt` surface a "Custom record types" section: the
+  description, key fields, and the Document class's `LINK_FIELDS` relationships
+  (e.g. a contact's `lead_id → Lead`), plus the rule to drive these with the
+  document tools and attach a child by setting its link field to the parent's
+  `name`. Lets a deployment expose a whole module (e.g. a CRM: lead/contact/
+  activity) to chat through the validated write path — no master overlay needed.
+- **`list_documents` chat tool gained `order_by` + `order`** (`asc`/`desc`), so
+  the assistant can list a timeline newest-first (e.g. activities by
+  `occurred_at`) instead of always `creation DESC`.
+
+## [0.6.0] - 2026-07-27
+
+### Added
+- **Plugin schema seam — `register_table` / `register_migration` +
+  `db.ensure_column`.** A plugin can declare its own tables and one-shot
+  migrations from `register()`; the core creates the tables and runs pending
+  migrations in the app lifespan (`apply_plugin_schema()`, after
+  `load_plugins()`, before any document is created). Migrations run **exactly
+  once per database**, recorded in `_PluginMigrations` by a namespaced id; a
+  failure is rolled back and retried next boot without aborting startup.
+  `db.ensure_column(table, col, type)` is the idempotent, backend-portable
+  column-add for use inside a migration. Replaces the
+  `db.conn.execute(db._ddl(...))` hack deployments used to create plugin tables,
+  and finally gives plugins a safe path for `ALTER`/backfills on a live database.
+- **Arbitrary-field filter + ordering on `GET /api/documents/{slug}`.** Any
+  query param naming a real column of the doctype becomes an equality filter
+  (e.g. `?lead_id=LEAD-3316`), and `order_by` + `order` (`asc|desc`) sort by a
+  validated column. Unknown field names are a 400 (validated against the live
+  columns via `api.services.document_columns`; values are parameterized), never
+  interpolated. Lets plugin doctypes be listed by a foreign key — the missing
+  piece for relational plugin data like a CRM activity timeline.
+- **Boot-seeded admin from the environment — `LAMBDA_ERP_ADMIN_EMAIL` +
+  `LAMBDA_ERP_ADMIN_PASSWORD`.** When both are set, an enabled admin with that
+  email is provisioned at startup (`api.auth.ensure_seed_admin`, called from
+  the app lifespan) *before* anyone can register — closing the "first user to
+  sign up becomes admin" window on deployments whose database is recreated on
+  every rollout (e.g. an ephemeral-SQLite demo container, where otherwise
+  whichever visitor loads the login page first after a redeploy would own the
+  instance). Create-if-missing and idempotent: an existing account with that
+  email is promoted to an enabled admin if needed, but its password is left
+  untouched so a redeploy never clobbers a credential changed in a live
+  instance; the password is read only from the environment and never logged.
+  Optional `LAMBDA_ERP_ADMIN_NAME` sets the display name. No-op when the vars
+  are unset, so nothing changes for deployments that don't use it.
+
+### Changed
+- **Demo container (`LAMBDA_ERP_AUTO_DEMO=1`) without public-demo mode now
+  opens viewer self-registration** instead of leaving the instance on the
+  register-as-admin path. With the boot-seeded admin owning the instance,
+  open signup can only ever mint viewers, so demo visitors get a hands-on
+  (read-mostly) account and nobody can grab admin off the login page. Only
+  seeds `allow_public_signup` when it has never been set, so an admin who
+  toggles it off in a persistent instance isn't overridden on the next boot.
+
+## [0.5.0] - 2026-07-26
+
+### Added
+- **Plugin masters are discovered by the AI chat and REST API —
+  `register_master` seam.** A deployment plugin can register its own master
+  type (`api.services.register_master(slug, table, name_field,
+  name_prefix=..., identity_alias=...)`) — the master-side counterpart of
+  `register_doctype` — and it works from day one with zero per-type teaching:
+  `/api/masters/{slug}` REST CRUD, and all chat master tools (`search_masters`
+  with fuzzy fallback, `get_master_fields`, `create/update/delete_master`).
+  Chat tool schemas and the system prompt are now built per request from the
+  live registries instead of hardcoded lists, which also makes
+  `register_doctype`-registered doctypes visible to the chat document tools
+  (`list_documents`, `get_document`, …). Fields are introspected from the live
+  table, so every text column of a registered master is immediately
+  searchable. New test suite `tests/test_master_registry.py` (SQLite +
+  Postgres in CI). `MASTER_NAME_PREFIXES` and `MASTER_IDENTITY_ALIAS` moved
+  from `api.routers.masters` to `api.services` (still re-exported from the
+  router).
+- **Back button on detail pages.** The app-shell header shows a back arrow on
+  doctype/master detail and new-record pages (and the opening-balances setup
+  page), navigating to the parent list — using in-app history when available
+  so the list keeps its state.
+- **App version shown in Settings.** The Settings page now displays the running
+  ERP core version (e.g. "Version 0.4.0") in a small footer. The version is
+  resolved at runtime from `pyproject.toml` (source checkout) or the installed
+  package metadata (wheel), so it's always accurate without a manual bump, and
+  is also exposed on `GET /api/health` (`{status, version}`) and as the FastAPI
+  app version. Replaces the previously hardcoded, stale `__version__`.
+
+## [0.4.0] - 2026-07-24
+
+### Added
+- **REST API access via Bearer API keys.** The same per-user API keys that drive
+  the chat API now authenticate the regular REST API (`/api/documents`,
+  `/api/masters`, `/api/reports`, …) when an admin enables the new
+  `rest_api_enabled` Settings flag (off by default, independent of
+  `chat_api_enabled`). A key acts **as its owner** with the owner's live role,
+  capped at the key's role, so a connector or sync job can create and submit
+  documents through the endpoints the web app already uses — role checks,
+  attribution, and instant revocation all behave as if the user logged in. The
+  Settings screen gains a combined **Programmatic API** card with independent
+  Chat/REST toggles over one shared key list. Docs: [`docs/rest-api.md`](docs/rest-api.md);
+  tested in `tests/test_rest_api.py` (SQLite + PostgreSQL).
+
+## [0.3.4] - 2026-07-17
+
+### Added
+- **Confirmation dialog before deactivating the chat API.** Turning the chat API
+  off in Settings now asks first (enabling stays one click). The dialog makes the
+  reassuring part explicit: the API is gated off and Bearer requests are rejected,
+  but **API keys are not deleted** — they stay saved and work again the moment the
+  API is re-enabled. Previously the toggle fired immediately with no warning.
+
+## [0.3.3] - 2026-07-17
+
+### Fixed
+- **Disabled master records are reachable again from the chat.** `search_masters`
+  hides disabled/archived records by default (so you don't book to a retired
+  account), but there was no way to reach them at all — you couldn't find a
+  disabled account to re-enable it (a catch-22), nor ask "what's disabled". Adds an
+  optional `include_disabled` flag (default false) that surfaces disabled records
+  across the no-query, substring, and fuzzy paths; the chat is told to retry with
+  it when a record it expects isn't found.
+
+## [0.3.2] - 2026-07-17
+
+### Fixed
+- **Journal entries with amounts only in the account-currency fields now post.**
+  A JE row carrying `debit_in_account_currency`/`credit_in_account_currency` but 0
+  in the base `debit`/`credit` (as the chat's create path produced) passed the
+  0==0 balance check, submitted, and posted **nothing**. The JE now back-fills base
+  ↔ account-currency per row (single-currency: they're equal), and a submit that
+  would post no non-zero GL lines is now rejected instead of silently no-op'ing.
+- **Master flag updates accept booleans.** `create_master`/`update_master` coerce a
+  JSON `true`/`false` to `1`/`0` for integer flag columns (e.g. `disabled`), so
+  re-enabling an account with `{"disabled": false}` actually persists (a bool into
+  an INTEGER column errors on Postgres).
+
+### Changed
+- **Chat: stronger anti-fabrication guardrail.** The assistant must confirm an
+  action from the tool's returned record before claiming success, must not invent
+  capabilities (there is no master rename), and must verify a field/capability
+  exists before asserting it's missing.
+
+## [0.3.1] - 2026-07-17
+
+### Changed
+- **`search_masters` no longer hard-caps results at 20.** The chat can pass an
+  optional `limit` (omit for no cap), so "list all accounts" returns the whole
+  chart of accounts instead of a silently-truncated 20. Applies to the no-query
+  listing, the substring match, and the fuzzy fallback. Backend-only, but both
+  packages version together.
+
+## [0.3.0] - 2026-07-16
+
+### Changed
+- **Relicensed from MIT to Apache License 2.0.** 0.3.0 is the first
+  Apache-2.0-licensed version of both packages
+  (`lambda-erp` on PyPI, `@lambda-development/erp-core` on npm). Apache-2.0
+  adds an explicit patent grant and contributor patent-license terms, which
+  fits an extensible platform consumed and extended by private customer
+  implementations. All prior code was contributed by the sole copyright
+  holder, so no external relicensing consents were required. Releases up to
+  and including 0.2.6 remain available under MIT. The npm package also gains
+  a `LICENSE` file in its tarball (`frontend/LICENSE`) — previous tarballs
+  shipped none, since npm only auto-includes a license file from the package
+  root, not the repo root.
+
+## [0.2.6] - 2026-07-16
+
+### Fixed
+- **Browser refresh no longer serves a stale app.** The SPA shell
+  (`index.html`) was returned with no `Cache-Control` header, so browsers
+  heuristically cached it and a soft reload could load an old shell pointing at
+  previous-build asset URLs — you had to hard-refresh. It's now served
+  `Cache-Control: no-cache` so the shell is always revalidated (a cheap 304
+  when unchanged, fresh bytes after a deploy). Backend-only, but both packages
+  version together.
+
+### Changed
+- **Content-hashed `/assets` are now served `immutable` with a one-year
+  max-age.** Their URLs change with every build, so the browser can skip
+  revalidation entirely — a reload no longer round-trips a 304 per bundle.
+  Combined with the `no-cache` shell, a reload costs one small shell
+  revalidation instead of re-checking every asset. Net: fewer requests.
+
+## [0.2.5] - 2026-07-15
+
+### Fixed
+- **Chart of Accounts report also hides disabled accounts.** 0.2.4 hid disabled
+  accounts in `/account/tree`, but the CoA page the GUI renders is the
+  `/reports/chart-of-accounts` report, which still listed them (shown as
+  "disabled"). It now hides disabled accounts by default too — same rule: balances
+  still roll up over disabled descendants, and a disabled group with an enabled
+  descendant is kept so nothing active is orphaned. `include_disabled=true` shows
+  them.
+
+## [0.2.4] - 2026-07-15
+
+### Changed
+- **Chart of Accounts hides disabled accounts.** The `/account/tree` endpoint now
+  omits disabled accounts by default (they already drop out of account pickers),
+  so retiring an account removes it from the CoA view instead of leaving it as
+  clutter. A disabled *group* is still shown when it has an enabled descendant, so
+  an active account is never hidden behind a disabled parent. Pass
+  `include_disabled=true` to see them; each node now carries a `disabled` flag.
+
+## [0.2.3] - 2026-07-15
+
+### Added
+- **German localization packs (DATEV).** Two new `country="de"` variants —
+  `de.skr03` (process-ordered, the most widely used German SME chart) and
+  `de.skr04` (balance-sheet-ordered, DATEV's recommendation for new companies).
+  Each hand-authored from the published DATEV standard (cross-checked against the
+  LGPL Odoo `l10n_de` data): a curated ~70-account core with German titles
+  carrying their SKR number, EUR, and an Umsatzsteuer/Vorsteuer tax hook at the
+  federal rates (19 % Regelsteuersatz, 7 % ermäßigt). A bare `country="de"`
+  resolves to SKR03; `de.skr04` selects the modern chart. This is the first use
+  of the `country[.variant]` key axis the pack registry was built for — no engine
+  change, the shared VAT builder lives in `packs/de_common.py`. Sector overlays
+  render in German on the DATEV chart, same as the Swiss pack.
+
+## [0.2.2] - 2026-07-15
+
+### Changed
+- **Idempotent company setup.** `apply_company_setup` now *converges* toward the
+  desired chart instead of refusing when the company already exists. It creates
+  only the accounts that are missing, fills only the company defaults that are
+  still empty (never overwriting a configured company), and creates the tax
+  templates / cost center only if absent — so setup is safe to run alongside an
+  existing deployment and to re-run. It returns a reconciliation report
+  (`accounts_created` vs `accounts_skipped`, `defaults_set` vs
+  `defaults_left_untouched`). When the company is already configured, or its
+  currency differs from the setup (which would mix two charts), it returns
+  `needs_confirmation` and proceeds only with `confirm_existing` after the user
+  insists; `plan_company_setup` surfaces this up front via an `existing` block.
+  Replaces the previous hard guard / `force` flag.
+
+### Fixed
+- **Chat bold headings.** A line the assistant emits as bold (`**Heading**`) is no
+  longer mistaken for a `*` bullet — the chat's list detection now requires
+  whitespace after the marker, so the bold renders instead of leaking stray `*`/`•`.
+
+## [0.2.1] - 2026-07-15
+
+### Fixed
+- **Localized sector accounts.** Sector-profile overlay accounts are now created
+  in the localization pack's language, so on the Swiss (German) chart they read in
+  German — e.g. *Beratungserlöse*, *Aufwand für Fremdleistungen* — instead of the
+  neutral English names, matching the German base chart.
+- **Services income default.** The services profile pointed its income default at
+  *Service Revenue*, an account that exists only in the generic chart; it now
+  points at the profile's own revenue account, so the default resolves on every
+  jurisdiction (it was dangling on the Swiss chart).
+- **Chat line breaks.** Multi-line messages now preserve their line breaks in the
+  user's own message bubble.
+
+## [0.2.0] - 2026-07-15
+
+### Added
+- **Guided, sector-aware company setup.** New `lambda_erp/accounting/setup/`
+  package builds a company's chart of accounts through a three-layer design:
+  a universal `account_type` spine, pluggable **localization packs** keyed
+  `country[.variant]` (a registry with a permanent generic/international
+  fallback), and seven jurisdiction-independent **sector profiles** (services,
+  retail/POS, hospitality, distribution, import/export, manufacturing,
+  construction) that attach accounts to pack *anchors* — never to literal codes,
+  so they carry across every jurisdiction unchanged. Adding a country is a new
+  pack module with no engine change. Exposed as `plan_company_setup` (preview,
+  no writes) and `apply_company_setup` (creates chart + defaults + tax + cost
+  center). The registries and profiles are semver-governed extension seams.
+- **Switzerland localization pack.** First jurisdiction pack beyond generic: the
+  Swiss *Kontenrahmen KMU* (German account names with KMU numbers, CHF), with an
+  MWST tax hook that builds Sales/Purchase tax templates at the current rates
+  (8.1 % / 2.6 % / 3.8 %, from 2024). Selected via `country="CH"`; the seven
+  sector profiles apply on it unchanged.
+- **Chat setup wizard.** Admin-only `plan_company_setup` / `apply_company_setup`
+  chat tools walk the user through the plan, surface each sector "big decision"
+  for explicit confirmation, and only create anything on approval. `POST
+  /api/setup/company` now routes through the engine (the company `country`
+  selects the jurisdiction, an optional `sector` applies the overlay); with
+  neither it is byte-identical to the previous chart. Added `GET
+  /api/setup/profiles` and `POST /api/setup/plan`.
+- **Tutorial "Get started".** A prominent guided-setup card on `/tutorial` with a
+  "Get started in chat" button that launches the wizard (en/de/fr).
+- **API keys grouped by owner.** The admin API-keys page now groups keys by the
+  user they belong to (your own first, clearly labelled), with an in-page
+  confirmation dialog before revoking or deleting another user's key.
+
+## [0.1.38] - 2026-07-13
+
+### Changed
+- **Channel-aware chat replies.** `run_session_turn` now takes a `channel`
+  (`web` | `api`); `POST /api/v1/chat` runs as `api`. On that channel the agent is
+  told its reply is relayed to an external application (not the ERP web UI), so it
+  names records in plain text and stops emitting `/app`, `/masters`, and
+  `/reports` links that are dead outside the ERP. It still emits the canonical
+  `/api/documents/{slug}/{name}/pdf` reference for documents (phrased as an
+  attachment, not a link to click). The web/WebSocket channel is unchanged.
+
+### Added
+- **Structured `documents` in the chat API response.** `POST /api/v1/chat` now
+  returns a `documents` array — each referenced PDF as
+  `{doctype, name, pdf_url}`, where `pdf_url` is an absolute, Bearer-gated
+  `/api/v1/documents/.../pdf` URL the caller can fetch directly. This is the
+  machine-readable contract an orchestrator uses to attach PDFs, instead of
+  re-parsing the reply prose.
+
+## [0.1.37] - 2026-07-10
+
+### Added
+- **Document read endpoints on the chat API.**
+  `GET /api/v1/documents/{doctype-slug}/{name}/pdf` (rendered PDF) and
+  `GET /api/v1/documents/{doctype-slug}/{name}` (structured JSON), Bearer-key-gated
+  like the rest of the chat API (inherit the `chat_api_enabled` flag + key role).
+  Chat replies link to a document's PDF, but the web `/api/documents/...` route is
+  cookie-gated and unreachable by an API caller — these mirror it so an
+  orchestrator (and the iOS app) can fetch the bytes with its key. Read-only
+  (`viewer` role suffices); missing document → 404, unknown doctype → 422.
+
+### Fixed
+- **Self-host the Inter font.** The Tailwind preset asks for `Inter`, but the font
+  was only loaded by the demo's Google Fonts `<link>` (not part of the published
+  package), so consumer apps fell back to system-ui. `@fontsource/inter` is now a
+  runtime dependency and `@import`ed in `src/index.css` (shipped via
+  `exports["./styles.css"]`), so every consumer inherits Inter with no extra setup.
+
+## [0.1.36] - 2026-07-10
+
+### Added
+- **Programmatic chat API (opt-in).** A synchronous REST surface over the chat
+  agent so an external application can hold a conversation with an ERP instance.
+  Off by default — an admin enables it (Settings → Chat API, `chat_api_enabled`)
+  and issues **Bearer API keys** (hashed at rest, shown once, per-key role
+  `viewer`/`manager`/`admin`, revocable). New `POST /api/v1/chat` plus
+  `GET`/`DELETE /api/v1/chat/sessions`, and admin `GET`/`POST /auth/api-keys`
+  (+ `.../revoke`). Conversations are **stateless by default** — each call answers
+  from the current message only (persisted to a rolling session for audit, not
+  replayed); passing a `session_id` opts into replaying that session's history.
+  The WebSocket chat and the REST API now share one `run_session_turn` driver
+  (the agent loop is unchanged). Disabled instances 404 the whole surface. New
+  `Api Key` table (SQLite + Postgres); CI covers the API on both backends. i18n
+  en/de/fr. See [`docs/chat-api.md`](docs/chat-api.md).
+
+## [0.1.35] - 2026-07-01
+
+### Added
+- **"Set a password" for social-login-only accounts.** A user created via Google
+  (or Apple) has no password; Settings now shows a "Set a Password" card (no
+  "current password" field) so they can add an email+password fallback in case
+  they lose access to their provider. New `POST /auth/set-password` (authenticated;
+  refuses if a real password already exists — that's change-password — or for the
+  demo account). `/auth/me`, `/auth/login`, and `/auth/register` now return
+  `has_password`, and Settings shows "Set a Password" when it's false, otherwise
+  the usual "Change Password". i18n en/de/fr.
+
+## [0.1.34] - 2026-07-01
+
+### Changed
+- **No signup screen on invite-only instances.** When registration is closed
+  (not first-run and public signup off), the login page no longer shows the
+  "Register" link, which previously led to a dead-end signup form that failed on
+  submit. Invite-only instances now present sign-in only (password + any
+  configured social providers); invited users still register via their invite
+  link, which can be completed with a password or by continuing with Google /
+  Apple.
+
+## [0.1.33] - 2026-07-01
+
+### Fixed
+- **Social-login table crashed startup on PostgreSQL.** The new
+  `User OAuth Identity` table (0.1.32) had a column named `user`, which is a
+  reserved word in PostgreSQL — `CREATE TABLE` failed at boot on Postgres
+  deployments (SQLite accepts it, so it slipped through local testing). Renamed
+  the column to `user_name`. SQLite-only deployments were unaffected. Verified
+  against the PostgreSQL validation suite.
+
+## [0.1.32] - 2026-07-01
+
+### Added
+- **Social login with Google and Apple (`api/oauth.py`).** Users can sign in
+  with Google or Apple instead of an email + password. OAuth/OIDC is layered on
+  top of the existing password auth without changing what a session is: once a
+  provider proves identity, the same `lambda_erp_token` JWT cookie is minted, so
+  everything downstream is unchanged and password login keeps working. New
+  endpoints `GET /auth/{provider}/login` and `GET|POST /auth/{provider}/callback`
+  (Google and Apple), plus `GET /auth/oauth/providers` and
+  `GET /auth/oauth/identities`. No new dependency — httpx does OIDC discovery +
+  token exchange, python-jose validates the ID token against the provider JWKS
+  and signs Apple's ES256 client secret. Provider config is read from env; a
+  provider is simply disabled (its button hidden) when its vars are absent, so
+  local/dev needs no OAuth setup.
+- **Login page "Continue with Google / Apple" buttons** and a **Linked Accounts**
+  panel in Settings to link a provider to an existing account (the sanctioned
+  password → social switch, keeping the same user id and history). Invites can be
+  accepted via OAuth. New table `User OAuth Identity` (created at boot — no
+  migration; `hashed_password` stays NOT NULL, OAuth-only users carry a
+  non-matchable sentinel). i18n in en/de/fr. See `docs/social-login.md`.
+
+### Fixed
+- **Read-only Notes / Terms preserved line breaks.** After a quotation became
+  Open, the read-only display of the Notes / Terms field collapsed its line
+  breaks; textarea fields now render with `whitespace-pre-line`.
+
+## [0.1.31] - 2026-06-25
+
+### Added
+- **Horizontal rule in the Notes / Terms markup.** A line of 3+ dashes (`---`)
+  now renders as a full-width thin divider in the notes block. Like the rest of
+  the markup, the core emits a semantic `<div class="rm-hr">` and templates
+  style it (the default is a light grey; a branded template can match it to its
+  own separators). Documented in the chat system prompt and the formatting-help
+  tooltip (en/de/fr).
+
+## [0.1.30] - 2026-06-24
+
+### Fixed
+- **Link-field dropdown was clipped inside the line-items table.** The
+  search-as-you-type picker (item, customer, warehouse, account…) is now
+  rendered in a portal with fixed positioning, so it's no longer occluded by
+  the line-items table's horizontal-scroll container. It follows the input on
+  scroll/resize.
+
+### Changed
+- **Chat assistant now knows about quotation line `frequency` and the notes
+  pipe rule.** The system prompt documents the recurring-offer `frequency`
+  field (One-time/Monthly/Quarterly/Half-Yearly/Yearly) and when to use it
+  versus the cosmetic `>>` note, and spells out the `>> left | amount` markup
+  rule explicitly (the `|` pipe splits the frequency column from the amount
+  column; both are literal, not interpreted).
+
+## [0.1.29] - 2026-06-24
+
+### Added
+- **Billing frequency on quotation lines (recurring offers).** A quotation
+  line now carries a `frequency` — `One-time` (default) or a recurring cadence
+  (`Monthly`/`Quarterly`/`Half-Yearly`/`Yearly`, matching the Subscription
+  billing intervals). When an offer mixes one-time and recurring lines, the
+  headline totals (and tax rows) reflect the **one-time** part only, and each
+  recurring cadence is totalled separately with its own MWSt — so a recurring
+  line never inflates the one-time grand total. `generate_pdf()` exposes the
+  per-period breakdown as `recurring_summary` and a `show_frequency` flag for
+  templates. Quotations still post nothing to the ledger; this is presentation
+  + captured intent only. New `frequency` column on `Quotation Item` (migration
+  18) and a Frequency picker on quotation line items in the form.
+
+## [0.1.28] - 2026-06-24
+
+### Added
+- **Editable per-line description on document line items.** The line-item
+  table now has a Description column, so a quotation/order/invoice line can
+  carry its own blurb (like a Proposal position). It defaults from the Item
+  master on save — leaving it blank falls back to the master, so it never
+  wipes the default — and a typed value overrides it for that document only.
+  The backend already stored and defaulted this field; this exposes it in the
+  form.
+
+## [0.1.27] - 2026-06-24
+
+### Changed
+- **Notes / Terms field is now prominent in the document form.** On
+  quotations, sales orders, invoices, etc. the field moves onto its own
+  full-width row below the other fields and is taller (7 rows), with an info
+  icon beside the label that explains the supported markup (`# heading`,
+  `*italic*`/`**bold**`, and the right-aligned `>> Period | Amount` price line)
+  on hover or click. Translated for en/de/fr.
+
+## [0.1.26] - 2026-06-24
+
+### Added
+- **Lightweight markup for document Notes / Terms.** The `remarks` field on
+  quotations, sales orders, and invoices now renders on the PDF from a small
+  markup subset — `# Heading`, `*italic*`/`**bold**`, and a right-aligned
+  `>> Period | Amount` price line that sits beside the description above it —
+  so a closing block (recurring services, conditions, a sign-off) reads like a
+  real offer instead of flat text. `generate_pdf()` exposes the result as
+  `remarks_html` (safe, HTML-escaped); templates render it with `| safe` and
+  style the emitted classes (`.rm-block`, `.rm-h`, `.rm-p`, `.rm-amt`), so a
+  branded template can restyle the same markup. The chat assistant knows the
+  syntax and uses it when composing customer-facing notes. See
+  `api/remarks_md.py`.
+
+### Changed
+- **Chat assistant now discovers master fields instead of guessing.** The
+  `get_master_fields` tool and the system prompt steer the assistant to look up
+  a master's real columns before a `create_master`/`update_master` when it's
+  unsure where a value belongs, and the "fields ignored" warning points back to
+  it. Fixes cases like a customer's contact person being dropped (or a contact
+  phone misfiled into the company `phone`) because the model assumed there was
+  no field for it — `create_master` now spells out the contact-person mapping
+  with a worked example.
+
+## [0.1.25] - 2026-06-23
+
+### Fixed
+- **Master search was case-sensitive in production.** `search_masters` used a
+  bare `LIKE`, which SQLite treats case-insensitively but Postgres does not — so
+  a search that worked in dev returned nothing in prod unless the exact stored
+  casing was typed. Matching now lowercases both sides
+  (`lower(col) LIKE lower(?)`), identical on both backends.
+
+### Added
+- **Master search now covers all text columns and tolerates typos.** It searches
+  every text field (name, display name, and address fields like city/zip),
+  discovered from the live schema so new columns are searchable automatically,
+  and falls back to fuzzy matching for misspellings. Large free-text columns
+  (e.g. item `description`, templates) are skipped by default and searchable on
+  demand via the new optional `fields` argument, which also narrows a search to
+  specific columns.
+- **`get_master_fields` chat tool.** Lists a master type's real columns (and
+  which are searched by default), so the assistant targets existing fields
+  instead of guessing.
+
+## [0.1.24] - 2026-06-22
+
+### Added
+- **Discard a Proposal from the UI.** The Proposal builder now has a Discard
+  button (existing proposals only, with a confirm). It soft-deletes the proposal
+  (status `Discarded`, hidden from the list) via the standard discard path —
+  the custom builder page previously had no way to remove a proposal.
+
+## [0.1.23] - 2026-06-20
+
+### Fixed
+- **Chat assistant crashed on every message** in 0.1.22. The Proposal section
+  added to the system prompt contained a literal `{…}` JSON example, but the
+  prompt is an f-string, so the braces were parsed as format fields and
+  `build_system_prompt()` raised `ValueError: Invalid format specifier`. The
+  example is now brace-free prose. Also taught the assistant the German names
+  (Sammelofferte/Sammelofferten) so "zeig mir unsere Sammelofferten" maps to the
+  proposal doctype instead of asking which order type is meant.
+
+## [0.1.22] - 2026-06-20
+
+### Added
+- **Proposals in the chat assistant.** The LLM can now create, read, update, and
+  list Proposals (Sammelofferten) through the document tools — e.g. "combine
+  QTN-0001 and QTN-0003 into one offer for Plus Medica AG". The system prompt
+  documents the Proposal shape (the `quotations[]` child table referencing
+  existing quotations, not `items`) and that it is print-only.
+
+### Changed
+- A Proposal can no longer be submitted (it's print-only); an attempted submit
+  now raises a clear error instead of silently flipping docstatus.
+
+### Added
+- **Proposal (Sammelofferte).** A new print-only document that assembles several
+  *independent* quotations into one branded, customer-facing PDF — each rendered
+  as a lettered position (A, B, C…) with an optional "recommendation" badge, a
+  cover letter (pre-filled from a per-company template), and an optional uploaded
+  appendix PDF stapled on the end (`pypdf`). It has no financial behaviour and
+  never mutates the quotations it references; saving lets a user reopen and
+  duplicate it. New **Proposals** page under Quotation in the nav. New tables
+  `Proposal` / `Proposal Item` / `Proposal Appendix` (the appendix stored as a
+  blob so it survives restarts); `Company.proposal_cover_template` (migration 17).
+  Deployments override the look via a `proposal.html` template, same seam as
+  `document.html`.
+
+### Added
+- **Contact person (Ansprechperson) on Customer.** The Customer master gains
+  three optional fields — `contact_person` (a named contact at the customer),
+  `contact_email`, and `contact_phone` — kept separate from the company-level
+  email/phone. They appear in the master create/edit form (en/de/fr labels) and
+  are settable via the chat `create_master`/`update_master` tools. Additive
+  migration (16); existing customers keep the fields empty until edited.
+
+## [0.1.19] - 2026-06-17
+
+### Added
+- **Voice-to-text in chat.** A microphone button in the chat composer records a
+  spoken message, transcribes it with OpenAI `gpt-4o-transcribe`, and drops the
+  text into the input for review before sending (it does not auto-send). Click
+  to start, click to stop; a short accidental tap is ignored without an API
+  call. Transcription is biased with ERP domain vocabulary and guards against
+  silence/prompt-echo hallucinations. The spend is recorded to the Demo Spend
+  Log (per-minute STT pricing in `api.providers.cost_of_transcription`) and
+  demo visitors are rate-limited the same as LLM turns. New WebSocket message
+  `transcribe` → `transcription_result`.
+
+## [0.1.18] - 2026-06-05
+
+### Added
+- **Discard draft (void).** An unwanted *draft* can now be discarded instead of
+  the old "submit then cancel" dance — a soft delete that keeps the row for the
+  audit trail (no hard delete anywhere). `Document.discard()` sets
+  `discarded = 1` / status `'Discarded'` (drafts only; submitted docs must still
+  be cancelled), `submit()` refuses a discarded draft, and discarded documents
+  are hidden from default lists (`include_discarded` to show them, plus a "Show
+  discarded" toggle on the list and a `discarded` column on every submittable
+  doctype via migration `_m015`). Exposed end to end: `POST
+  /documents/{type}/{name}/discard`, the **Discard draft** button (drafts render
+  terminal/read-only once voided), and a `discard_document` **chat tool**.
+
+### Changed
+- **Document cancel now needs a deliberate two-step confirmation.** "Cancel"
+  (Stornieren) no longer fires immediately; it arms a confirmation whose
+  confirm button renders in a *different place* while the original spot becomes
+  a safe "Don't cancel" — so a double-click can't trigger an irreversible
+  posting reversal by accident.
+
+## [0.1.17] - 2026-06-05
+
+### Fixed
+- **Change Password form now works with password managers.** Added
+  `autocomplete="current-password"` / `new-password` (on both the new and
+  confirm fields, so managers fill the generated password into both), unique
+  `id`/`name` per field, and a hidden `username` anchor input
+  (`autocomplete="username"`, `display:none`) so 1Password et al. associate and
+  save the credential against the right account.
+
+### Changed
+- **Settings page reordering:** the Public Access (Demo Mode) card moved to the
+  very bottom (it's the most consequential toggle).
+- **Users page:** the pending-invite "Copy link" and "Revoke" actions are now
+  proper buttons (shared `Button` component — secondary / danger) instead of
+  text links, matching "Create Invite".
+
+## [0.1.16] - 2026-06-05
+
+### Added
+- **Change password.** Signed-in users can change their own password from
+  General Settings (a card reachable by every role). New endpoint
+  `POST /auth/change-password` verifies the current password, requires the new
+  one to be at least 6 characters, and rejects the shared `public_manager` demo
+  account. Wrong current → 403, too short → 422.
+
+## [0.1.15] - 2026-06-05
+
+### Fixed
+- **Sidebar logo broken in consumer deployments.** `.lambda-logo-icon` masked
+  its gradient with `url('/logo_lad_erp.png')` — an absolute path to an asset
+  that was only in the core's own `public/` and not shipped in the npm package,
+  so every downstream deployment got a broken (empty) logo. The mark now lives
+  at `src/logo_lad_erp.png`, is referenced relatively (`url('./logo_lad_erp.png')`)
+  so each consumer's bundler emits and rewrites it, and is included in the
+  package `files`. Frontend only; backend bumps for version lockstep.
+
+## [0.1.14] - 2026-06-04
+
+### Added
+- **Opt-in public signup.** A new admin setting `allow_public_signup` (default
+  off) under General Settings. When enabled, anyone may self-register — as a
+  **viewer** only. The first user still bootstraps as admin, and with the toggle
+  off registration stays invite-only. `setup-status` now returns `first_run`,
+  `public_signup`, and `registration_open` so the signup page can distinguish
+  first-run admin creation from open viewer signup.
+- **Invite management** on the Users page: copy a pending invite's link again,
+  and revoke a pending invite via `DELETE /auth/invites/{token}` (admin-only;
+  404 if unknown, 409 if already used).
+
+### Fixed
+- **Token Spend (formerly "Demo Spend") crashed on Postgres.** A double-quoted
+  SQL string literal (`role = "public_manager"`) was read as an identifier by
+  Postgres, 500-ing the `/admin/demo-spend` endpoint. Now single-quoted. The
+  card is relabeled **Token Spend**, stays admin-only, and on non-demo
+  deployments leads with total LLM spend (cap details show only in demo mode).
+- The double-quoted-literal CI guard now also scans continuation lines of
+  multi-line SQL (`CASE/WHEN/THEN`, aggregates), which previously slipped past.
+
+## [0.1.13] - 2026-06-04
+
+### Added
+- **`register_pdf_context(fn)`** seam (`api.pdf`): a deployment plugin can
+  register a provider `fn(doctype, name, context)` that returns extra keys
+  merged into the PDF render context just before rendering — e.g. a computed
+  Swiss QR-bill image for invoices. Providers run after the built-in context is
+  assembled; an exception in one is swallowed so it can't break PDF generation.
+- **`Company.iban`** field (schema + migration `_m014_company_iban`) and an
+  IBAN input on the company master form. A generic bank-account field for
+  payment instructions; consumed by deployments that render payment slips
+  (e.g. the Swiss QR-bill in the example/internal plugins). The company info
+  passed to PDF templates now includes `iban`.
+
+## [0.1.12] - 2026-06-04
+
+### Added
+- PDF templates can reference **sibling assets** (logo, fonts, CSS) by relative
+  path: `generate_pdf` now sets WeasyPrint's `base_url` to the rendered
+  template's own directory. A `register_pdf_template_dir` override can drop a
+  `document.html` next to its `logo.png` and use `<img src="logo.png">`.
+
+## [0.1.11] - 2026-06-04
+
+### Added
+- **PDF template override seam** (`register_pdf_template_dir(path)` in
+  `api/pdf.py`). A deployment plugin can register a directory whose templates
+  (e.g. `document.html`) override the built-in invoice/document PDF layout —
+  registered dirs are searched before the core's. The custom template gets the
+  same render context generate_pdf() builds (doc, company_info, party_info,
+  items, taxes, currency, page_size, ...), so it just restyles the same data.
+  No behaviour change when nothing is registered.
+
+### Fixed
+- **New customers/suppliers now inherit the company's base currency instead of
+  defaulting to USD.** The Customer/Supplier `default_currency` column defaults
+  to `'USD'`, so for a non-USD company (e.g. CHF) a customer created without an
+  explicit currency was stored as USD — which then forced its sales/purchase
+  documents to USD and failed to save without a USD->base exchange rate.
+  `create_master_record` now fills `default_currency` from the company when none
+  is given (explicit values still win). Also exposed the **Currency** field on
+  the Customer and Supplier master forms (previously only settable via the
+  API/chat, so it was invisible in the UI).
+
+## [0.1.10] - 2026-06-04
+
+### Changed
+- **Company Setup no longer invents a fake address for real companies.** The
+  `/setup/company` endpoint used to fill any missing contact field with a
+  deterministic pseudo-random US address (so demo PDFs looked complete) — which
+  meant every real company got a bogus address printed on its invoices. Now the
+  Company Setup form collects address / city / ZIP / country / tax-id / email /
+  phone (optional), and the backend only auto-fills when the caller opts in
+  (`autofill_address`), which the public demo seeding does. Real setups keep
+  unprovided fields blank. Backend + frontend; ships at 0.1.10.
+
+## [0.1.9] - 2026-06-04
+
+### Fixed
+- **Sidebar highlighted two nav rows at once.** A NavLink to a path that is a
+  prefix of a sibling's (`/setup` "Company Setup" vs `/setup/opening-balances`
+  "Opening Balances") matched as active on the longer path's page, so both rows
+  showed the active grey background on the Opening Balances page. Items whose
+  path is nested under a sibling now use exact (`end`) matching. Backend
+  unchanged; ships at 0.1.9 for lockstep.
+
+## [0.1.8] - 2026-06-04
+
+### Added
+- **Company Setup: "Create empty company, no demo data" option.** The setup
+  page now offers a third seed mode alongside "Quick demo" and "Simulate 3 years
+  of history" that creates only the company (and its chart of accounts) and
+  seeds nothing — for real deployments starting from scratch. Frontend only;
+  the backend already exposed company creation and seeding as separate calls.
+
+### Changed
+- **Company Setup nav link hides once setup is complete.** The sidebar drops the
+  "Company Setup" (`/setup`) item once a company exists (`setup_complete`), since
+  it's a one-time step. Getting Started and Opening Balances are unaffected.
+
+## [0.1.7] - 2026-06-03
+
+### Fixed
+- **`db.sql()` raised on Postgres for write statements.** It always called
+  `fetchall()`; after an `INSERT`/`UPDATE`/`DELETE` psycopg raises "the last
+  operation didn't produce records" (SQLite harmlessly returns `[]`). This broke
+  the chat/WebSocket path — which runs `UPDATE`/`DELETE` through `db.sql()` —
+  causing constant disconnect/reconnect loops, and affected other `db.sql()`
+  write call sites (settings, attachments, invites, report drafts). `db.sql()`
+  now fetches only when the statement produced a result set
+  (`cursor.description is not None`). `test_db_portability` extended to assert
+  write-via-`db.sql()` returns `[]` on both backends. Frontend unchanged; ships
+  at 0.1.7 for lockstep.
+
+## [0.1.6] - 2026-06-03
+
+### Fixed
+- **Double-quoted string literals in SQL broke on Postgres.** Several queries
+  used `WHERE x = "value"` / `IN ("a","b")` — SQLite quietly reads an unknown
+  double-quoted token as a string literal, but Postgres treats `"..."` as an
+  identifier and errors (`column "value" does not exist`). This 500'd the auth
+  (`get_current_user`, register/admin checks), chat-history, PDF, and master
+  delete-guard paths on Postgres. All converted to single-quoted values.
+- **A failed query no longer poisons the Postgres connection.** With
+  `autocommit=False`, one failing statement left the (thread-local) connection
+  in an aborted transaction, so every later request reusing it failed with
+  `InFailedSqlTransaction`. The connection wrapper now rolls back on error
+  before re-raising.
+
+### Added
+- `tests/test_db_portability.py`: a static scan that fails on double-quoted SQL
+  literals, plus a functional auth smoke test (`setup-status`/register/login +
+  an unauthenticated protected request) run against both backends. Wired into
+  CI. Frontend unchanged; ships at 0.1.6 for lockstep.
+
+## [0.1.5] - 2026-06-03
+
+### Added
+- **Optional PostgreSQL backend.** The data layer (`lambda_erp/database.py`) now
+  supports Postgres in addition to SQLite. SQLite stays the default (and is what
+  the test suite and local dev use); select Postgres at runtime by setting
+  `LAMBDA_ERP_DB` to a `postgresql://…` URL. Install the driver with the new
+  extra: `pip install lambda-erp[postgres]`. This unblocks deployments whose
+  durable storage can't host a SQLite file with working file locks (e.g. Azure
+  Files SMB volumes), where `PRAGMA journal_mode=WAL` and even ordinary writes
+  fail with "database is locked".
+- CI now runs the full validation suite against a real Postgres (service
+  container) on every push, alongside SQLite, so the accounting/stock invariants
+  are verified on the production backend.
+
+### Changed
+- A handful of queries were made dialect-portable (no behaviour change on
+  SQLite): `IFNULL`→`COALESCE`, `strftime` date bucketing → `substr`, and
+  `get_value`/`get_all` now select only columns that exist (padding the rest as
+  `NULL`) instead of relying on SQLite returning unknown quoted identifiers as
+  string literals. Frontend (`@lambda-development/erp-core`) is unchanged; it
+  ships at 0.1.5 to keep the two packages in lockstep.
+
+## [0.1.4] - 2026-06-03
+
+### Added
+- **`LAMBDA_ERP_SQLITE_JOURNAL_MODE`** env var (default `WAL`) to choose the
+  SQLite journal mode. WAL relies on a memory-mapped `-shm` file and therefore
+  cannot be used when the database lives on a **network filesystem** (SMB/NFS
+  Azure Files, NFS shares): `PRAGMA journal_mode=WAL` fails outright with
+  "database is locked" at startup. A deployment that persists its DB on such a
+  share now sets `LAMBDA_ERP_SQLITE_JOURNAL_MODE=DELETE` (rollback-journal mode,
+  which uses only byte-range locks the share supports). Single-replica /
+  single-worker deployments lose nothing by using DELETE. Frontend unchanged;
+  ships at 0.1.4 to keep the two packages in lockstep.
+
+## [0.1.3] - 2026-06-03
+
+### Fixed
+- **`@lambda-development/erp-core` could not be production-built by a consumer.**
+  The analytics report worker was referenced with a bare
+  `new Worker(new URL("…", import.meta.url))`, so the library build emitted an
+  **absolute** `/assets/report-runtime.worker-*.js` URL. A downstream app
+  bundling the package resolved that leading-slash path against its own
+  `public/` dir and failed with "Could not resolve entry module". The worker is
+  now imported with `?worker&inline`, embedding it as a blob in `dist/index.js`
+  — no external asset for consumers to resolve. Backend (`lambda-erp`) is
+  unchanged; it ships at 0.1.3 only to keep the two packages in lockstep.
+
+## [0.1.2] - 2026-05-26
+
+### Fixed
+- npm publish failed provenance verification on 0.1.1 because
+  `frontend/package.json` declared no `repository` field. Added it (plus
+  `description`, `license`, `homepage`, `bugs`). No functional changes since
+  0.1.1. Net effect on versions: **npm** goes 0.1.0 → 0.1.2 (npm 0.1.1 never
+  shipped); **PyPI** published 0.1.1 normally, so PyPI includes 0.1.1 and npm
+  does not. Both registries are aligned again at 0.1.2.
+
+## [0.1.1] - 2026-05-26
+
+First public release of `lambda-erp` to PyPI via the keyless CI pipeline. (npm
+0.1.1 failed provenance verification and shipped as 0.1.2 instead — see above.)
+Same code as the 0.1.0 npm bootstrap noted below.
+
+### Added
+- **Core ERP engine** (backend) — document lifecycle (quotation → sales order →
+  delivery note / sales invoice → payment, plus the buying side), double-entry
+  GL posting, a stock ledger with moving-average valuation, and tax calculation.
+- **Multi-currency** (backend + frontend) — per-document transaction currency
+  with a historical exchange-rate snapshot on each document, realized FX
+  gain/loss on settlement, period-end revaluation of open foreign balances, and
+  presentation-currency translation of financial statements. New sales/purchase
+  documents default their currency from the party (or company) and expose a
+  currency picker in the UI.
+- **Stock-movement analytics** — a `stock_movements` semantic dataset over the
+  stock ledger, queryable from the chat assistant (e.g. "what item moves the
+  most").
+- **Internationalization** — the full UI in English, German, and French with a
+  language switcher; the choice is persisted per browser.
+- **Open-core packaging** — the backend ships as `lambda-erp` on PyPI; the
+  frontend ships as `@lambda-development/erp-core` on npm with additive override
+  seams (`registerDoctype`, `registerRoute`, the nav and component registries,
+  `configureBranding`, `configureApiBase`) and a `bootstrap()` entry, so a
+  customer deployment depends on the packages instead of forking the repo.
+
+## [0.1.0] - 2026-05-26
+
+Internal npm bootstrap that created `@lambda-development/erp-core` on the
+registry — required before OIDC trusted publishing can be enabled for a new npm
+package. No PyPI release and no functional changes; superseded by 0.1.1.
+
+[Unreleased]: https://github.com/lambdadevelopment/lambda-erp/compare/v1.1.8...HEAD
+[1.1.8]: https://github.com/lambdadevelopment/lambda-erp/compare/v1.1.7...v1.1.8
+[1.1.7]: https://github.com/lambdadevelopment/lambda-erp/compare/v1.1.6...v1.1.7
+[1.1.6]: https://github.com/lambdadevelopment/lambda-erp/compare/v1.1.5...v1.1.6
+[1.1.5]: https://github.com/lambdadevelopment/lambda-erp/compare/v1.1.4...v1.1.5
+[1.1.4]: https://github.com/lambdadevelopment/lambda-erp/compare/v1.1.3...v1.1.4
+[1.1.3]: https://github.com/lambdadevelopment/lambda-erp/compare/v1.1.2...v1.1.3
+[1.1.2]: https://github.com/lambdadevelopment/lambda-erp/compare/v1.1.1...v1.1.2
+[1.0.0]: https://github.com/lambdadevelopment/lambda-erp/compare/v0.8.34...v1.0.0
+[0.8.34]: https://github.com/lambdadevelopment/lambda-erp/compare/v0.8.33...v0.8.34
+[0.8.28]: https://github.com/lambdadevelopment/lambda-erp/compare/v0.8.27...v0.8.28
+[0.8.27]: https://github.com/lambdadevelopment/lambda-erp/compare/v0.8.26...v0.8.27
+[0.8.21]: https://github.com/lambdadevelopment/lambda-erp/compare/v0.8.20...v0.8.21
+[0.8.20]: https://github.com/lambdadevelopment/lambda-erp/compare/v0.8.19...v0.8.20
+[0.8.19]: https://github.com/lambdadevelopment/lambda-erp/compare/v0.8.18...v0.8.19
+[0.8.17]: https://github.com/lambdadevelopment/lambda-erp/compare/v0.8.16...v0.8.17
+[0.6.4]: https://github.com/lambdadevelopment/lambda-erp/compare/v0.6.3...v0.6.4
+[0.6.3]: https://github.com/lambdadevelopment/lambda-erp/compare/v0.6.2...v0.6.3
+[0.6.2]: https://github.com/lambdadevelopment/lambda-erp/compare/v0.6.1...v0.6.2
+[0.6.1]: https://github.com/lambdadevelopment/lambda-erp/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/lambdadevelopment/lambda-erp/compare/v0.5.0...v0.6.0
+[0.1.12]: https://github.com/lambdadevelopment/lambda-erp/compare/v0.1.11...v0.1.12
+[0.1.11]: https://github.com/lambdadevelopment/lambda-erp/compare/v0.1.10...v0.1.11
+[0.1.10]: https://github.com/lambdadevelopment/lambda-erp/compare/v0.1.9...v0.1.10
+[0.1.9]: https://github.com/lambdadevelopment/lambda-erp/compare/v0.1.8...v0.1.9
+[0.1.8]: https://github.com/lambdadevelopment/lambda-erp/compare/v0.1.7...v0.1.8
+[0.1.7]: https://github.com/lambdadevelopment/lambda-erp/compare/v0.1.6...v0.1.7
+[0.1.6]: https://github.com/lambdadevelopment/lambda-erp/compare/v0.1.5...v0.1.6
+[0.1.5]: https://github.com/lambdadevelopment/lambda-erp/compare/v0.1.4...v0.1.5
+[0.1.4]: https://github.com/lambdadevelopment/lambda-erp/compare/v0.1.3...v0.1.4
+[0.1.3]: https://github.com/lambdadevelopment/lambda-erp/compare/v0.1.2...v0.1.3
+[0.1.2]: https://github.com/lambdadevelopment/lambda-erp/releases/tag/v0.1.2
+[0.1.1]: https://github.com/lambdadevelopment/lambda-erp/releases/tag/v0.1.1
+[0.1.0]: https://www.npmjs.com/package/@lambda-development/erp-core/v/0.1.0
+
+[1.0.1]: https://github.com/lambdadevelopment/lambda-erp/compare/v1.0.0...v1.0.1
+[1.0.2]: https://github.com/lambdadevelopment/lambda-erp/compare/v1.0.1...v1.0.2

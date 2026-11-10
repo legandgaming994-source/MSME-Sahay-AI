@@ -1,0 +1,1048 @@
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { createPortal } from "react-dom";
+import { Link, useParams, useNavigate } from "react-router-dom";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { api } from "@/api/client";
+import { getDoctypeConfig, type FieldDef, type ChildTableDef } from "@/lib/doctypes";
+import { usePageTitle } from "@/lib/use-page-title";
+import { PdfButton } from "@/components/document/pdf-button";
+import { StatusBadge } from "@/components/document/status-badge";
+import { DocPager } from "@/components/document/doc-pager";
+import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Select } from "@/components/ui/select";
+import { formatCurrency, formatLocalDate, flt } from "@/lib/utils";
+import { HintTooltip } from "@/components/ui/hint-tooltip";
+import { NotesMarkupHelp } from "@/components/ui/notes-markup-help";
+import { useCurrencies } from "@/hooks/use-currencies";
+import { useBaseCurrency } from "@/hooks/use-base-currency";
+import { useTranslation } from "react-i18next";
+
+// ---------------------------------------------------------------------------
+// Link resolution — where does clicking "customer" / "account" / etc. lead?
+// ---------------------------------------------------------------------------
+
+// Link doctypes that have a real MasterForm page. Anything else falls through
+// to a special route (Account → GL report) or renders as plain text.
+const LINKABLE_MASTERS = new Set([
+  "customer",
+  "supplier",
+  "item",
+  "warehouse",
+]);
+
+export function linkRefHref(linkDoctype: string | undefined | null, value: string): string | null {
+  if (!linkDoctype || !value) return null;
+  if (LINKABLE_MASTERS.has(linkDoctype)) {
+    return `/masters/${linkDoctype}/${encodeURIComponent(value)}`;
+  }
+  if (linkDoctype === "price-list") return `/app/price-list/${encodeURIComponent(value)}`;
+  if (linkDoctype === "account") {
+    // No standalone Account page — deep-link into the GL report pre-filtered
+    // to this account, which is what users actually want to see.
+    return `/reports/general-ledger?account=${encodeURIComponent(value)}`;
+  }
+  // cost_center / company / anything else: no destination yet.
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// FieldLabel -- label with optional hint tooltip
+// ---------------------------------------------------------------------------
+
+function FieldLabel({ label, hint, extra }: { label: string; hint?: string; extra?: React.ReactNode }) {
+  return (
+    <label className="mb-1.5 block text-sm font-medium text-fg">
+      {label}
+      {hint && <HintTooltip text={hint} />}
+      {extra}
+    </label>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// LinkField -- simple search-as-you-type select for master data
+// ---------------------------------------------------------------------------
+
+function LinkField({
+  field,
+  value,
+  onChange,
+  disabled,
+  hideLabel,
+}: {
+  field: FieldDef;
+  value: string;
+  onChange: (v: string) => void;
+  disabled?: boolean;
+  hideLabel?: boolean;
+}) {
+  const [query, setQuery] = useState(value ?? "");
+  const [open, setOpen] = useState(false);
+  // The dropdown is portaled to <body> so it isn't clipped by the line-items
+  // table's overflow-x-auto scroll container; we track the input's viewport
+  // rect to position it (and follow it on scroll/resize).
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const [menuRect, setMenuRect] = useState<{ top: number; left: number; width: number } | null>(null);
+
+  const { data: options } = useQuery({
+    queryKey: ["link-search", field.linkDoctype, query],
+    queryFn: () => api.searchLink(field.linkDoctype!, query),
+    enabled: !!field.linkDoctype && open,
+  });
+
+  useEffect(() => {
+    setQuery(value ?? "");
+  }, [value]);
+
+  useEffect(() => {
+    if (!open) return;
+    const update = () => {
+      const el = wrapRef.current;
+      if (el) {
+        const r = el.getBoundingClientRect();
+        setMenuRect({ top: r.bottom, left: r.left, width: r.width });
+      }
+    };
+    update();
+    // capture=true so scrolling any ancestor (the table's scroller) repositions it.
+    window.addEventListener("scroll", update, true);
+    window.addEventListener("resize", update);
+    return () => {
+      window.removeEventListener("scroll", update, true);
+      window.removeEventListener("resize", update);
+    };
+  }, [open]);
+
+  if (disabled) {
+    return (
+      <div>
+        {!hideLabel && <label className="mb-1.5 block text-sm font-medium text-fg">{field.label}</label>}
+        <p className="py-2 text-sm text-fg">{value || "-"}</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="relative" ref={wrapRef}>
+      <Input
+        label={hideLabel ? undefined : field.label}
+        value={query}
+        onChange={(e) => {
+          setQuery(e.target.value);
+          setOpen(true);
+        }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setTimeout(() => setOpen(false), 200)}
+      />
+      {open && options && options.length > 0 && menuRect && createPortal(
+        <ul
+          className="fixed z-50 mt-1 max-h-40 overflow-auto rounded-lg bg-surface ring-1 ring-line shadow-card-hover"
+          style={{ top: menuRect.top, left: menuRect.left, width: menuRect.width }}
+        >
+          {options.map((opt: any) => (
+            <li
+              key={opt.name}
+              className="cursor-pointer px-3 py-2 text-sm text-fg transition-colors hover:bg-surface-subtle"
+              onMouseDown={() => {
+                onChange(opt.name);
+                setQuery(opt.name);
+                setOpen(false);
+              }}
+            >
+              {opt.name}
+            </li>
+          ))}
+        </ul>,
+        document.body,
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// FieldRenderer
+// ---------------------------------------------------------------------------
+
+function FieldRenderer({
+  field,
+  value,
+  onChange,
+  readOnly,
+  rowData,
+  hideLabel,
+  currency = "USD",
+  doctype,
+}: {
+  field: FieldDef;
+  value: any;
+  onChange: (v: any) => void;
+  readOnly: boolean;
+  rowData?: Record<string, any>;
+  /** Doctype slug — scopes hint translation keys (hints.<slug>.<field>). */
+  doctype?: string;
+  /** Suppress the in-cell field label. Used by ChildTableEditor where the
+   *  table column header already shows the label — repeating it inside
+   *  every row makes mobile cells taller and wider than they need to be. */
+  hideLabel?: boolean;
+  /** The document's currency, so amounts render with the right symbol
+   *  (€/£/¥…) instead of always $. */
+  currency?: string;
+}) {
+  const { t } = useTranslation();
+  const isDisabled = readOnly || !!field.readOnly;
+  const Label = () =>
+    hideLabel ? null : (
+      <FieldLabel
+        label={t(`fields.${field.label}`, { defaultValue: field.label })}
+        hint={field.hint ? t(`hints.${doctype ?? "_"}.${field.name}`, { defaultValue: field.hint }) : undefined}
+      />
+    );
+
+  // Currency pickers get their options from the available-currencies endpoint
+  // rather than a static list. The fetch is skipped for every other field.
+  const needsCurrencyOptions =
+    field.type === "select" && field.optionsSource === "currency";
+  const currencyOptions = useCurrencies(undefined, needsCurrencyOptions);
+
+  if (isDisabled) {
+    // Link fields render as a clickable link in read-only mode when there's a
+    // real destination. Matches the sky-600 treatment in document lists.
+    if (field.type === "link" && value) {
+      const resolvedLinkDoctype =
+        field.linkDoctypeField && rowData
+          ? String(rowData[field.linkDoctypeField] ?? "")
+              .toLowerCase()
+              .replace(/\s+/g, "-")
+          : field.linkDoctype;
+      const href = linkRefHref(resolvedLinkDoctype, String(value));
+      if (href) {
+        return (
+          <div>
+            <Label />
+            <p className={hideLabel ? "text-sm" : "py-2 text-sm"}>
+              <Link
+                to={href}
+                className="text-sky-600 hover:text-sky-800 hover:underline"
+              >
+                {value}
+              </Link>
+            </p>
+          </div>
+        );
+      }
+    }
+
+    let display = value ?? "-";
+    if ((field.type === "currency") && typeof value === "number") {
+      display = formatCurrency(value, currency);
+    }
+    if (field.type === "datetime" && typeof value === "string" && value) {
+      display = value.slice(0, 16); // "YYYY-MM-DD HH:MM" (drop seconds)
+    }
+    // Multi-line fields (Notes / Terms) keep their line breaks when shown
+    // read-only, instead of collapsing to one paragraph like a <p> does.
+    const pClass = [
+      hideLabel ? "text-sm text-fg" : "py-2 text-sm text-fg",
+      field.type === "textarea" ? "whitespace-pre-line" : "",
+    ].join(" ").trim();
+    return (
+      <div>
+        <Label />
+        <p className={pClass}>{display}</p>
+      </div>
+    );
+  }
+
+  if (field.type === "link") {
+    const resolvedField = field.linkDoctypeField && rowData
+      ? { ...field, linkDoctype: rowData[field.linkDoctypeField]?.toLowerCase().replace(/\s+/g, "-") }
+      : field;
+    return (
+      <div>
+        <Label />
+        <LinkField
+          field={resolvedField}
+          value={value ?? ""}
+          onChange={onChange}
+          disabled={isDisabled}
+          hideLabel
+        />
+      </div>
+    );
+  }
+
+  if (field.type === "select" && (field.options || needsCurrencyOptions)) {
+    // Keep the doc's own currency selectable even if it's not in the fetched
+    // list (e.g. an older currency no longer on any rate/default).
+    const options = needsCurrencyOptions
+      ? value && !currencyOptions.includes(value)
+        ? [value, ...currencyOptions]
+        : currencyOptions
+      : // Translate the visible label but keep the stored value (e.g. status
+        // "Available" -> "Verfügbar"): t(`fieldOptions.<value>`), English fallback.
+        field.options!.map((o) => {
+          const val = typeof o === "string" ? o : o.value;
+          const lbl = typeof o === "string" ? o : o.label;
+          return { value: val, label: t(`fieldOptions.${val}`, { defaultValue: lbl }) };
+        });
+    return (
+      <div>
+        <Label />
+        <Select
+          options={options}
+          value={value ?? ""}
+          onChange={(e) => onChange(e.target.value)}
+        />
+      </div>
+    );
+  }
+
+  if (field.type === "textarea") {
+    // The `remarks` field is rendered from a light markup on the PDF, so it
+    // gets the formatting-help icon. Parent textareas (not child-table cells)
+    // are roomier since they sit on their own full-width row.
+    const showMarkupHelp = field.name === "remarks";
+    return (
+      <div>
+        {!hideLabel && (
+          <FieldLabel
+            label={t(`fields.${field.label}`, { defaultValue: field.label })}
+            hint={field.hint}
+            extra={showMarkupHelp ? <NotesMarkupHelp /> : undefined}
+          />
+        )}
+        <textarea
+          className="block w-full rounded-lg bg-surface px-3 py-2 text-sm text-fg ring-1 ring-line transition-all placeholder:text-fg-muted/70 focus:outline-none focus:ring-2 focus:ring-brand/30"
+          rows={hideLabel ? 3 : 7}
+          value={value ?? ""}
+          onChange={(e) => onChange(e.target.value)}
+        />
+      </div>
+    );
+  }
+
+  const inputType =
+    field.type === "number" || field.type === "currency"
+      ? "number"
+      : field.type === "date"
+        ? "date"
+        : field.type === "datetime"
+          ? "datetime-local"
+          : "text";
+
+  // <input type="datetime-local"> wants "YYYY-MM-DDTHH:MM"; we store/normalise
+  // as "YYYY-MM-DD HH:MM:SS". Convert on the way in (here) and out (onChange).
+  const inputValue =
+    field.type === "datetime" && typeof value === "string" && value
+      ? value.replace(" ", "T").slice(0, 16)
+      : (value ?? "");
+
+  return (
+    <div>
+      <Label />
+      <Input
+        type={inputType}
+        step={field.type === "currency" ? "0.01" : undefined}
+        value={inputValue}
+        onChange={(e) => {
+          const v = e.target.value;
+          onChange(
+            inputType === "number"
+              ? (v === "" && field.default === null ? null : parseFloat(v) || 0)
+              : field.type === "datetime"
+                ? v.replace("T", " ") // -> "YYYY-MM-DD HH:MM"; backend adds seconds
+                : v,
+          );
+        }}
+      />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// ChildTableEditor
+// ---------------------------------------------------------------------------
+
+function ChildTableEditor({
+  tableDef,
+  rows,
+  onChange,
+  readOnly,
+  currency = "USD",
+}: {
+  tableDef: ChildTableDef;
+  rows: any[];
+  onChange: (rows: any[]) => void;
+  readOnly: boolean;
+  currency?: string;
+}) {
+  const { t } = useTranslation();
+  const updateRow = (idx: number, fieldName: string, value: any) => {
+    const updated = rows.map((row, i) =>
+      i === idx ? { ...row, [fieldName]: value } : row,
+    );
+    onChange(updated);
+  };
+
+  const addRow = () => {
+    const blank: any = {};
+    tableDef.fields.forEach((f) => {
+      blank[f.name] = f.default !== undefined ? f.default : (f.type === "number" || f.type === "currency" ? 0 : "");
+    });
+    onChange([...rows, blank]);
+  };
+
+  const removeRow = (idx: number) => {
+    onChange(rows.filter((_, i) => i !== idx));
+  };
+
+  return (
+    <Card title={t(`tables.${tableDef.key}`, { defaultValue: tableDef.label })}>
+      <div className="-mx-6 overflow-x-auto px-6">
+        <table className="min-w-full divide-y divide-line text-sm">
+          <thead>
+            <tr>
+              <th className="px-2 py-2 text-left text-xs font-medium uppercase tracking-wide text-fg-muted">
+                #
+              </th>
+              {tableDef.fields.map((f) => (
+                <th
+                  key={f.name}
+                  className="px-2 py-2 text-left text-xs font-medium uppercase tracking-wide text-fg-muted"
+                >
+                  {t(`fields.${f.label}`, { defaultValue: f.label })}
+                </th>
+              ))}
+              {!readOnly && (
+                <th className="px-2 py-2 text-left text-xs font-medium uppercase tracking-wide text-fg-muted" />
+              )}
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-line">
+            {rows.map((row, idx) => (
+              <tr key={idx}>
+                <td className="px-2 py-1 text-fg-muted">{idx + 1}</td>
+                {tableDef.fields.map((f) => (
+                  <td key={f.name} className="px-2 py-1 align-top">
+                    <FieldRenderer
+                      field={f}
+                      value={row[f.name]}
+                      onChange={(v) => updateRow(idx, f.name, v)}
+                      readOnly={readOnly}
+                      rowData={row}
+                      hideLabel
+                      currency={currency}
+                    />
+                  </td>
+                ))}
+                {!readOnly && (
+                  <td className="px-2 py-1">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => removeRow(idx)}
+                    >
+                      Remove
+                    </Button>
+                  </td>
+                )}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {!readOnly && (
+        <div className="mt-2">
+          <Button variant="secondary" size="sm" onClick={addRow}>
+            {t("common.addRow")}
+          </Button>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// DocumentActions
+// ---------------------------------------------------------------------------
+
+function DocumentActions({
+  isNew,
+  doctype,
+  name,
+  docstatus,
+  discarded,
+  saving,
+  config,
+  onSave,
+  onSubmit,
+  onCancel,
+  onConvert,
+  onDiscard,
+  onSoftCancel,
+  softCancelDone,
+  draftReadOnly,
+}: {
+  isNew: boolean;
+  doctype?: string;
+  name?: string;
+  docstatus: number;
+  discarded?: boolean;
+  saving: boolean;
+  config: ReturnType<typeof getDoctypeConfig>;
+  onSave: () => void;
+  onSubmit: () => void;
+  onCancel: () => void;
+  onConvert: (targetDoctype: string) => void;
+  onDiscard: () => void;
+  onSoftCancel: () => void;
+  softCancelDone?: boolean;
+  /** Hide draft mutation actions for externally sourced immutable records. */
+  draftReadOnly?: boolean;
+}) {
+  const { t } = useTranslation();
+  // Two-step cancel: clicking "Cancel" doesn't cancel — it arms confirmation.
+  // The confirm button then renders in a DIFFERENT place (pushed right) while
+  // the original spot becomes a safe "Don't cancel", so a double-click can't
+  // accidentally go through with this irreversible action.
+  const [confirmingCancel, setConfirmingCancel] = useState(false);
+  // Discard (drafts only) is a soft delete — reversible at the DB level — so a
+  // lighter inline two-step arm is enough.
+  const [confirmingDiscard, setConfirmingDiscard] = useState(false);
+  const [confirmingSoftCancel, setConfirmingSoftCancel] = useState(false);
+  if (!config) return null;
+
+  const showCancel = !isNew && config.canCancel && docstatus === 1;
+
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      {!isNew && doctype && name && <PdfButton doctype={doctype} name={name} />}
+      {docstatus < 1 && !discarded && !draftReadOnly && (
+        <Button onClick={onSave} disabled={saving}>
+          {saving ? t("common.saving") : t("common.save")}
+        </Button>
+      )}
+      {!isNew && config.canSubmit && docstatus === 0 && !discarded && (
+        <Button variant="secondary" onClick={onSubmit}>
+          {t("common.submit")}
+        </Button>
+      )}
+      {/* Discard draft (soft delete) — only on an unsubmitted, saved draft. */}
+      {!isNew && config.canSubmit && docstatus === 0 && !discarded && (
+        confirmingDiscard ? (
+          <>
+            <Button variant="secondary" onClick={() => setConfirmingDiscard(false)}>
+              {t("common.keepDraft")}
+            </Button>
+            <Button
+              variant="danger"
+              onClick={() => {
+                setConfirmingDiscard(false);
+                onDiscard();
+              }}
+            >
+              {t("common.discardDraftConfirm")}
+            </Button>
+          </>
+        ) : (
+          <Button variant="ghost" onClick={() => setConfirmingDiscard(true)}>
+            {t("common.discardDraft")}
+          </Button>
+        )
+      )}
+      {/* Soft-cancel (e.g. a Reservation -> "Cancelled"): a plain field update,
+          NOT a document cancel — the ERP has no hard delete. Reversible (the
+          status can be set back), so a light inline two-step is enough. */}
+      {config.softCancel && !isNew && !discarded && !softCancelDone && (
+        confirmingSoftCancel ? (
+          <>
+            <Button variant="secondary" onClick={() => setConfirmingSoftCancel(false)}>
+              {t("common.keepBooking")}
+            </Button>
+            <Button
+              variant="danger"
+              onClick={() => {
+                setConfirmingSoftCancel(false);
+                onSoftCancel();
+              }}
+            >
+              {t("common.cancelBookingConfirm")}
+            </Button>
+          </>
+        ) : (
+          <Button variant="ghost" onClick={() => setConfirmingSoftCancel(true)}>
+            {t("common.cancelBooking")}
+          </Button>
+        )
+      )}
+      {/* Original Cancel button position. In confirm mode it becomes the safe
+          "Don't cancel" so a stray repeat click here aborts rather than fires. */}
+      {showCancel && (
+        confirmingCancel ? (
+          <Button variant="secondary" onClick={() => setConfirmingCancel(false)}>
+            {t("common.cancelDocAbort")}
+          </Button>
+        ) : (
+          <Button variant="danger" onClick={() => setConfirmingCancel(true)}>
+            {t("common.cancelDoc")}
+          </Button>
+        )
+      )}
+      {/* Conversions are hidden while confirming to keep the choice unambiguous. */}
+      {!isNew &&
+        docstatus === 1 &&
+        !confirmingCancel &&
+        config.conversions.map((conv) => (
+          <Button
+            key={conv.targetDoctype}
+            variant="secondary"
+            onClick={() => onConvert(conv.targetDoctype)}
+          >
+            {t(`conversions.${conv.label}`, { defaultValue: conv.label })}
+          </Button>
+        ))}
+      {/* The actual confirm — deliberately placed far from the original button
+          (pushed to the opposite end) so it can't be hit by a double-click. */}
+      {showCancel && confirmingCancel && (
+        <Button
+          variant="danger"
+          className="ml-auto"
+          onClick={() => {
+            setConfirmingCancel(false);
+            onCancel();
+          }}
+        >
+          {t("common.cancelDocConfirmBtn")}
+        </Button>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Recalculation helper
+// ---------------------------------------------------------------------------
+
+function recalculate(formData: any, config: ReturnType<typeof getDoctypeConfig>) {
+  if (!config) return formData;
+
+  const updated = { ...formData };
+
+  // Recalculate item amounts
+  const hasItems = config.childTables.some((ct) => ct.key === "items");
+  if (hasItems && config.childTables.find((ct) => ct.key === "items")?.fields.some((f) => f.name === "rate") && Array.isArray(updated.items)) {
+    updated.items = updated.items.map((item: any) => ({
+      ...item,
+      amount: flt(item.qty, 2) * flt(item.rate, 2),
+    }));
+
+    if (config.fields.some((f) => f.name === "net_total")) {
+      updated.net_total = updated.items.reduce(
+        (sum: number, item: any) => sum + flt(item.amount, 2), 0,
+      );
+    }
+  }
+
+  // Recalculate taxes
+  const hasTaxes = config.childTables.some((ct) => ct.key === "taxes");
+  if (hasTaxes && Array.isArray(updated.taxes)) {
+    updated.taxes = updated.taxes.map((tax: any) => {
+      if (tax.charge_type === "On Net Total") {
+        return {
+          ...tax,
+          tax_amount: flt(updated.net_total, 2) * flt(tax.rate, 2) / 100,
+        };
+      }
+      return tax;
+    });
+
+    const totalTax = updated.taxes.reduce(
+      (sum: number, t: any) => sum + flt(t.tax_amount, 2),
+      0,
+    );
+    updated.total_taxes_and_charges = totalTax;
+    updated.grand_total = flt(updated.net_total, 2) + totalTax;
+  }
+
+  return updated;
+}
+
+// ---------------------------------------------------------------------------
+// Main form page
+// ---------------------------------------------------------------------------
+
+export default function DocumentFormPage() {
+  const { doctype, name } = useParams<{ doctype: string; name: string }>();
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+  const config = getDoctypeConfig(doctype ?? "");
+  const isNew = !name;
+  usePageTitle(isNew ? (config?.label ?? null) : (name ?? config?.label ?? null));
+
+  const [formData, setFormData] = useState<any>({});
+  // True once the user picks a currency by hand, so auto-defaulting backs off.
+  const [currencyTouched, setCurrencyTouched] = useState(false);
+
+  // Fetch existing document
+  const { data: existingDoc, isLoading } = useQuery({
+    queryKey: ["document", doctype, name],
+    queryFn: () => api.getDocument(doctype!, name!),
+    enabled: !!doctype && !!name && !isNew,
+  });
+
+  // --- Currency defaulting (new documents only) ----------------------------
+  // Pre-fill the transaction currency from the selected party's default
+  // currency, falling back to the company base — mirroring the backend's
+  // precedence — until the user picks one. Only sales/purchase docs have it.
+  const hasCurrencyField = useMemo(
+    () => !!config?.fields.some((f) => f.name === "currency"),
+    [config],
+  );
+  const partyType = config?.partyField;
+  const partyName = partyType ? formData[partyType] : undefined;
+  const companyCurrency = useBaseCurrency(formData.company);
+
+  const { data: partyMaster } = useQuery({
+    queryKey: ["master", partyType, partyName],
+    queryFn: () => api.getMaster(partyType!, partyName!),
+    enabled: isNew && hasCurrencyField && !!partyType && !!partyName,
+    staleTime: 5 * 60 * 1000,
+  });
+
+  useEffect(() => {
+    if (!isNew || !hasCurrencyField || currencyTouched) return;
+    let suggested: string | undefined;
+    if (partyName) {
+      if (!partyMaster) return; // wait for the party's currency before defaulting
+      suggested = partyMaster.default_currency || companyCurrency;
+    } else {
+      suggested = companyCurrency;
+    }
+    if (suggested && suggested !== formData.currency) {
+      setFormData((prev: any) => ({ ...prev, currency: suggested }));
+    }
+  }, [
+    isNew, hasCurrencyField, currencyTouched,
+    partyName, partyMaster, companyCurrency, formData.currency,
+  ]);
+
+  // Initialize formData
+  useEffect(() => {
+    if (isNew && config) {
+      const defaults: any = {};
+      config.fields.forEach((f) => {
+        if (f.type === "date" && f.name !== "valid_from" && f.name !== "valid_upto") {
+          defaults[f.name] = formatLocalDate();
+        } else {
+          defaults[f.name] = f.default ?? "";
+        }
+      });
+      config.childTables.forEach((ct) => {
+        defaults[ct.key] = [];
+      });
+      defaults.docstatus = 0;
+      setFormData(defaults);
+    } else if (existingDoc) {
+      setFormData(existingDoc);
+    }
+  }, [isNew, existingDoc, config]);
+
+  // Mutations
+  const createMut = useMutation({
+    mutationFn: (data: any) => api.createDocument(doctype!, data),
+    onSuccess: (result) => {
+      queryClient.invalidateQueries({ queryKey: ["documents", doctype] });
+      if (doctype === "reservation" || doctype === "asset") {
+        queryClient.invalidateQueries({ queryKey: ["fleet-calendar"] });
+        queryClient.invalidateQueries({ queryKey: ["availability"] });
+      }
+      navigate(`/app/${doctype}/${result.name}`, { replace: true });
+    },
+  });
+
+  const updateMut = useMutation({
+    mutationFn: (data: any) => api.updateDocument(doctype!, name!, data),
+    onSuccess: (result) => {
+      queryClient.invalidateQueries({ queryKey: ["document", doctype, name] });
+      queryClient.invalidateQueries({ queryKey: ["documents", doctype] });
+      if (doctype === "reservation" || doctype === "asset") {
+        queryClient.invalidateQueries({ queryKey: ["fleet-calendar"] });
+        queryClient.invalidateQueries({ queryKey: ["availability"] });
+      }
+      setFormData(result);
+    },
+  });
+
+  const submitMut = useMutation({
+    mutationFn: () => api.submitDocument(doctype!, name!),
+    onSuccess: (result) => {
+      setFormData(result);
+      queryClient.invalidateQueries({ queryKey: ["document", doctype, name] });
+      queryClient.invalidateQueries({ queryKey: ["documents", doctype] });
+      if (doctype === "reservation" || doctype === "asset") {
+        queryClient.invalidateQueries({ queryKey: ["fleet-calendar"] });
+        queryClient.invalidateQueries({ queryKey: ["availability"] });
+      }
+    },
+  });
+
+  const cancelMut = useMutation({
+    mutationFn: () => api.cancelDocument(doctype!, name!),
+    onSuccess: (result) => {
+      setFormData(result);
+      queryClient.invalidateQueries({ queryKey: ["document", doctype, name] });
+      queryClient.invalidateQueries({ queryKey: ["documents", doctype] });
+      if (doctype === "reservation" || doctype === "asset") {
+        queryClient.invalidateQueries({ queryKey: ["fleet-calendar"] });
+        queryClient.invalidateQueries({ queryKey: ["availability"] });
+      }
+    },
+  });
+
+  const discardMut = useMutation({
+    mutationFn: () => api.discardDocument(doctype!, name!),
+    onSuccess: () => {
+      // The draft is now hidden from the default list; leave the editor.
+      queryClient.invalidateQueries({ queryKey: ["documents", doctype] });
+      if (doctype === "reservation" || doctype === "asset") {
+        queryClient.invalidateQueries({ queryKey: ["fleet-calendar"] });
+        queryClient.invalidateQueries({ queryKey: ["availability"] });
+      }
+      navigate(`/app/${doctype}`, { replace: true });
+    },
+  });
+
+  const convertMut = useMutation({
+    mutationFn: (targetDoctype: string) =>
+      api.convertDocument(doctype!, name!, targetDoctype),
+    onSuccess: (result, targetDoctype) => {
+      const targetSlug = targetDoctype.toLowerCase().replace(/\s+/g, "-");
+      navigate(`/app/${targetSlug}/${result.name}`);
+    },
+  });
+
+  // Field change handler with recalculation
+  const setField = useCallback(
+    (fieldName: string, value: any) => {
+      if (fieldName === "currency") setCurrencyTouched(true);
+      setFormData((prev: any) => {
+        const next = { ...prev, [fieldName]: value };
+        // A new currency invalidates any prior rate; clear it so the backend
+        // re-resolves the exchange rate for the chosen currency.
+        if (fieldName === "currency" && config?.usesExchangeRate !== false) next.conversion_rate = 0;
+        if (doctype === "reservation" && fieldName === "asset" && value) next.allocation_mode = "Unit";
+        return recalculate(next, config);
+      });
+    },
+    [config, doctype],
+  );
+
+  const setChildTable = useCallback(
+    (key: string, rows: any[]) => {
+      setFormData((prev: any) => {
+        const next = { ...prev, [key]: rows };
+        return recalculate(next, config);
+      });
+    },
+    [config],
+  );
+
+  const handleSave = () => {
+    if (isNew) {
+      createMut.mutate(formData);
+    } else {
+      updateMut.mutate(formData);
+    }
+  };
+
+  const handleSubmit = () => {
+    submitMut.mutate();
+  };
+
+  const handleCancel = () => {
+    // Cancelling reverses all postings (GL + stock) and is irreversible. The
+    // two-step confirm UI lives in DocumentActions (the confirm button appears
+    // in a different place, so a double-click can't fire it by accident).
+    cancelMut.mutate();
+  };
+
+  const handleConvert = (targetDoctype: string) => {
+    convertMut.mutate(targetDoctype);
+  };
+
+  const handleDiscard = () => {
+    // Soft delete of an unwanted draft — no postings to reverse. Confirmation
+    // is handled inline in DocumentActions.
+    discardMut.mutate();
+  };
+
+  const handleSoftCancel = () => {
+    // Flip a field to a terminal value (e.g. a Reservation's status ->
+    // "Cancelled", which frees the calendar) via an ordinary update — there is
+    // no hard delete for documents. Reuses the update mutation + payload.
+    if (!config?.softCancel) return;
+    updateMut.mutate({ ...formData, [config.softCancel.field]: config.softCancel.value });
+  };
+
+  if (!config) {
+    return (
+      <p className="text-fg-muted">
+        Unknown document type: {doctype}
+      </p>
+    );
+  }
+
+  if (!isNew && isLoading) {
+    return <p className="text-fg-muted">{t("common.loading")}</p>;
+  }
+
+  const docstatus: number = formData.docstatus ?? 0;
+  const discarded = !!formData.discarded;
+  const importedBankTransaction = doctype === "bank-transaction" && !!formData.bank_statement_import;
+  // A discarded draft is voided/terminal — lock it like a submitted document.
+  const readOnly = docstatus >= 1 || discarded || importedBankTransaction;
+
+  // The document's currency drives how amounts are formatted (€/£/¥ vs $).
+  // Documents without a currency field (Stock Entry, …) store their values in
+  // the company BASE currency — falling back to a hardcoded USD stamped $ on
+  // CHF numbers. Fall back to the company currency instead.
+  const docCurrency: string = formData.currency || companyCurrency;
+  const docRate: number = flt(formData.conversion_rate ?? 1);
+
+  // Separate editable parent fields from computed/totals fields. Textareas
+  // (Notes / Terms) are pulled onto their own full-width row below the grid so
+  // there's room to write — and to surface the markup the field supports.
+  const editableFields = config.fields.filter((f) => !f.readOnly);
+  const gridFields = editableFields.filter((f) => f.type !== "textarea");
+  const noteFields = editableFields.filter((f) => f.type === "textarea");
+  const totalsFields = config.fields.filter((f) => f.readOnly);
+
+  return (
+    <div className="space-y-6">
+      {/* Header — stacks on mobile (status pill on top, action buttons
+          below) since on a narrow screen the action buttons wrap to multiple
+          lines and items-center vertically centers the pill against the
+          tall buttons column, leaving it floating in dead space. From sm:
+          up, side-by-side again. */}
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex items-center gap-3">
+          {!isNew && <DocPager slug={config.slug} name={name!} onSave={handleSave} />}
+          {!isNew && formData.status && (
+            <StatusBadge status={formData.status} />
+          )}
+          {!isNew && formData.currency && (
+            <span
+              className="inline-flex items-center gap-1 rounded-full bg-surface-subtle px-2.5 py-0.5 text-xs font-medium text-fg-muted ring-1 ring-line"
+              title={docRate !== 1 ? `1 ${docCurrency} = ${docRate} base currency` : undefined}
+            >
+              {docCurrency}
+              {docRate !== 1 && <span className="text-fg-muted/70">@ {docRate}</span>}
+            </span>
+          )}
+        </div>
+        <DocumentActions
+          isNew={isNew}
+          doctype={doctype}
+          name={name}
+          docstatus={docstatus}
+          saving={createMut.isPending || updateMut.isPending}
+          config={config}
+          discarded={discarded}
+          onSave={handleSave}
+          onSubmit={handleSubmit}
+          onCancel={handleCancel}
+          onConvert={handleConvert}
+          onDiscard={handleDiscard}
+          onSoftCancel={handleSoftCancel}
+          softCancelDone={
+            !!config.softCancel &&
+            formData[config.softCancel.field] === config.softCancel.value
+          }
+          draftReadOnly={importedBankTransaction}
+        />
+      </div>
+
+      {/* Error display */}
+      {(createMut.error || updateMut.error || submitMut.error || cancelMut.error) && (
+        <div className="rounded-lg bg-rose-50 p-4 text-sm text-rose-700 ring-1 ring-rose-200">
+          {(createMut.error ?? updateMut.error ?? submitMut.error ?? cancelMut.error)
+            ?.message ?? t("common.errorOccurred")}
+        </div>
+      )}
+
+      {(formData._validation?.warnings ?? []).map((warning: any) => (
+        <div key={warning.code} className="rounded-lg bg-amber-50 p-4 text-sm text-amber-900" role="status">
+          {warning.code === "asset_unassigned" ? t("rentals.poolWarning") : warning.message}
+        </div>
+      ))}
+
+      {/* Parent fields */}
+      <Card>
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          {gridFields.map((field) => (
+            <FieldRenderer
+              key={field.name}
+              field={field}
+              value={formData[field.name]}
+              onChange={(v) => setField(field.name, v)}
+              readOnly={readOnly}
+              rowData={formData}
+              currency={docCurrency}
+              doctype={doctype}
+            />
+          ))}
+        </div>
+        {/* Notes / Terms — full width, below Company/Currency etc. */}
+        {noteFields.length > 0 && (
+          <div className="mt-4 space-y-4">
+            {noteFields.map((field) => (
+              <FieldRenderer
+                key={field.name}
+                field={field}
+                value={formData[field.name]}
+                onChange={(v) => setField(field.name, v)}
+                readOnly={readOnly}
+                rowData={formData}
+                currency={docCurrency}
+                doctype={doctype}
+              />
+            ))}
+          </div>
+        )}
+      </Card>
+
+      {/* Child tables */}
+      {config.childTables.map((ct) => (
+        <ChildTableEditor
+          key={ct.key}
+          tableDef={ct}
+          rows={formData[ct.key] ?? []}
+          onChange={(rows) => setChildTable(ct.key, rows)}
+          readOnly={readOnly}
+          currency={docCurrency}
+        />
+      ))}
+
+      {/* Totals section */}
+      {totalsFields.length > 0 && (
+        <Card title={t("common.totals")}>
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+            {totalsFields.map((field) => (
+              <FieldRenderer
+                key={field.name}
+                field={field}
+                value={formData[field.name]}
+                onChange={() => {}}
+                readOnly={true}
+                currency={docCurrency}
+              />
+            ))}
+          </div>
+        </Card>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,279 @@
+"""
+FastAPI application entry point.
+
+Run with: uvicorn api.main:app --reload --port 8000
+"""
+
+import os
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+
+from lambda_erp import get_app_version
+from lambda_erp.database import setup
+
+from api.errors import register_exception_handlers
+from api.auth import router as auth_router, COOKIE_NAME, decode_token
+from api.oauth import router as oauth_router
+from api.mcp_oauth import router as mcp_oauth_router, OAuthError, oauth_error_handler
+from api.attachments import router as attachments_router
+from api.chat import chat_websocket, router as chat_router
+from api.routers import admin, documents, masters, reports, setup as setup_router, bank_reconciliation, bank_statements, analytics, accounting, proposals, chat_api, mcp, availability, actions, msme_documents, msme_compliance, msme_credit, msme_reconciliation, ops
+
+
+def load_plugins() -> None:
+    """Import customer extension modules named in LAMBDA_ERP_PLUGINS and call
+    each module's register().
+
+    A customer deployment is a separate repo that depends on this core and
+    registers doctype overrides / lifecycle hooks (see
+    docs/core-extension-architecture.md). Set e.g. LAMBDA_ERP_PLUGINS=acme
+    (comma-separated for several). Runs after setup() and BEFORE any documents
+    are created, so overrides/hooks apply to seeded data too. Unset = no-op, so
+    the core runs unchanged. Fails fast on a broken plugin rather than booting
+    silently without the customer's customizations.
+    """
+    import importlib
+
+    names = [m.strip() for m in os.environ.get("LAMBDA_ERP_PLUGINS", "").split(",") if m.strip()]
+    for name in names:
+        print(f"[plugins] loading {name}", flush=True)
+        module = importlib.import_module(name)
+        register = getattr(module, "register", None)
+        if not callable(register):
+            raise RuntimeError(f"Plugin '{name}' has no callable register()")
+        register()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: initialize database
+    db_path = os.environ.get("LAMBDA_ERP_DB", "lambda_erp.db")
+    setup(db_path)
+
+    # Load customer extension plugins before anything creates documents.
+    load_plugins()
+
+    # Create plugin-registered tables and run their pending migrations. Must be
+    # after load_plugins() (registrations happen in register()) and before any
+    # document is created.
+    from api.services import apply_plugin_schema
+    apply_plugin_schema()
+
+    from api.pdf_profiles import validate_pdf_registry
+    validate_pdf_registry()
+
+    # Ensure the demo spend log table exists before any LLM call happens.
+    from api.demo_limits import init_schema as init_demo_spend_schema
+    init_demo_spend_schema()
+
+    # Seed a deterministic admin from the environment (if configured) before
+    # anyone can register. On deployments whose DB is recreated each rollout
+    # this stops the first visitor after a redeploy from grabbing admin.
+    from api.auth import ensure_seed_admin
+    ensure_seed_admin()
+
+    # When packaged as a demo container, land visitors straight in demo mode.
+    if os.environ.get("LAMBDA_ERP_AUTO_DEMO") == "1":
+        from api.bootstrap import bootstrap_demo
+
+        bootstrap_demo()
+
+    # Optional in-process sweep of queued/stuck documents (MSME_SWEEP_INTERVAL_SECONDS; off by default).
+    from api.routers.msme_documents import get_service as get_document_service
+    from msme.ops.scheduler import PeriodicSweeper, interval_from_env
+
+    sweep_interval = interval_from_env()
+    sweeper = PeriodicSweeper(lambda: get_document_service().sweep(10), sweep_interval) if sweep_interval else None
+    if sweeper:
+        sweeper.start()
+
+    yield
+    if sweeper:
+        await sweeper.stop()
+
+
+app = FastAPI(
+    title="Lambda ERP",
+    version=get_app_version(),
+    lifespan=lifespan,
+)
+
+# CORS for Vite dev server
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Structured logging, request ids and the generic 500 handler (outermost middleware)
+from api.observability import configure_logging, install as install_observability
+
+configure_logging()
+install_observability(app)
+
+# Exception handlers
+register_exception_handlers(app)
+app.add_exception_handler(OAuthError, oauth_error_handler)
+
+# Routers
+app.include_router(auth_router, prefix="/api")
+app.include_router(oauth_router, prefix="/api")
+app.include_router(mcp_oauth_router)
+app.include_router(attachments_router, prefix="/api")
+app.include_router(documents.router, prefix="/api")
+app.include_router(proposals.router, prefix="/api")
+app.include_router(masters.router, prefix="/api")
+app.include_router(actions.router, prefix="/api")
+app.include_router(availability.router, prefix="/api")
+app.include_router(reports.router, prefix="/api")
+app.include_router(analytics.router, prefix="/api")
+app.include_router(setup_router.router, prefix="/api")
+app.include_router(bank_reconciliation.router, prefix="/api")
+app.include_router(bank_statements.router, prefix="/api")
+app.include_router(accounting.router, prefix="/api")
+app.include_router(admin.router, prefix="/api")
+app.include_router(chat_router, prefix="/api")
+app.include_router(chat_api.router, prefix="/api")
+app.include_router(mcp.router, prefix="/api")
+app.include_router(msme_documents.router, prefix="/api")
+app.include_router(msme_compliance.router, prefix="/api")
+app.include_router(msme_credit.router, prefix="/api")
+app.include_router(msme_reconciliation.router, prefix="/api")
+app.include_router(ops.router, prefix="/api")
+
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok", "version": get_app_version()}
+
+
+@app.get("/api/chat-doctypes")
+def chat_doctypes():
+    """Public metadata for doctypes registered via register_chat_doctype: their
+    description and, for the frontend, how each is opened (`page`). The frontend
+    uses the `page` of kind "via" to auto-register a redirect from the doctype's
+    (chat-generated) `/app/{slug}/{name}` link to its parent's page. Not
+    sensitive — it's the same info the chat system prompt carries."""
+    from api import services
+    out = []
+    for slug, meta in services.CHAT_DOCTYPES.items():
+        if slug not in services.SLUG_TO_DOCTYPE:
+            continue
+        out.append({
+            "slug": slug,
+            "description": meta.get("description"),
+            "fields": meta.get("fields", []),
+            "page": services.chat_doctype_page_info(slug),
+        })
+    return {"doctypes": out}
+
+
+@app.websocket("/ws/chat")
+async def ws_chat(websocket: WebSocket):
+    # Authenticate via cookie, fall back to public_manager for demo mode
+    from lambda_erp.database import get_db
+    from api.auth import make_auth_principal, SESSION_CREDENTIAL, PUBLIC_DEMO_CREDENTIAL
+
+    token = websocket.cookies.get(COOKIE_NAME)
+    user_name = decode_token(token) if token else None
+    user = None
+
+    db = get_db()
+    if user_name:
+        user = db.get_value("User", user_name, ["name", "full_name", "role", "enabled"])
+        if user and not user.get("enabled"):
+            user = None
+        elif user:
+            user = make_auth_principal(dict(user), SESSION_CREDENTIAL)
+
+    # Fall back to public manager
+    if not user:
+        pub = db.sql('SELECT name, full_name, role, enabled FROM "User" WHERE role = \'public_manager\' AND enabled = 1')
+        user = make_auth_principal(dict(pub[0]), PUBLIC_DEMO_CREDENTIAL) if pub else None
+
+    if not user:
+        await websocket.accept()
+        await websocket.close(code=4001, reason="Not authenticated")
+        return
+
+    # Client IP for demo-spend rate limiting. Azure Container Apps ingress
+    # (and any sane reverse proxy) sets X-Forwarded-For with the original
+    # client as the leftmost entry; fall back to the socket peer for local
+    # dev where no proxy is in front.
+    xff = websocket.headers.get("x-forwarded-for", "")
+    if xff:
+        client_ip = xff.split(",")[0].strip()
+    else:
+        client_ip = websocket.client.host if websocket.client else "unknown"
+
+    await chat_websocket(websocket, user_info=dict(user), client_ip=client_ip)
+
+
+# Serve frontend build in production (if dist/ exists).
+#
+# In local dev the frontend runs on Vite's dev server (port 5173), which
+# has SPA fallback built in — any unknown route serves index.html so
+# React Router can take over. In the container, FastAPI serves the built
+# frontend itself, and StaticFiles(html=True) only serves index.html for
+# directory requests, not arbitrary paths. That made direct-URL visits
+# and reloads on routes like /chat/:id return `{"detail": "Not Found"}`
+# instead of the React app. The route below replicates Vite's fallback
+# semantics: real files (assets, favicon, logos) resolve as-is; anything
+# else falls through to index.html and React Router handles it
+# client-side. API and WebSocket paths keep returning their normal 404s.
+class _ImmutableStaticFiles(StaticFiles):
+    """Serve content-hashed build assets with a long-lived immutable cache.
+
+    Vite fingerprints every file under /assets (index-<hash>.js, etc.), so the
+    bytes at a given URL never change — a new build emits new filenames. The
+    `immutable` directive lets the browser skip revalidation entirely (no 304
+    round-trip on reload), while index.html stays `no-cache` so a new build is
+    still picked up. Net effect vs. the old default: fewer requests, not more.
+    """
+
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers.setdefault(
+            "Cache-Control", "public, max-age=31536000, immutable"
+        )
+        return response
+
+
+frontend_dist = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
+if os.path.isdir(frontend_dist):
+    assets_dir = os.path.join(frontend_dist, "assets")
+    if os.path.isdir(assets_dir):
+        app.mount("/assets", _ImmutableStaticFiles(directory=assets_dir), name="assets")
+
+    frontend_root = os.path.realpath(frontend_dist)
+    index_html = os.path.join(frontend_root, "index.html")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def spa_fallback(full_path: str):
+        # Let API/WS paths that didn't match a real route 404 as JSON,
+        # rather than accidentally returning the SPA shell HTML.
+        if full_path.startswith(("api/", "ws/")):
+            raise HTTPException(status_code=404, detail="Not Found")
+
+        # Real public files (favicon.ico, favicon.png, logo_*.png, etc.)
+        # should resolve to themselves. Guard against path traversal by
+        # re-anchoring to the resolved frontend_dist root.
+        if full_path:
+            candidate = os.path.realpath(os.path.join(frontend_root, full_path))
+            if candidate.startswith(frontend_root + os.sep) and os.path.isfile(candidate):
+                return FileResponse(candidate)
+
+        # SPA fallback — React Router takes over from here.
+        #
+        # `no-cache` = always revalidate the shell before reuse (a cheap 304
+        # when unchanged, fresh bytes after a deploy). index.html is the only
+        # UNHASHED file and it points at the hashed /assets bundles, so if the
+        # browser heuristically caches it (which it does when no Cache-Control
+        # is set), a soft reload serves a stale shell referencing old asset
+        # URLs — the "refresh doesn't refresh, need a hard-refresh" bug.
+        return FileResponse(index_html, headers={"Cache-Control": "no-cache"})

@@ -1,0 +1,1384 @@
+"""Bridge between FastAPI request data and lambda_erp Document classes."""
+
+import re
+import time
+
+from lambda_erp.utils import _dict, now
+from api.time_filters import resolve_time_filter, time_predicate, time_quality, page_metadata, time_filter_fields
+from lambda_erp.database import get_db, get_write_generation
+
+from lambda_erp.selling.quotation import (
+    Quotation, make_sales_order,
+    make_sales_invoice_from_quotation, make_delivery_note_from_quotation,
+)
+from lambda_erp.selling.proposal import Proposal
+from lambda_erp.selling.sales_order import SalesOrder, make_sales_invoice
+from lambda_erp.buying.purchase_order import PurchaseOrder, make_purchase_invoice
+from lambda_erp.accounting.sales_invoice import SalesInvoice, make_sales_return
+from lambda_erp.accounting.purchase_invoice import PurchaseInvoice, make_purchase_return
+from lambda_erp.accounting.payment_entry import PaymentEntry
+from lambda_erp.accounting.journal_entry import JournalEntry
+from lambda_erp.stock.stock_entry import StockEntry
+from lambda_erp.stock.delivery_note import DeliveryNote, make_delivery_note, make_delivery_return
+from lambda_erp.stock.purchase_receipt import PurchaseReceipt, make_purchase_receipt, make_purchase_receipt_return
+from lambda_erp.accounting.pos_invoice import POSInvoice
+from lambda_erp.controllers.pricing_rule import PricingRule
+from lambda_erp.controllers.item_price import PriceList, ItemPrice
+from lambda_erp.accounting.budget import Budget
+from lambda_erp.accounting.subscription import Subscription
+from lambda_erp.accounting.bank_transaction import BankTransaction
+from lambda_erp.accounting.bank_account import BankAccount
+from lambda_erp.assets.asset import Asset
+from lambda_erp.assets.reservation import Reservation
+
+
+# --- Doctype registries ---
+
+DOCUMENT_CLASSES = {
+    "Quotation": Quotation,
+    "Proposal": Proposal,
+    "Sales Order": SalesOrder,
+    "Sales Invoice": SalesInvoice,
+    "Purchase Order": PurchaseOrder,
+    "Purchase Invoice": PurchaseInvoice,
+    "Payment Entry": PaymentEntry,
+    "Journal Entry": JournalEntry,
+    "Stock Entry": StockEntry,
+    "Delivery Note": DeliveryNote,
+    "Purchase Receipt": PurchaseReceipt,
+    "POS Invoice": POSInvoice,
+    "Pricing Rule": PricingRule,
+    "Price List": PriceList,
+    "Item Price": ItemPrice,
+    "Budget": Budget,
+    "Subscription": Subscription,
+    "Bank Transaction": BankTransaction,
+    "Bank Account": BankAccount,
+    # Neither posts to the GL or the Stock Ledger; both stay at docstatus 0 and
+    # carry their meaning in `status`. Registered here so the generic document
+    # CRUD, the chat tools and MCP drive them like every other doctype.
+    "Asset": Asset,
+    "Reservation": Reservation,
+}
+
+CONVERTERS = {
+    ("Quotation", "Sales Order"): make_sales_order,
+    ("Quotation", "Sales Invoice"): make_sales_invoice_from_quotation,
+    ("Quotation", "Delivery Note"): make_delivery_note_from_quotation,
+    ("Sales Order", "Sales Invoice"): make_sales_invoice,
+    ("Sales Order", "Delivery Note"): make_delivery_note,
+    ("Purchase Order", "Purchase Invoice"): make_purchase_invoice,
+    ("Purchase Order", "Purchase Receipt"): make_purchase_receipt,
+    # Returns (same-to-same conversion creates a return document)
+    ("Sales Invoice", "Sales Invoice"): make_sales_return,
+    ("Purchase Invoice", "Purchase Invoice"): make_purchase_return,
+    ("Delivery Note", "Delivery Note"): make_delivery_return,
+    ("Purchase Receipt", "Purchase Receipt"): make_purchase_receipt_return,
+}
+
+MASTER_TABLES = {
+    "customer": ("Customer", "customer_name"),
+    "supplier": ("Supplier", "supplier_name"),
+    "item": ("Item", "item_name"),
+    "warehouse": ("Warehouse", "warehouse_name"),
+    "account": ("Account", "account_name"),
+    "company": ("Company", "company_name"),
+    "cost-center": ("Cost Center", "cost_center_name"),
+}
+
+# Auto-naming prefixes: masters created without an explicit `name` get a
+# generated PREFIX-NNN id (see masters.create_master_record). Types without an
+# entry require an explicit name (or derive it, like company).
+MASTER_NAME_PREFIXES = {
+    "customer": "CUST",
+    "supplier": "SUPP",
+    "item": "ITEM",
+    "warehouse": "WH",
+}
+
+# Minimum numeric suffix width for sequential plugin master ids. Core masters
+# retain the historical three-digit form; plugins can opt into e.g. FIDX-0001.
+MASTER_NAME_DIGITS: dict[str, int] = {}
+
+# High-volume plugin masters can opt out of sequential ids. Sequential naming
+# must inspect existing suffixes after a process restart; opaque random ids keep
+# inserts constant-time for index-scale reference tables.
+MASTER_RANDOM_NAME_TYPES: set[str] = set()
+
+# An Item's code is stored in the primary-key column `name`, but every
+# transaction line and report references it as `item_code`. Accept that
+# intuitive alias on the master API so callers (LLM tools, REST clients) can
+# set and read the code under the name they already use everywhere else,
+# instead of silently falling back to ITEM-NNN.
+MASTER_IDENTITY_ALIAS = {
+    "item": "item_code",
+}
+
+# Optional metadata for plugin masters. Backend consumers use the descriptions
+# to teach chat/MCP about deployment-specific records; the frontend has a
+# parallel build-time registry because Python plugin state is not available to
+# the browser bundle.
+MASTER_METADATA: dict[str, dict] = {}
+
+# Reference checks registered alongside plugin masters. Each entry has the same
+# shape as the core checks in api.routers.masters: (query, human label). Keeping
+# this registry here avoids making plugins mutate router-private globals.
+MASTER_REFERENCE_CHECKS: dict[str, list[tuple[str, str]]] = {}
+
+# Slug <-> doctype name mapping
+SLUG_TO_DOCTYPE = {}
+DOCTYPE_TO_SLUG = {}
+for dt in DOCUMENT_CLASSES:
+    slug = dt.lower().replace(" ", "-")
+    SLUG_TO_DOCTYPE[slug] = dt
+    DOCTYPE_TO_SLUG[dt] = slug
+
+
+def register_doctype(doctype: str, cls, slug: str | None = None, *, pdf_profile=None) -> None:
+    """Register (or override) the class used for a doctype.
+
+    Extension point for customer deployments (see
+    docs/core-extension-architecture.md): a plugin subclasses a core document
+    class and registers it here at startup, so every loader path
+    (create/load/update/submit/cancel_document) resolves the subclass.
+    `get_document_class` reads `DOCUMENT_CLASSES` live, so no other change is
+    needed.
+    """
+    from api.pdf_profiles import PROFILES, PDFProfile, DisabledPDF
+    if pdf_profile is not None:
+        if not isinstance(pdf_profile, (PDFProfile, DisabledPDF)):
+            raise ValueError('pdf_profile must be a PDFProfile or DisabledPDF(reason)')
+        PROFILES[doctype] = pdf_profile
+    elif doctype not in PROFILES:
+        raise ValueError(f'{doctype}: explicitly register a PDFProfile or DisabledPDF(reason)')
+    DOCUMENT_CLASSES[doctype] = cls
+    slug = slug or doctype.lower().replace(" ", "-")
+    SLUG_TO_DOCTYPE[slug] = doctype
+    DOCTYPE_TO_SLUG[doctype] = slug
+
+
+# --- Plugin schema seam ---
+#
+# Core tables are created by database.setup(); plugin tables have no home there
+# (setup() runs before plugins load). These two registries let a plugin declare
+# its own tables and one-time migrations from register(); the core applies them
+# via apply_plugin_schema() in the app lifespan, right after load_plugins() and
+# before any document is created. See docs/core-extension-architecture.md.
+
+_PLUGIN_TABLES: list[str] = []
+_PLUGIN_MIGRATIONS: list = []  # list[tuple[str, Callable[[DB], None]]]
+
+
+def register_table(ddl: str) -> None:
+    """Register a CREATE TABLE (use IF NOT EXISTS) for a plugin table. The DDL is
+    the SQLite-flavoured subset the core's own DDL uses; apply_plugin_schema()
+    translates it per backend via db._ddl(). Idempotent — safe on every boot."""
+    _PLUGIN_TABLES.append(ddl)
+
+
+def register_migration(migration_id: str, fn) -> None:
+    """Register a one-shot migration run exactly once per database, recorded in
+    _PluginMigrations by `migration_id` (namespace it, e.g. "internal:0001_x").
+    `fn(db)` receives the DB; use db.ensure_column(...) for idempotent ALTERs
+    and plain db.sql(...) for backfills. Runs after registered tables exist, in
+    registration order. Must be idempotent and self-contained (single logical
+    unit — it commits on success)."""
+    _PLUGIN_MIGRATIONS.append((migration_id, fn))
+
+
+def apply_plugin_schema() -> None:
+    """Create registered plugin tables, then run pending plugin migrations once
+    each. Call from the app lifespan after load_plugins(). Table creation always
+    runs (IF NOT EXISTS); each migration runs only if its id isn't already in
+    _PluginMigrations. A failing migration is rolled back and left unrecorded so
+    it retries next boot; it does not abort startup (mirrors the core migrator)."""
+    db = get_db()
+    for ddl in _PLUGIN_TABLES:
+        db.conn.execute(db._ddl(ddl))
+    db.conn.commit()
+
+    if not _PLUGIN_MIGRATIONS:
+        db._ensure_list_indexes()
+        return
+
+    db.conn.execute(
+        'CREATE TABLE IF NOT EXISTS "_PluginMigrations" '
+        "(migration_id TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
+    )
+    db.conn.commit()
+    applied = {r["migration_id"] for r in db.sql('SELECT migration_id FROM "_PluginMigrations"')}
+
+    for migration_id, fn in _PLUGIN_MIGRATIONS:
+        if migration_id in applied:
+            continue
+        try:
+            fn(db)
+            db.sql(
+                'INSERT INTO "_PluginMigrations" (migration_id, applied_at) VALUES (?, ?)',
+                [migration_id, now()],
+            )
+            db.conn.commit()
+            print(f"[plugin-migration] applied {migration_id}", flush=True)
+        except Exception as e:
+            db.conn.rollback()
+            print(f"[plugin-migration] FAILED {migration_id}: {e!r} — will retry next boot", flush=True)
+
+    db._ensure_list_indexes()
+
+
+def document_columns(doctype_slug: str) -> set:
+    """The real column names of a registered doctype's table, or empty set if the
+    slug is unknown. Used to validate ad-hoc list filters against actual columns
+    (see the documents router) so an unknown field is a 400, never SQL."""
+    doctype = SLUG_TO_DOCTYPE.get(doctype_slug)
+    if not doctype:
+        return set()
+    return get_db()._get_table_columns(doctype)
+
+
+def register_master(slug: str, table: str, name_field: str, *,
+                    name_prefix: str | None = None,
+                    name_digits: int = 3,
+                    random_name: bool = False,
+                    identity_alias: str | None = None,
+                    description: str | None = None,
+                    fields: list[str] | None = None,
+                    reference_checks: list[tuple[str, str]] | None = None) -> None:
+    """Register (or override) a master type — the master-side counterpart of
+    `register_doctype`.
+
+    A plugin calls this at startup and the master becomes a first-class type
+    everywhere `MASTER_TABLES` is consulted: the REST CRUD surface
+    (`/api/masters/{slug}`) and the chat tools (search_masters,
+    get_master_fields, create/update/delete_master — their schemas and the
+    system prompt are built from the live registry per request). Fields are
+    never declared: they're introspected from the table at call time. Ordinary
+    text columns are searched by default; large blobs remain available when a
+    caller names them explicitly.
+
+    `name_field` is the human display column (e.g. "company_name").
+    `name_prefix` enables auto-generated ids (prefix "LEAD" -> LEAD-001) when a
+    record is created without an explicit `name`. `name_digits` controls the
+    minimum sequential suffix width. `identity_alias` lets callers address the
+    `name` PK under a friendlier key, like item's `item_code`.
+    """
+    MASTER_TABLES[slug] = (table, name_field)
+    if name_prefix:
+        if name_digits < 1:
+            raise ValueError("name_digits must be at least 1")
+        MASTER_NAME_PREFIXES[slug] = name_prefix
+        MASTER_NAME_DIGITS[slug] = name_digits
+    if random_name:
+        if not name_prefix:
+            raise ValueError("random_name requires name_prefix")
+        MASTER_RANDOM_NAME_TYPES.add(slug)
+    else:
+        MASTER_RANDOM_NAME_TYPES.discard(slug)
+    if identity_alias:
+        MASTER_IDENTITY_ALIAS[slug] = identity_alias
+    if description or fields:
+        MASTER_METADATA[slug] = {
+            "description": description or "",
+            "fields": list(fields or []),
+        }
+    if reference_checks is not None:
+        MASTER_REFERENCE_CHECKS[slug] = list(reference_checks)
+
+
+# --- Registered actions ----------------------------------------------------
+#
+# Plugins sometimes need one deliberate transition that is richer than CRUD
+# (for example, promoting reference data into a workflow document). Register it
+# once here and it becomes available through REST, AI chat, and MCP. The
+# frontend's master registry can point a button at the same action name.
+
+REGISTERED_ACTIONS: dict[str, dict] = {}
+_ACTION_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+_ROLE_LEVEL = {"viewer": 1, "manager": 2, "public_manager": 2, "admin": 3}
+
+
+def register_action(name: str, handler, *, description: str,
+                    parameters: dict | None = None,
+                    minimum_role: str = "manager",
+                    allow_public_manager: bool = False) -> None:
+    """Register a deployment action across REST, chat, and MCP.
+
+    ``handler`` receives one JSON-compatible argument dict and returns a
+    JSON-compatible result. ``parameters`` is a JSON Schema object for that
+    dict. Mutating actions should keep the default manager requirement; demo
+    ``public_manager`` users are excluded unless explicitly opted in.
+    """
+    if not _ACTION_NAME_RE.fullmatch(name):
+        raise ValueError(f"Invalid action name: {name!r}")
+    if minimum_role not in _ROLE_LEVEL:
+        raise ValueError(f"Invalid minimum action role: {minimum_role!r}")
+    REGISTERED_ACTIONS[name] = {
+        "handler": handler,
+        "description": description,
+        "parameters": parameters or {"type": "object", "properties": {}},
+        "minimum_role": minimum_role,
+        "allow_public_manager": allow_public_manager,
+    }
+
+
+def registered_action_allowed(name: str, role: str | None) -> bool:
+    meta = REGISTERED_ACTIONS.get(name)
+    if not meta:
+        return False
+    if role == "public_manager" and not meta["allow_public_manager"]:
+        return False
+    return _ROLE_LEVEL.get(role or "", 0) >= _ROLE_LEVEL[meta["minimum_role"]]
+
+
+def registered_action_tools() -> list[dict]:
+    """OpenAI-style function tool schemas for all live registered actions."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": meta["description"],
+                "parameters": meta["parameters"],
+            },
+        }
+        for name, meta in REGISTERED_ACTIONS.items()
+    ]
+
+
+def run_registered_action(name: str, args: dict | None, user_info: dict | None = None):
+    meta = REGISTERED_ACTIONS.get(name)
+    if not meta:
+        raise KeyError(name)
+    role = (user_info or {}).get("role")
+    if not registered_action_allowed(name, role):
+        raise PermissionError(
+            f"Action '{name}' requires {meta['minimum_role']} access."
+        )
+    return meta["handler"](args or {})
+
+
+def registered_action_handlers(user_info: dict | None = None) -> dict:
+    """Handlers bound to one caller, used by both chat and MCP dispatch."""
+    return {
+        name: (lambda args, action=name: run_registered_action(action, args, user_info))
+        for name in REGISTERED_ACTIONS
+    }
+
+
+# Chat guidance for registered doctypes: slug -> {"description", "fields"}. The
+# document tools (create/update/list/get_document) already accept any registered
+# doctype and run its validate(); this registry only teaches the AI chat WHAT a
+# custom doctype is and HOW it links, so it uses the validated document path
+# instead of, say, scribbling on a parent's fields. Relationships are read
+# automatically from the Document class's LINK_FIELDS — not declared here.
+CHAT_DOCTYPES: dict = {}
+
+
+def register_chat_doctype(slug: str, *, description: str, fields: list | None = None,
+                          page: str | None = "self") -> None:
+    """Give the AI chat a description (and optional key-field hints) for a doctype
+    already registered via `register_doctype`, so build_system_prompt can tell the
+    model what it is and how it links (LINK_FIELDS are surfaced automatically).
+    No new tools — the document tools already cover every registered doctype.
+
+    `page` tells the chat how a record of this doctype is *opened*, so it emits
+    correct view links (and the frontend can auto-register redirects):
+      "self" (default) — its own page at `/app/{slug}/{name}`;
+      "<link_field>"   — no page of its own; it's shown inside the parent that
+                         `link_field` (a LINK_FIELD) references, so it opens at
+                         `/app/{parent-slug}/{value of link_field}` (e.g. a
+                         contact opens via its lead: page="lead_id");
+      None             — no page and no view link at all.
+    """
+    CHAT_DOCTYPES[slug] = {"description": description, "fields": fields or [], "page": page}
+
+
+def chat_doctype_page_info(slug: str) -> dict | None:
+    """Resolve a chat-doctype's `page` config into a link rule, for the system
+    prompt and the /api/chat-doctypes read. Returns one of:
+      {"kind": "self", "slug": slug}
+      {"kind": "via", "link_field": f, "parent_slug": p}   # opens via a parent
+      {"kind": "none"}
+    or None if the slug isn't a registered chat-doctype."""
+    meta = CHAT_DOCTYPES.get(slug)
+    if not meta:
+        return None
+    page = meta.get("page", "self")
+    if page == "self":
+        return {"kind": "self", "slug": slug}
+    if page is None:
+        return {"kind": "none"}
+    # page names a LINK_FIELD -> resolve the parent doctype -> its slug.
+    doctype = SLUG_TO_DOCTYPE.get(slug)
+    cls = DOCUMENT_CLASSES.get(doctype) if doctype else None
+    links = getattr(cls, "LINK_FIELDS", None) or {}
+    parent_slug = DOCTYPE_TO_SLUG.get(links.get(page)) if links.get(page) else None
+    if not parent_slug:
+        return {"kind": "self", "slug": slug}  # misconfigured -> safe fallback
+    return {"kind": "via", "link_field": page, "parent_slug": parent_slug}
+
+
+def get_document_class(doctype_slug: str):
+    """Get document class from URL slug."""
+    doctype = SLUG_TO_DOCTYPE.get(doctype_slug)
+    if not doctype:
+        return None, None
+    return doctype, DOCUMENT_CLASSES[doctype]
+
+
+# Which Company default a doc's `taxes` table draws from — keyed by the taxes
+# child doctype, so any doc that has a taxes table is covered without a hardcoded
+# doctype list. Selling -> sales default, buying -> purchase default.
+_TAX_CHILD_DEFAULT_FIELD = {
+    "Sales Taxes and Charges": "default_sales_tax_template",
+    "Purchase Taxes and Charges": "default_purchase_tax_template",
+}
+
+
+def _default_tax_rows(cls, data: dict) -> list | None:
+    """`taxes[]` rows to seed a new document from its company's default Tax
+    Template, or None to leave taxes untouched.
+
+    Applied ONLY when the caller omits `taxes` entirely — the exact case the chat
+    model kept hitting (it forgets to add MWST). An explicit `taxes: []` is left
+    alone, so a deliberately tax-free doc (export, reverse-charge, exempt) is
+    expressed by passing an empty list. The document's own tax calc then computes
+    `tax_amount` from the rate, so this only seeds charge_type/account/rate.
+    """
+    taxes_child = cls.CHILD_TABLES.get("taxes")
+    if not taxes_child or "taxes" in data:
+        return None
+    field = _TAX_CHILD_DEFAULT_FIELD.get(taxes_child[0])
+    company = data.get("company")
+    if not field or not company:
+        return None
+    db = get_db()
+    template = db.get_value("Company", company, field)
+    if not template:
+        return None
+    details = db.get_all("Tax Template Detail", filters={"parent": template},
+                         fields=["*"], order_by="idx")
+    if not details:
+        return None
+    return [
+        {
+            "charge_type": d.get("charge_type") or "On Net Total",
+            "account_head": d.get("account_head"),
+            "rate": d.get("rate") or 0,
+            "description": d.get("description") or template,
+            "add_deduct_tax": "Add",
+        }
+        for d in details
+    ]
+
+
+def document_field_metadata(doctype_slug: str) -> dict:
+    from lambda_erp.validation import document_requirements
+    from api.pdf_profiles import pdf_metadata
+    doctype, cls = get_document_class(doctype_slug)
+    if not cls:
+        raise ValueError(f"Unknown document type: {doctype_slug}")
+    db = get_db()
+    return {
+        "doctype": doctype_slug,
+        "fields": sorted(db._get_table_columns(doctype)),
+        "text_fields": sorted(db._get_text_columns(doctype)),
+        "default_search_fields": document_search_columns(db, doctype_slug),
+        "time_filter_fields": time_filter_fields(db, doctype),
+        "child_tables": sorted(cls.CHILD_TABLES),
+        "link_fields": dict(cls.LINK_FIELDS),
+        "dynamic_link_fields": dict(cls.DYNAMIC_LINK_FIELDS),
+        "input_fields": sorted(cls.INPUT_FIELDS),
+        "read_only_fields": sorted(cls.SERVER_MANAGED_FIELDS),
+        "child_input_fields": {key: sorted(value) for key, value in cls.CHILD_INPUT_FIELDS.items()},
+        "requirements": document_requirements(cls),
+        "pdf": pdf_metadata(doctype),
+    }
+
+
+def _validate_document_input(doctype, cls, data):
+    from lambda_erp.exceptions import ValidationError
+    if not isinstance(data, dict):
+        raise ValidationError("Document data must be an object")
+    # Response-only annotations can accompany a round trip through the form.
+    data = {key: value for key, value in data.items() if key != "_validation"}
+    db = get_db()
+    allowed = db._get_table_columns(doctype) | set(cls.CHILD_TABLES) | set(cls.INPUT_FIELDS)
+    unknown = set(data) - allowed
+    if unknown:
+        raise ValidationError(f"{doctype}: Unknown field(s): {', '.join(sorted(unknown))}. Use get_document_fields to inspect supported fields.")
+    for key, (table, _) in cls.CHILD_TABLES.items():
+        if key not in data:
+            continue
+        rows = data[key]
+        if not isinstance(rows, list):
+            raise ValidationError(f"{doctype}: {key} must be an array")
+        allowed_child = db._get_table_columns(table) | set(cls.CHILD_INPUT_FIELDS.get(key, ()))
+        for idx, row in enumerate(rows, 1):
+            if not isinstance(row, dict):
+                raise ValidationError(f"{doctype}: {key} row {idx} must be an object")
+            unknown = set(row) - allowed_child
+            if unknown:
+                raise ValidationError(f"{doctype}: {key} row {idx}: Unknown field(s): {', '.join(sorted(unknown))}")
+    return data
+
+
+def _document_validation(doc):
+    warnings = []
+    if doc.DOCTYPE == 'Proposal' and (not doc.get('customer') or not doc.get('company') or not doc.get('quotations')):
+        warnings.append({'code': 'proposal_incomplete', 'message': 'Draft saved; PDF output requires Customer, Company and at least one Quotation.'})
+    if doc.DOCTYPE == "Reservation" and not doc.get("asset") and doc.get("status") in {"Reserved", "Out"}:
+        warnings.append({
+            "code": "asset_unassigned", "field": "asset",
+            "message": "Pool capacity is reserved; no specific machine is assigned. This booking appears on a pool row in the fleet calendar. Assign an asset before dispatch.",
+        })
+    return {"warnings": warnings}
+
+
+def create_document(doctype_slug: str, data: dict) -> dict:
+    doctype, cls = get_document_class(doctype_slug)
+    if not cls:
+        raise ValueError(f"Unknown document type: {doctype_slug}")
+    data = _validate_document_input(doctype, cls, data)
+    default_taxes = _default_tax_rows(cls, data)
+    if default_taxes is not None:
+        data = {**data, "taxes": default_taxes}
+    doc = cls(data)
+    doc.save()
+    return load_document(doctype_slug, doc.name)
+
+
+def load_document(doctype_slug: str, name: str) -> dict:
+    doctype, cls = get_document_class(doctype_slug)
+    if not cls:
+        raise ValueError(f"Unknown document type: {doctype_slug}")
+    doc = cls.load(name)
+    result = doc.as_dict()
+    result["_validation"] = _document_validation(doc)
+    return result
+
+
+def update_document(doctype_slug: str, name: str, data: dict) -> dict:
+    doctype, cls = get_document_class(doctype_slug)
+    if not cls:
+        raise ValueError(f"Unknown document type: {doctype_slug}")
+    data = _validate_document_input(doctype, cls, data)
+    doc = cls.load(name)
+    # Update parent fields
+    for key, value in data.items():
+        if key not in ("name", "docstatus", "creation") and key not in doc.CHILD_TABLES:
+            doc._data[key] = value
+    # Update child tables if provided
+    for table_name in doc.CHILD_TABLES:
+        if table_name in data:
+            doc._children[table_name] = []
+            for row in data[table_name]:
+                doc.append(table_name, _dict(row))
+    doc.save()
+    return load_document(doctype_slug, doc.name)
+
+
+def batch_update_documents(doctype_slug: str, updates: list) -> dict:
+    """Apply many ``{"name", "data"}`` updates to ONE doctype in a single call.
+
+    Best-effort and per-item: each update runs as its own update_document (its
+    own save + hooks), so a failing row doesn't roll back the others. Returns
+    ``{"updated", "failed", "results": [{"name", "ok", "error"?}]}``. Because it
+    reuses update_document, every plugin save-hook still fires — e.g. a lead
+    update carrying a transient ``_note`` records its timeline Activity here too.
+    """
+    doctype, cls = get_document_class(doctype_slug)
+    if not cls:
+        raise ValueError(f"Unknown document type: {doctype_slug}")
+    if not isinstance(updates, list) or not updates:
+        raise ValueError("updates must be a non-empty array of {name, data} objects")
+    if len(updates) > _BATCH_MAX:
+        raise ValueError(f"Too many updates ({len(updates)}); max {_BATCH_MAX} per call")
+
+    results, updated = [], 0
+    for i, item in enumerate(updates):
+        if not isinstance(item, dict):
+            results.append({"name": None, "ok": False, "error": f"item {i} is not an object"})
+            continue
+        name = item.get("name")
+        data = item.get("data")
+        if not name:
+            results.append({"name": None, "ok": False, "error": f"item {i} is missing 'name'"})
+            continue
+        if not isinstance(data, dict) or not data:
+            results.append({"name": name, "ok": False, "error": "missing 'data' object"})
+            continue
+        try:
+            saved = update_document(doctype_slug, name, data)
+            results.append({"name": name, "ok": True, "warnings": saved.get('_validation', {}).get('warnings', [])})
+            updated += 1
+        except Exception as e:  # noqa: BLE001 — per-item best effort; report, don't abort
+            results.append({"name": name, "ok": False, "error": str(e)})
+    warnings = [{**warning, 'name': row['name']} for row in results for warning in row.get('warnings', [])]
+    return {"updated": updated, "failed": len(results) - updated, "results": results, '_validation': {'warnings': warnings}}
+
+
+def submit_document(doctype_slug: str, name: str) -> dict:
+    doctype, cls = get_document_class(doctype_slug)
+    if not cls:
+        raise ValueError(f"Unknown document type: {doctype_slug}")
+    doc = cls.load(name)
+    doc.submit()
+    return doc.as_dict()
+
+
+def cancel_document(doctype_slug: str, name: str) -> dict:
+    doctype, cls = get_document_class(doctype_slug)
+    if not cls:
+        raise ValueError(f"Unknown document type: {doctype_slug}")
+    doc = cls.load(name)
+    doc.cancel()
+    return doc.as_dict()
+
+
+def discard_document(doctype_slug: str, name: str) -> dict:
+    """Void an unwanted draft (soft delete — keeps the row, hides it from lists)."""
+    doctype, cls = get_document_class(doctype_slug)
+    if not cls:
+        raise ValueError(f"Unknown document type: {doctype_slug}")
+    doc = cls.load(name)
+    doc.discard()
+    return doc.as_dict()
+
+
+def register_converter(source_doctype: str, target_doctype: str, fn) -> None:
+    """Register (or override) the converter for a (source, target) pair.
+
+    Extension point for customer deployments that need different conversion
+    logic (see docs/core-extension-architecture.md). To merely have the
+    converted document use an overridden class, you don't need this — register
+    the class with `register_doctype` and `convert_document` upgrades the
+    produced instance automatically.
+    """
+    CONVERTERS[(source_doctype, target_doctype)] = fn
+
+
+def convert_document(doctype_slug: str, name: str, target_doctype: str) -> dict:
+    source_doctype = SLUG_TO_DOCTYPE.get(doctype_slug)
+    if not source_doctype:
+        raise ValueError(f"Unknown document type: {doctype_slug}")
+
+    converter = CONVERTERS.get((source_doctype, target_doctype))
+    if not converter:
+        raise ValueError(f"Cannot convert {source_doctype} to {target_doctype}")
+
+    new_doc = converter(name)
+    # Honor a registered class override for the produced doctype. The core
+    # converter builds a base-class instance; if a plugin registered a subclass
+    # for the target, upgrade the instance in place so save()/on_submit() use
+    # the override. Safe because overrides are subclasses (same layout, no
+    # __slots__); guarded so a non-subclass registration is ignored.
+    override = DOCUMENT_CLASSES.get(target_doctype)
+    if override is not None and type(new_doc) is not override and issubclass(override, type(new_doc)):
+        new_doc.__class__ = override
+
+    new_doc.save()
+    return new_doc.as_dict()
+
+
+DATE_FIELDS = {
+    "Quotation": "transaction_date",
+    "Sales Order": "transaction_date",
+    "Purchase Order": "transaction_date",
+    "Sales Invoice": "posting_date",
+    "Purchase Invoice": "posting_date",
+    "Payment Entry": "posting_date",
+    "Journal Entry": "posting_date",
+    "Stock Entry": "posting_date",
+    "Delivery Note": "posting_date",
+    "Purchase Receipt": "posting_date",
+    "POS Invoice": "posting_date",
+    "Bank Transaction": "posting_date",
+}
+
+
+def _resolve_date_field(db, doctype: str, override: str | None) -> str | None:
+    """The column that from_date/to_date range-filter against. An explicit
+    override (the frontend's declared `dateField`, passed as the `date_field`
+    filter) wins when it names a real column; otherwise fall back to the
+    built-in DATE_FIELDS map for core doctypes. Guarded so the override is never
+    interpolated into SQL unless it's an actual column."""
+    if override and override in db._get_table_columns(doctype):
+        return override
+    return DATE_FIELDS.get(doctype)
+
+
+# --- List search seam ---
+#
+# The generic list can free-text search across a doctype's own columns (the
+# frontend passes `search` + the config's `search_fields`). A plugin doctype
+# often also wants to match on a *related* table the core knows nothing about
+# (e.g. find a Lead by one of its Contacts). register_search_expansion lets it:
+# fn(query, db) returns the primary-key names to also include, and the core ORs
+# `name IN (...)` into the search clause. See docs/core-extension-architecture.md.
+
+_SEARCH_EXPANSIONS: dict[str, list] = {}  # slug -> [fn(query: str, db) -> Iterable[str]]
+
+# Audit/plumbing columns and large blobs are poor defaults for a free-text
+# lookup. Callers can still target every real column explicitly.
+_SEARCH_SKIP_COLUMNS = {
+    "creation", "modified", "created_at", "updated_at", "owner",
+    "modified_by", "idx", "parent", "parenttype", "parentfield",
+}
+_BULK_TEXT_COLUMNS = {"description", "notes", "remarks", "terms", "comments"}
+
+
+def is_bulk_text_column(column: str) -> bool:
+    return (
+        column in _BULK_TEXT_COLUMNS
+        or column.endswith("_template")
+        or column.endswith("_html")
+    )
+
+
+def _useful_text_columns(db, doctype: str) -> list[str]:
+    return sorted(
+        column for column in db._get_text_columns(doctype) - _SEARCH_SKIP_COLUMNS
+        if not is_bulk_text_column(column)
+    )
+
+
+def document_search_columns(db, doctype_slug: str) -> list[str]:
+    """Default free-text columns for a document REST/MCP list query.
+
+    A registered chat doctype may deliberately provide a smaller field set.
+    Otherwise use schema-discovered text columns, excluding audit noise and
+    large blobs. This prevents ``search`` without ``search_fields`` from
+    silently becoming an unfiltered list.
+    """
+    doctype = SLUG_TO_DOCTYPE.get(doctype_slug)
+    if not doctype:
+        return []
+    columns = db._get_table_columns(doctype)
+    declared = (CHAT_DOCTYPES.get(doctype_slug) or {}).get("fields") or []
+    if declared:
+        return sorted({field for field in declared if field in columns})
+    return _useful_text_columns(db, doctype)
+
+
+def register_search_expansion(doctype_slug: str, fn) -> None:
+    """Register a related-table search for a doctype's list. `fn(query, db)`
+    returns an iterable of this doctype's PK names whose related records match
+    `query` (e.g. Lead names that have a matching Contact). Those names are
+    OR-ed into the list/count/adjacent search alongside the same-table column
+    matches. Keep it bounded and indexed — it runs on every search keystroke."""
+    _SEARCH_EXPANSIONS.setdefault(doctype_slug, []).append(fn)
+
+
+def _search_clause(db, doctype: str, doctype_slug: str, search, search_fields):
+    """A parenthesized OR-group matching `search` (case-insensitive substring)
+    across `search_fields` (kept to real columns) plus any PK names a registered
+    search expansion returns. Returns (clause, params), or (None, []) when
+    there's nothing to match on. Same shape for list/count/adjacent so prev/next
+    tracks the searched list exactly."""
+    if not search:
+        return None, []
+    if not search_fields:
+        search_fields = document_search_columns(db, doctype_slug)
+    cols = db._get_table_columns(doctype)
+    like = f"%{search}%"
+    parts, params = [], []
+    for f in (search_fields or []):
+        if f in cols:
+            # CAST to text so non-text search_fields (e.g. an int/bool column a
+            # caller names) don't blow up Postgres with "lower(integer) does not
+            # exist" — matches the master path (_handle_search_masters, 2026-08-13).
+            parts.append(f'LOWER(CAST("{f}" AS TEXT)) LIKE LOWER(?)')
+            params.append(like)
+    extra = []
+    seen = set()
+    for fn in _SEARCH_EXPANSIONS.get(doctype_slug, []):
+        for pk in (fn(search, db) or []):
+            if pk and pk not in seen:
+                seen.add(pk)
+                extra.append(pk)
+    if extra:
+        parts.append(f'name IN ({",".join("?" for _ in extra)})')
+        params.extend(extra)
+    if not parts:
+        return None, []
+    return "(" + " OR ".join(parts) + ")", params
+
+
+def _exclude_discarded(db, doctype: str, db_filters: dict, include_discarded: bool) -> None:
+    """Hide voided drafts (discarded=1) unless explicitly requested. Guarded on
+    the column existing so non-submittable doctypes are unaffected."""
+    if include_discarded:
+        return
+    if "discarded" in db._get_table_columns(doctype) and "discarded" not in db_filters:
+        db_filters["discarded"] = 0
+
+
+def _order_clause(order_by: str = None, order: str = "desc") -> str:
+    """ORDER BY clause for list queries. Defaults to newest-created first.
+    `order_by`, when given, must already be a validated column name (the
+    documents router checks it against document_columns) — it is quoted here."""
+    if not isinstance(order, str) or order.lower() not in ("asc", "desc"):
+        raise ValueError("order must be 'asc' or 'desc'")
+    if not order_by:
+        return "creation DESC, name DESC"
+    direction = order.upper()
+    return f'"{order_by}" {direction}' + (f", name {direction}" if order_by != "name" else "")
+
+
+# --- Filter operators (safe, whitelisted) ---
+#
+# A list-style filter value is normally a scalar (equality), but it may also be
+# an operator form so callers can express inequality / range / NULL checks:
+#   {"amount": [">", 100]}   {"fit": ["!=", "A"]}
+#   {"fit": ["is null"]}     {"main_email": ["is not null"]}
+# The operator is looked up in this whitelist and NEVER interpolated from raw
+# caller input, so an operator filter can't inject SQL. (The column name is
+# validated separately against the doctype's real columns by the callers.)
+_FILTER_OPS = {
+    "=": "=", "==": "=", "!=": "!=", "<>": "!=",
+    ">": ">", "<": "<", ">=": ">=", "<=": "<=",
+    "like": "LIKE", "not like": "NOT LIKE",
+    "contains": "CONTAINS",
+    "in": "IN", "not in": "NOT IN",
+    "is null": "IS NULL", "is not null": "IS NOT NULL",
+}
+_NULLARY_OPS = {"IS NULL", "IS NOT NULL"}  # take no bound value
+
+# Max records a single batch write may touch (keeps one call bounded).
+_BATCH_MAX = 200
+
+
+def _resolve_op(raw) -> str:
+    op = _FILTER_OPS.get(str(raw).strip().lower())
+    if not op:
+        raise ValueError(
+            f"Unsupported filter operator: {raw!r} "
+            f"(allowed: {', '.join(sorted(set(_FILTER_OPS)))})"
+        )
+    return op
+
+
+def _filter_atom(col: str, value):
+    """Build (sql_clause, params) for one filter entry. `value` may be:
+      scalar      -> `"col" = ?`
+      [op, val]   -> `"col" <op> ?`            (op whitelisted)
+      [op]        -> `"col" IS [NOT] NULL`     (nullary op only)
+    Raises ValueError on an unknown operator or a malformed operator list — the
+    tool/REST layer surfaces that as a clean error rather than bad SQL."""
+    if isinstance(value, (list, tuple)):
+        if len(value) == 1:
+            op = _resolve_op(value[0])
+            if op not in _NULLARY_OPS:
+                raise ValueError(f"Filter operator {value[0]!r} requires a value")
+            return f'"{col}" {op}', []
+        if len(value) == 2:
+            op = _resolve_op(value[0])
+            if op in _NULLARY_OPS:
+                return f'"{col}" {op}', []  # value ignored for IS [NOT] NULL
+            if op in {"IN", "NOT IN"}:
+                values = value[1]
+                if not isinstance(values, (list, tuple)) or len(values) > 500 or any(isinstance(x, (dict, list, tuple)) or x is None for x in values):
+                    raise ValueError(f"{op} requires an array of at most 500 non-null scalar values")
+                if not values:
+                    return ("1=0" if op == "IN" else "1=1"), []
+                return f'"{col}" {op} (' + ", ".join("?" for _ in values) + ")", list(values)
+            if op == "CONTAINS":
+                # Literal, case-insensitive substring search. Escape LIKE's two
+                # wildcard characters so a user-entered '%' or '_' keeps its
+                # ordinary meaning. The REST layer only permits this operator
+                # for schema-confirmed text columns.
+                escaped = str(value[1]).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                return f'LOWER("{col}") LIKE LOWER(?) ESCAPE \'\\\'', [f"%{escaped}%"]
+            return f'"{col}" {op} ?', [value[1]]
+        raise ValueError(
+            f"Malformed filter for {col!r}: expected a scalar, [op], or [op, value]"
+        )
+    return f'"{col}" = ?', [value]
+
+
+def parse_list_filter(db, doctype: str, raw_key: str, value):
+    """Parse one REST list-filter query parameter.
+
+    Plain ``field=value`` parameters retain their historical equality
+    semantics. ``field__contains=value`` becomes the internal whitelisted
+    ``contains`` operator, but only when the live schema says ``field`` is a
+    text column. Unknown fields raise ``KeyError``; applying ``contains`` to a
+    non-text field raises ``TypeError``. Callers translate both into HTTP 400.
+    """
+    suffix = "__contains"
+    field = raw_key[:-len(suffix)] if raw_key.endswith(suffix) else raw_key
+    if not field or field not in db._get_table_columns(doctype):
+        raise KeyError(field or raw_key)
+    if raw_key.endswith(suffix):
+        if field not in db._get_text_columns(doctype):
+            raise TypeError(field)
+        return field, ("contains", value)
+    return field, value
+
+
+def _validate_typed_filters(db, doctype: str, filters: dict) -> None:
+    """Keep type-sensitive operators honest for REST, chat, and direct calls."""
+    text_columns = db._get_text_columns(doctype)
+    for field, value in filters.items():
+        if (
+            isinstance(value, (list, tuple))
+            and len(value) == 2
+            and str(value[0]).strip().lower() == "contains"
+            and field not in text_columns
+        ):
+            raise ValueError(f"Contains filter is only supported for text fields: {field}")
+
+
+def _where_from_filters(db_filters: dict):
+    """(where_parts, params) for a dict of already-parsed equality/operator
+    filters, via the whitelisted _filter_atom builder."""
+    where_parts, params = [], []
+    for k, v in db_filters.items():
+        clause, ps = _filter_atom(k, v)
+        where_parts.append(clause)
+        params.extend(ps)
+    return where_parts, params
+
+
+def _projection_columns(doctype_slug: str, fields) -> set:
+    """The set of real columns to keep for a `fields` projection — always
+    includes 'name'. Unknown field names are dropped (validated against the
+    doctype's real columns), so a projection can never widen or inject."""
+    real = document_columns(doctype_slug)
+    keep = {"name"}
+    for f in (fields or []):
+        if f in real:
+            keep.add(f)
+    return keep
+
+
+def list_documents(doctype_slug: str, filters: dict = None, limit: int = 50, offset: int = 0,
+                   include_discarded: bool = False, order_by: str = None, order: str = "desc",
+                   fields: list = None, time_filter: dict = None) -> list:
+    doctype = SLUG_TO_DOCTYPE.get(doctype_slug)
+    if not doctype:
+        raise ValueError(f"Unknown document type: {doctype_slug}")
+    db = get_db()
+    window = resolve_time_filter(db, doctype, time_filter)
+    where, params = _filter_where(db, doctype, doctype_slug, filters, include_discarded,
+                                  time_filter=window)
+    columns = db._get_table_columns(doctype)
+    if order_by and order_by not in columns:
+        raise ValueError(f"Unknown order_by field: {order_by}")
+    order_clause = _order_clause(order_by, order)
+    if window and (order_by is None or order_by == window["field"]):
+        order_clause = f'erp_timestamp_epoch("{window["field"]}") {order.upper()}, name {order.upper()}'
+    projection = ", ".join(f'"{x}"' for x in sorted(_projection_columns(doctype_slug, fields))) if fields else "*"
+    query = f'SELECT {projection} FROM "{doctype}"'
+    if where:
+        query += " WHERE " + " AND ".join(f"({x})" for x in where)
+    query += " ORDER BY " + order_clause
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(max(1, int(limit)))
+    if offset:
+        if limit is None and db.dialect == "sqlite":
+            query += " LIMIT -1"
+        query += " OFFSET ?"
+        params.append(max(0, int(offset)))
+    rows = db.sql(query, params)
+    return rows if fields else _attach_children(db, doctype_slug, rows)
+
+
+def list_document_page(doctype_slug: str, *, time_filter=None, **kwargs):
+    db = get_db()
+    doctype = SLUG_TO_DOCTYPE.get(doctype_slug)
+    if not doctype:
+        raise ValueError(f"Unknown document type: {doctype_slug}")
+    window = resolve_time_filter(db, doctype, time_filter)
+    rows = list_documents(doctype_slug, time_filter=window, **kwargs)
+    filters = kwargs.get("filters")
+    discarded = kwargs.get("include_discarded", False)
+    total = count_documents(doctype_slug, filters, discarded, time_filter=window)
+    unknown = 0
+    if window:
+        where, params = _filter_where(db, doctype, doctype_slug, filters, discarded)
+        unknown = time_quality(db, doctype, window, where, params)
+    return page_metadata(rows, total, kwargs.get("limit", 50), kwargs.get("offset", 0), window, unknown)
+
+
+# Exact list counts are cached per (doctype, filters). The count is the one O(N)
+# part of a list load — a full scan even with the creation index, since the
+# discard/search predicates aren't covered — and paging within a view repeats the
+# identical count. The cache stays EXACT (unlike a reltuples estimate, which would
+# make the page-jump "of N" bound approximate): every entry is tagged with the DB
+# write-generation, so any in-process write invalidates it immediately; the TTL is
+# only a backstop for cross-replica writes this process didn't see.
+_COUNT_CACHE: dict = {}
+_COUNT_CACHE_TTL = 60.0
+_COUNT_CACHE_MAX = 512
+
+
+def _count_cache_key(doctype_slug, filters, include_discarded):
+    items = tuple(sorted((k, str(v)) for k, v in (filters or {}).items()))
+    return (doctype_slug, items, bool(include_discarded))
+
+
+def invalidate_count_cache() -> None:
+    """Clear the list-count cache (writes already invalidate via the write-
+    generation; call this only to force-drop cross-replica staleness early)."""
+    _COUNT_CACHE.clear()
+
+
+def count_query_cached(query: str, params=None) -> int:
+    """Result of a single-column COUNT(*) query, cached per (query, params) with
+    the same policy as count_documents — until the next write (write-generation)
+    or the TTL. Lets the masters list share the exact-but-cached count."""
+    key = ("q", query, tuple(str(p) for p in (params or [])))
+    gen = get_write_generation()
+    now_mono = time.monotonic()
+    hit = _COUNT_CACHE.get(key)
+    if hit is not None and hit[1] == gen and now_mono - hit[0] < _COUNT_CACHE_TTL:
+        return hit[2]
+    rows = get_db().sql(query, params or [])
+    total = int(next(iter(rows[0].values()))) if rows else 0
+    if len(_COUNT_CACHE) >= _COUNT_CACHE_MAX:
+        _COUNT_CACHE.clear()
+    _COUNT_CACHE[key] = (now_mono, gen, total)
+    return total
+
+
+def master_search_columns(db, doctype: str) -> list:
+    """Text columns a free-text master-list search matches by default — schema-
+    discovered (a new text field becomes searchable automatically), minus audit
+    noise and large blobs. Shared by REST and chat/MCP."""
+    return _useful_text_columns(db, doctype)
+
+
+def master_bulk_text_columns(db, doctype: str) -> list[str]:
+    """Large text fields available for explicit search, but skipped by default."""
+    return sorted(
+        column for column in db._get_text_columns(doctype)
+        if is_bulk_text_column(column)
+    )
+
+
+def _master_sort_sql(column: str, direction: str) -> str:
+    sql = f'"{column}" {direction.upper()}'
+    if column != "name":
+        sql += f" NULLS LAST, name {direction.upper()}"
+    return sql
+
+
+def master_field_aliases(master_type: str) -> dict[str, str]:
+    """Registered virtual fields only; a real column always keeps its meaning."""
+    entry = MASTER_TABLES.get(master_type)
+    if not entry:
+        return {}
+    columns = get_db()._get_table_columns(entry[0])
+    alias = MASTER_IDENTITY_ALIAS.get(master_type)
+    return {alias: "name"} if alias and alias not in columns and "name" in columns else {}
+
+
+def resolve_master_filters(master_type: str, filters: dict) -> dict:
+    aliases = master_field_aliases(master_type)
+    resolved = {}
+    for key, value in filters.items():
+        column = aliases.get(key, key)
+        if column in resolved and resolved[column] != value:
+            raise ValueError(f"Conflicting filters for {column} and its alias")
+        resolved[column] = value
+    return resolved
+
+
+def list_master_records(
+    master_type: str,
+    *,
+    filters: dict | None = None,
+    search: str | None = None,
+    search_fields: list[str] | None = None,
+    include_disabled: bool = False,
+    order_by: str | None = None,
+    order: str = "asc",
+    limit: int | None = 50,
+    offset: int = 0,
+    fields: list[str] | None = None,
+    with_total: bool = True,
+    time_filter: dict | None = None,
+) -> dict:
+    """Deterministic master-list query shared by REST and chat/MCP.
+
+    Scalars are exact filters; the whitelisted operator forms accepted by
+    ``_filter_atom`` provide contains/comparison/NULL filtering. Free text is a
+    separate OR-group and is ANDed with those field filters.
+    """
+    entry = MASTER_TABLES.get(master_type)
+    if not entry:
+        raise ValueError(f"Unknown master type: {master_type}")
+    doctype, _ = entry
+    db = get_db()
+    window = resolve_time_filter(db, doctype, time_filter)
+    columns = db._get_table_columns(doctype)
+    text_fields = sorted(db._get_text_columns(doctype))
+    aliases = master_field_aliases(master_type)
+
+    db_filters = resolve_master_filters(master_type, {
+        key: value for key, value in (filters or {}).items()
+        if value is not None and value != ""
+    })
+    unknown_filters = [key for key in db_filters if key not in columns]
+    if unknown_filters:
+        raise ValueError(
+            f"Unknown filter column(s) for {master_type}: {', '.join(unknown_filters)}"
+        )
+    if window and window["field"] in db_filters:
+        raise ValueError("Do not combine time_filter with a filter on the same timestamp field")
+    _validate_typed_filters(db, doctype, db_filters)
+
+    where_parts, params = _where_from_filters(db_filters)
+    if not include_disabled and "disabled" in columns:
+        where_parts.insert(0, '"disabled" = ?')
+        params.insert(0, 0)
+
+    requested_search_fields = list(dict.fromkeys(aliases.get(field, field) for field in (search_fields or [])))
+    unknown_search = [field for field in requested_search_fields if field not in columns]
+    if unknown_search:
+        raise ValueError(f"Unknown search field(s): {', '.join(unknown_search)}")
+    effective_search_fields = requested_search_fields or master_search_columns(db, doctype)
+    search_where, search_params = _search_clause(
+        db, doctype, master_type, search, effective_search_fields,
+    )
+    if search_where:
+        where_parts.append(search_where)
+        params.extend(search_params)
+
+    sort_column = aliases.get(order_by, order_by) or "name"
+    if sort_column not in columns:
+        raise ValueError(f"Unknown order_by column for {master_type}: {sort_column}")
+    direction = str(order).lower()
+    if direction not in ("asc", "desc"):
+        raise ValueError("order must be 'asc' or 'desc'")
+
+    requested_aliases = {field: aliases[field] for field in (fields or []) if field in aliases}
+    requested_fields = list(dict.fromkeys(aliases.get(field, field) for field in (fields or [])))
+    unknown_fields = [field for field in requested_fields if field not in columns]
+    if unknown_fields:
+        raise ValueError(f"Unknown result field(s): {', '.join(unknown_fields)}")
+    if requested_fields:
+        if "name" not in requested_fields:
+            requested_fields.insert(0, "name")
+        projection = ", ".join(f'"{field}"' for field in requested_fields)
+    else:
+        projection = "*"
+    unknown = time_quality(db, doctype, window, where_parts, params) if window else 0
+    if window:
+        clause, bounds = time_predicate(window)
+        where_parts.append(clause)
+        params.extend(bounds)
+
+    where = " WHERE " + " AND ".join(where_parts) if where_parts else ""
+    total = (
+        count_query_cached(f'SELECT COUNT(*) AS c FROM "{doctype}"{where}', params)
+        if with_total else None
+    )
+    sort_sql = _master_sort_sql(sort_column, direction)
+    if window and (order_by is None or order_by == window["field"]):
+        sort_sql = f'erp_timestamp_epoch("{window["field"]}") {direction.upper()}, name {direction.upper()}'
+    query = (
+        f'SELECT {projection} FROM "{doctype}"{where} '
+        f'ORDER BY {sort_sql}'
+    )
+    if limit is not None:
+        query += f" LIMIT {max(1, int(limit))}"
+    elif offset and db.dialect == "sqlite":
+        query += " LIMIT -1"
+    if offset:
+        query += f" OFFSET {max(0, int(offset))}"
+
+    rows = db.sql(query, params)
+    for row in rows:
+        for alias, column in requested_aliases.items():
+            row[alias] = row[column]
+    result = page_metadata(rows, total, limit, max(0, int(offset)), window, unknown) if total is not None else {"rows": rows}
+    return {**result, "text_fields": text_fields}
+
+
+def count_documents(doctype_slug: str, filters: dict = None, include_discarded: bool = False, time_filter=None) -> int:
+    """Exact count of documents matching the filters, cached per filter-set until
+    the next write (write-generation) or the TTL, whichever comes first."""
+    if time_filter is not None:
+        # Resolve a moving window once and avoid caching it under a relative key.
+        return _count_documents_uncached(doctype_slug, filters, include_discarded, time_filter)
+    key = _count_cache_key(doctype_slug, filters, include_discarded)
+    gen = get_write_generation()
+    now_mono = time.monotonic()
+    hit = _COUNT_CACHE.get(key)
+    if hit is not None and hit[1] == gen and now_mono - hit[0] < _COUNT_CACHE_TTL:
+        return hit[2]
+    result = _count_documents_uncached(doctype_slug, filters, include_discarded)
+    if len(_COUNT_CACHE) >= _COUNT_CACHE_MAX:
+        _COUNT_CACHE.clear()
+    _COUNT_CACHE[key] = (now_mono, gen, result)
+    return result
+
+
+def _count_documents_uncached(doctype_slug: str, filters: dict = None, include_discarded: bool = False, time_filter=None) -> int:
+    doctype = SLUG_TO_DOCTYPE.get(doctype_slug)
+    if not doctype:
+        raise ValueError(f"Unknown document type: {doctype_slug}")
+    db = get_db()
+    where, params = _filter_where(db, doctype, doctype_slug, filters, include_discarded, time_filter=time_filter)
+    query = f'SELECT COUNT(*) AS c FROM "{doctype}"'
+    if where:
+        query += " WHERE " + " AND ".join(f"({x})" for x in where)
+    return int(db.sql(query, params)[0]["c"])
+
+
+def _filter_where(db, doctype: str, doctype_slug: str, filters: dict, include_discarded: bool, time_filter=None):
+    """Build (where_parts, params) for a doctype from a list-style `filters` dict
+    (equality filters + from_date/to_date on the doctype's date field + free-text
+    search + discard exclusion). Same semantics as list_documents/count_documents
+    so prev/next matches exactly what the list shows."""
+    db_filters, from_date, to_date, date_field_override = {}, None, None, None
+    search = search_fields = None
+    for key, value in (filters or {}).items():
+        if value is None or value == "":
+            continue
+        if key == "from_date":
+            from_date = value
+        elif key == "to_date":
+            to_date = value
+        elif key == "date_field":
+            date_field_override = value
+        elif key == "search":
+            search = value
+        elif key == "search_fields":
+            search_fields = value
+        else:
+            db_filters[key] = value
+    unknown = set(db_filters) - set(db._get_table_columns(doctype))
+    if unknown:
+        raise ValueError(f"Unknown filter fields: {', '.join(sorted(unknown))}")
+    window = resolve_time_filter(db, doctype, time_filter)
+    if window and (from_date or to_date or date_field_override or window["field"] in db_filters):
+        raise ValueError("Do not combine time_filter with legacy date filters or another filter on the same field")
+    _exclude_discarded(db, doctype, db_filters, include_discarded)
+    _validate_typed_filters(db, doctype, db_filters)
+
+    date_field = _resolve_date_field(db, doctype, date_field_override)
+    where_parts, params = [], []
+    if date_field and from_date:
+        where_parts.append(f'"{date_field}" >= ?'); params.append(from_date)
+    if date_field and to_date:
+        where_parts.append(f'"{date_field}" <= ?'); params.append(to_date)
+    fparts, fparams = _where_from_filters(db_filters)
+    where_parts.extend(fparts); params.extend(fparams)
+    search_where, search_params = _search_clause(db, doctype, doctype_slug, search, search_fields)
+    if search_where:
+        where_parts.append(search_where)
+        params.extend(search_params)
+    if window:
+        clause, bounds = time_predicate(window)
+        where_parts.append(clause)
+        params.extend(bounds)
+    return where_parts, params
+
+
+def adjacent_documents(doctype_slug: str, name: str, filters: dict = None,
+                       include_discarded: bool = False, order_by: str = None,
+                       order: str = "desc", time_filter=None) -> dict:
+    """The records immediately before/after `name` in the same order+filters the
+    list uses — {"prev": name|None, "next": name|None}. `prev` is one step *up*
+    the list (toward the top), `next` one step *down*. Keyset queries (indexed,
+    not a full scan). Order defaults to creation DESC (the list default), with
+    `name` as a stable tie-break so rows sharing an order value still step 1:1."""
+    doctype = SLUG_TO_DOCTYPE.get(doctype_slug)
+    if not doctype:
+        raise ValueError(f"Unknown document type: {doctype_slug}")
+    db = get_db()
+    cols = db._get_table_columns(doctype)
+    window = resolve_time_filter(db, doctype, time_filter)
+    _order_clause(order_by, order)
+    if order_by and order_by not in cols:
+        raise ValueError(f"Unknown order_by field: {order_by}")
+    oc = order_by or (window["field"] if window else "creation")
+    expression = f'"{oc}"'
+    if window and oc == window["field"]:
+        expression = f'erp_timestamp_epoch("{oc}")'
+    base_where, base_params = _filter_where(db, doctype, doctype_slug, filters or {}, include_discarded, time_filter=window)
+    base_clause = " AND ".join(f"({part})" for part in base_where) or "1=1"
+    desc = str(order).lower() != "asc"
+
+    cur = db.sql(f'SELECT {expression} AS oc FROM "{doctype}" WHERE ({base_clause}) AND name = ?', [*base_params, name])
+    if not cur:
+        return {"prev": None, "next": None}
+    cur_oc = cur[0]["oc"]
+
+    def neighbor(direction):
+        # DESC list: next = tuple < current, prev = tuple > current (ASC flips).
+        going_less = (direction == "next") == desc
+        cmp = "<" if going_less else ">"
+        dir_sql = "DESC" if going_less else "ASC"
+        keyset = f'(({expression} {cmp} ?) OR ({expression} = ? AND name {cmp} ?))'
+        query = (f'SELECT name FROM "{doctype}" WHERE '
+                 + " AND ".join(base_where + [keyset])
+                 + f' ORDER BY {expression} {dir_sql}, name {dir_sql} LIMIT 1')
+        rows = db.sql(query, base_params + [cur_oc, cur_oc, name])
+        return rows[0]["name"] if rows else None
+
+    return {"prev": neighbor("prev"), "next": neighbor("next")}
+
+
+def _list_with_offset(db, doctype, doctype_slug, db_filters, limit, offset, order_clause="creation DESC",
+                      extra_where=None, extra_params=None):
+    where_parts, params = _where_from_filters(db_filters)
+    if extra_where:
+        where_parts.append(extra_where)
+        params.extend(extra_params or [])
+    query = f'SELECT * FROM "{doctype}"'
+    if where_parts:
+        query += " WHERE " + " AND ".join(where_parts)
+    query += f" ORDER BY {order_clause}"
+    if limit:
+        query += f" LIMIT {int(limit)}"
+    if offset:
+        query += f" OFFSET {int(offset)}"
+    rows = db.sql(query, params)
+    return _attach_children(db, doctype_slug, rows)
+
+
+def _attach_children(db, doctype_slug: str, rows: list) -> list:
+    _, cls = get_document_class(doctype_slug)
+    result = []
+    for row in rows:
+        doc_dict = dict(row)
+        if cls and cls.CHILD_TABLES:
+            for table_name, (child_doctype, _) in cls.CHILD_TABLES.items():
+                children = db.get_all(
+                    child_doctype,
+                    filters={"parent": row["name"]},
+                    fields=["*"],
+                    order_by="idx",
+                )
+                doc_dict[table_name] = [dict(c) for c in children]
+        result.append(doc_dict)
+    return result
+
+
+def _list_with_date_range(db, doctype, doctype_slug, extra_filters, date_field, from_date, to_date, limit,
+                          offset=0, extra_where=None, extra_params=None):
+    """List documents when both from_date and to_date are set."""
+    where_parts = [f'"{date_field}" >= ?', f'"{date_field}" <= ?']
+    params = [from_date, to_date]
+    fparts, fparams = _where_from_filters(extra_filters)
+    where_parts.extend(fparts)
+    params.extend(fparams)
+    if extra_where:
+        where_parts.append(extra_where)
+        params.extend(extra_params or [])
+    query = (
+        f'SELECT * FROM "{doctype}" WHERE ' + " AND ".join(where_parts)
+        + " ORDER BY creation DESC"
+    )
+    if limit:
+        query += f" LIMIT {int(limit)}"
+    if offset:
+        query += f" OFFSET {int(offset)}"
+    rows = db.sql(query, params)
+    return _attach_children(db, doctype_slug, rows)

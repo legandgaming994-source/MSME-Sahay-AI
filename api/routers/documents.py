@@ -1,0 +1,297 @@
+"""Generic CRUD routes for all document types."""
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import Response
+from api.services import (
+    create_document,
+    load_document,
+    update_document,
+    submit_document,
+    cancel_document,
+    discard_document,
+    convert_document,
+    list_documents,
+    list_document_page,
+    count_documents,
+    document_columns,
+    adjacent_documents,
+    parse_list_filter,
+    SLUG_TO_DOCTYPE,
+)
+from api.pdf import generate_pdf
+from api.pdf_exports import create_pdf_export, get_pdf_export, pdf_content_disposition
+from api.auth import require_role
+from api.list_values import distinct_list_values
+from api.time_filters import request_time_filter
+from lambda_erp.database import get_db
+
+router = APIRouter(prefix="/documents", tags=["documents"])
+
+_viewer = Depends(require_role("viewer"))
+_manager = Depends(require_role("manager"))
+
+# Query params the list endpoint interprets itself — everything else is treated
+# as an ad-hoc field filter (validated against the doctype's columns). Plain
+# keys are exact; ``field__contains`` is available for real text columns.
+_LIST_RESERVED = {
+    "status", "party", "from_date", "to_date", "docstatus",
+    "include_discarded", "limit", "offset", "order_by", "order",
+    "date_field", "search", "search_fields", "fields", "time_filter",
+}
+
+
+@router.get("/{doctype_slug}/fields")
+def document_fields(doctype_slug: str, _user: dict = _viewer):
+    from api.services import document_field_metadata
+    return document_field_metadata(doctype_slug)
+
+
+@router.get("/{doctype_slug}")
+def list_docs(
+    doctype_slug: str,
+    request: Request,
+    status: str | None = None,
+    party: str | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    docstatus: int | None = None,
+    include_discarded: bool = False,
+    order_by: str | None = None,
+    order: str = "desc",
+    date_field: str | None = None,
+    search: str | None = None,
+    search_fields: str | None = None,
+    fields: str | None = None,
+    time_filter: str | None = None,
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    _user: dict = _viewer,
+):
+    filters = {}
+    if status:
+        filters["status"] = status
+    if docstatus is not None:
+        filters["docstatus"] = docstatus
+    if party:
+        filters["customer"] = party
+    if from_date:
+        filters["from_date"] = from_date
+    if to_date:
+        filters["to_date"] = to_date
+
+    # Ad-hoc filters: any remaining query param must name a real column, with an
+    # optional __contains suffix for schema-confirmed text columns.
+    columns = document_columns(doctype_slug)
+    doctype = SLUG_TO_DOCTYPE.get(doctype_slug)
+    for key, value in request.query_params.items():
+        if key in _LIST_RESERVED:
+            continue
+        try:
+            field, parsed_value = parse_list_filter(get_db(), doctype, key, value)
+        except KeyError:
+            raise HTTPException(status_code=400, detail=f"Unknown filter field: {key}")
+        except TypeError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Contains filter is only supported for text fields: {key}",
+            )
+        filters[field] = parsed_value
+
+    # Which column from_date/to_date filter on. The frontend passes its declared
+    # dateField so plugin doctypes get working date filters without a server-side
+    # map. Passed through untouched here; list_documents ignores it unless it's a
+    # real column (so a config with a synthetic dateField degrades to no date
+    # filter rather than 400-ing the whole list), and never interpolates it blind.
+    if date_field:
+        filters["date_field"] = date_field
+
+    # Free-text search across the doctype's declared search_fields (+ any
+    # registered related-table expansion). search_fields is a CSV validated to
+    # real columns, mirroring the arbitrary-filter / order_by contract.
+    if search:
+        filters["search"] = search
+        sf = [f.strip() for f in (search_fields or "").split(",") if f.strip()]
+        bad = [f for f in sf if f not in columns]
+        if bad:
+            raise HTTPException(status_code=400, detail=f"Unknown search field(s): {', '.join(bad)}")
+        if sf:
+            filters["search_fields"] = sf
+
+    if order_by is not None and order_by not in columns:
+        raise HTTPException(status_code=400, detail=f"Unknown order_by field: {order_by}")
+    if order.lower() not in ("asc", "desc"):
+        raise HTTPException(status_code=400, detail="order must be 'asc' or 'desc'")
+
+    # Column projection: the frontend sends the columns its list view renders, so
+    # a wide doctype doesn't ship every column for a few-column grid. This is
+    # ADVISORY — unknown columns are silently dropped, never a 400: the frontend
+    # appends display-only fields (currency, party_type) that not every doctype
+    # has, and a projection can only ever narrow the response (name is kept
+    # downstream), so an unknown field is harmless. (Contrast order_by/search_
+    # fields, which affect query correctness and stay strict.)
+    projection = None
+    if fields:
+        projection = [f.strip() for f in fields.split(",") if f.strip() and f.strip() in columns]
+
+    try:
+        result = list_document_page(
+            doctype_slug, filters=filters, limit=limit, offset=offset,
+            include_discarded=include_discarded, order_by=order_by, order=order,
+            fields=projection, time_filter=request_time_filter(request),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {**result, "text_fields": sorted(get_db()._get_text_columns(doctype))}
+
+
+@router.get("/{doctype_slug}/{name}/adjacent")
+def adjacent_doc(
+    doctype_slug: str,
+    name: str,
+    request: Request,
+    status: str | None = None,
+    party: str | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    docstatus: int | None = None,
+    include_discarded: bool = False,
+    order_by: str | None = None,
+    order: str = "desc",
+    date_field: str | None = None,
+    search: str | None = None,
+    search_fields: str | None = None,
+    _user: dict = _viewer,
+):
+    """Prev/next record around `name` in the same order+filters the list uses.
+    Returns {"prev": name|None, "next": name|None}. Filters mirror the list
+    endpoint so navigation stays within the list the user came from."""
+    filters = {}
+    if status:
+        filters["status"] = status
+    if docstatus is not None:
+        filters["docstatus"] = docstatus
+    if party:
+        filters["customer"] = party
+    if from_date:
+        filters["from_date"] = from_date
+    if to_date:
+        filters["to_date"] = to_date
+    columns = document_columns(doctype_slug)
+    doctype = SLUG_TO_DOCTYPE.get(doctype_slug)
+    for key, value in request.query_params.items():
+        if key in _LIST_RESERVED:
+            continue
+        try:
+            field, parsed_value = parse_list_filter(get_db(), doctype, key, value)
+        except KeyError:
+            raise HTTPException(status_code=400, detail=f"Unknown filter field: {key}")
+        except TypeError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Contains filter is only supported for text fields: {key}",
+            )
+        filters[field] = parsed_value
+    if date_field:
+        filters["date_field"] = date_field
+    if search:
+        filters["search"] = search
+        fields = [f.strip() for f in (search_fields or "").split(",") if f.strip()]
+        bad = [f for f in fields if f not in columns]
+        if bad:
+            raise HTTPException(status_code=400, detail=f"Unknown search field(s): {', '.join(bad)}")
+        if fields:
+            filters["search_fields"] = fields
+    if order_by is not None and order_by not in columns:
+        raise HTTPException(status_code=400, detail=f"Unknown order_by field: {order_by}")
+    if order.lower() not in ("asc", "desc"):
+        raise HTTPException(status_code=400, detail="order must be 'asc' or 'desc'")
+    try:
+        return adjacent_documents(doctype_slug, name, filters=filters,
+                                  include_discarded=include_discarded, order_by=order_by, order=order,
+                                  time_filter=request_time_filter(request))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/{doctype_slug}/search")
+def search_docs(doctype_slug: str, q: str = "", limit: int = Query(default=10, le=50), _user: dict = _viewer):
+    docs = list_documents(doctype_slug, limit=limit)
+    if q:
+        docs = [d for d in docs if q.lower() in d.get("name", "").lower()]
+    return [{"name": d["name"]} for d in docs]
+
+
+@router.get("/{doctype_slug}/filter-values")
+def document_filter_values(
+    doctype_slug: str,
+    field: str,
+    q: str = "",
+    limit: int = Query(default=200, ge=1, le=200),
+    _user: dict = _viewer,
+):
+    """Distinct values for the generic list's field autocomplete."""
+    from api.services import SLUG_TO_DOCTYPE
+
+    doctype = SLUG_TO_DOCTYPE.get(doctype_slug)
+    if not doctype:
+        raise HTTPException(status_code=404, detail=f"Unknown document type: {doctype_slug}")
+    try:
+        values = distinct_list_values(get_db(), doctype, field, q, limit)
+    except KeyError:
+        raise HTTPException(status_code=400, detail=f"Unknown field: {field}")
+    return {"values": values}
+
+
+@router.post("/{doctype_slug}/{name}/pdf")
+def export_pdf(doctype_slug: str, name: str, _user: dict = _viewer):
+    return create_pdf_export(doctype_slug, name, _user)
+
+
+@router.get("/{doctype_slug}/{name}/pdf")
+def get_pdf(doctype_slug: str, name: str, artifact_id: str | None = None, _user: dict = _viewer):
+    pdf_bytes = get_pdf_export(artifact_id, doctype_slug, name, _user) if artifact_id else generate_pdf(doctype_slug, name)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": pdf_content_disposition(name)},
+    )
+
+
+@router.get("/{doctype_slug}/{name}")
+def get_doc(doctype_slug: str, name: str, _user: dict = _viewer):
+    return load_document(doctype_slug, name)
+
+
+@router.post("/{doctype_slug}")
+def create_doc(doctype_slug: str, data: dict, _user: dict = _manager):
+    return create_document(doctype_slug, data)
+
+
+@router.put("/{doctype_slug}/{name}")
+def update_doc(doctype_slug: str, name: str, data: dict, _user: dict = _manager):
+    return update_document(doctype_slug, name, data)
+
+
+@router.post("/{doctype_slug}/{name}/submit")
+def submit_doc(doctype_slug: str, name: str, _user: dict = _manager):
+    return submit_document(doctype_slug, name)
+
+
+@router.post("/{doctype_slug}/{name}/cancel")
+def cancel_doc(doctype_slug: str, name: str, _user: dict = _manager):
+    return cancel_document(doctype_slug, name)
+
+
+@router.post("/{doctype_slug}/{name}/discard")
+def discard_doc(doctype_slug: str, name: str, _user: dict = _manager):
+    """Void an unwanted draft (soft delete — kept for the audit trail, hidden
+    from default lists). Only valid on drafts; submitted docs must be cancelled."""
+    return discard_document(doctype_slug, name)
+
+
+@router.post("/{doctype_slug}/{name}/convert")
+def convert_doc(doctype_slug: str, name: str, data: dict, _user: dict = _manager):
+    target = data.get("target_doctype")
+    if not target:
+        return {"detail": "target_doctype is required"}
+    return convert_document(doctype_slug, name, target)

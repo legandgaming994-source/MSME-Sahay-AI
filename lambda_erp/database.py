@@ -1,0 +1,2966 @@
+"""
+Lightweight SQLite database layer replacing the framework's database abstraction.
+
+the framework uses framework.db.sql(), framework.db.get_value(), framework.db.get_all(), etc.
+backed by MariaDB. This module provides the same interface on top of SQLite,
+so the ported business logic can call db.get_value(...) the same way.
+
+Schema is created from Python table definitions instead of DocType JSON files.
+"""
+
+import datetime as _datetime
+import os
+import sqlite3
+import threading
+from contextlib import contextmanager
+from lambda_erp.utils import _dict, now
+from lambda_erp.timestamps import timestamp_epoch, POSTGRES_TIMESTAMP_FUNCTION
+
+
+_TIMED_MASTERS = {"Customer", "Supplier", "Item", "Warehouse", "Account", "Company", "Cost Center"}
+
+
+_VALID_JOURNAL_MODES = {"WAL", "DELETE", "TRUNCATE", "PERSIST", "MEMORY", "OFF"}
+
+
+def _journal_mode() -> str:
+    """SQLite journal mode for connections, from LAMBDA_ERP_SQLITE_JOURNAL_MODE.
+
+    Defaults to WAL — best for a local-disk DB (concurrent readers alongside a
+    writer). But WAL relies on a memory-mapped ``-shm`` file, so it does NOT work
+    on a network filesystem (SMB/NFS Azure Files, NFS mounts): the
+    ``PRAGMA journal_mode=WAL`` itself fails with "database is locked". A
+    deployment whose DB lives on such a share must set
+    ``LAMBDA_ERP_SQLITE_JOURNAL_MODE=DELETE`` — rollback-journal mode, which uses
+    only the byte-range locks the share does support. A single-writer deployment
+    (one replica, one worker) loses nothing by using DELETE. Unknown values fall
+    back to WAL. The value is validated against an allowlist before being
+    interpolated into the PRAGMA.
+    """
+    mode = os.environ.get("LAMBDA_ERP_SQLITE_JOURNAL_MODE", "WAL").strip().upper()
+    return mode if mode in _VALID_JOURNAL_MODES else "WAL"
+
+
+def _is_postgres_dsn(db_path) -> bool:
+    """A db_path that looks like a Postgres connection URL selects Postgres;
+    anything else (a file path or ':memory:') stays on SQLite. This is how
+    LAMBDA_ERP_DB doubles as the backend switch — no separate env var."""
+    return isinstance(db_path, str) and db_path.startswith(("postgresql://", "postgres://"))
+
+
+# ---------------------------------------------------------------------------
+# Postgres adapter
+#
+# The whole codebase was written against sqlite3: `?` placeholders,
+# `conn.execute(sql, params) -> cursor`, and `sqlite3.Row` rows that support
+# BOTH positional (row[0]) and mapping (row["x"], dict(row)) access. Rather
+# than rewrite every call site, we make a psycopg connection quack like that:
+#   * _PgConn translates `?`->`%s` and forwards execute/executemany/commit/...
+#   * _PgRow mirrors sqlite3.Row's dual access so get_value/sql/migrations and
+#     the external `db.conn.execute(...)` users keep working untouched.
+# ---------------------------------------------------------------------------
+
+class _PgRow:
+    """Row that mimics sqlite3.Row: positional and by-name access, dict(row),
+    and tuple(row) -> values."""
+
+    __slots__ = ("_cols", "_vals")
+
+    def __init__(self, cols, vals):
+        self._cols = cols
+        self._vals = vals
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._vals[key]
+        return self._vals[self._cols.index(key)]
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except (KeyError, ValueError, IndexError):
+            return default
+
+    def keys(self):
+        return list(self._cols)
+
+    def __iter__(self):
+        return iter(self._vals)  # tuple(row) -> values, like sqlite3.Row
+
+    def __len__(self):
+        return len(self._vals)
+
+
+def _pg_row_factory(cursor):
+    cols = [c.name for c in (cursor.description or [])]
+
+    def make(values):
+        return _PgRow(cols, values)
+
+    return make
+
+
+_write_generation = 0
+
+
+def _stmt_is_read(sql: str) -> bool:
+    s = sql.lstrip().lower()
+    return s.startswith("select") and "for update" not in s and "for share" not in s
+
+
+def _note_write(sql: str) -> None:
+    """Bump the process write-generation on any non-SELECT statement. The list
+    count cache keys on it, so an in-process write invalidates cached counts at
+    once (cross-process staleness stays bounded by the cache TTL)."""
+    global _write_generation
+    if not _stmt_is_read(sql):
+        _write_generation += 1
+
+
+def get_write_generation() -> int:
+    """Monotonic per-process write counter — see _note_write."""
+    return _write_generation
+
+
+class _PgConn:
+    """Adapts a psycopg (v3) connection to the sqlite3 connection API the code
+    uses. autocommit is off so the existing `_in_transaction` + single commit()
+    / rollback() flow gives the same atomicity as SQLite's implicit transaction.
+
+    With autocommit off, even a plain SELECT opens a transaction that stays
+    open until commit/rollback — and these thread-local connections live as
+    long as their (pooled) thread, so a request whose last statement was a read
+    left the connection 'idle in transaction' forever, pinning ACCESS SHARE
+    locks on every table it touched. That starves any ALTER TABLE of its
+    ACCESS EXCLUSIVE lock, which made lock-safe plugin migrations time out on
+    every boot in production. The fix: after a read, when there is no pending
+    write and no explicit transaction, end the implicit transaction right away
+    (_maybe_release), so connections never idle inside one."""
+
+    def __init__(self, raw, in_explicit_txn=None):
+        self._raw = raw
+        self._dirty = False  # uncommitted write on this connection
+        self._in_explicit_txn = in_explicit_txn or (lambda: False)
+
+    @staticmethod
+    def _is_read(sql):
+        s = sql.lstrip().lower()
+        return s.startswith("select") and "for update" not in s and "for share" not in s
+
+    def _maybe_release(self, sql):
+        if self._in_explicit_txn():
+            return
+        if self._is_read(sql):
+            # psycopg's default cursor has already buffered the full result set
+            # client-side, so the caller can still fetch after the rollback.
+            if not self._dirty:
+                self._safe_rollback()
+        else:
+            self._dirty = True
+
+    def execute(self, sql, params=None):
+        try:
+            cur = self._raw.cursor()
+            if params:
+                # psycopg does %-substitution when params are given, so a literal
+                # % must be doubled. No params -> psycopg leaves the SQL
+                # untouched, so literal % is already safe and needs no escaping.
+                cur.execute(sql.replace("%", "%%").replace("?", "%s"), list(params))
+            else:
+                cur.execute(sql.replace("?", "%s"))
+        except Exception:
+            # A failed statement leaves the connection in an aborted transaction
+            # (autocommit=False); every later query on this pooled/thread-local
+            # connection would then fail with InFailedSqlTransaction. Roll back
+            # so the connection stays usable, unless an explicit transaction
+            # owner must roll back to its savepoint (or roll back the whole unit).
+            if not self._in_explicit_txn():
+                self._safe_rollback()
+            raise
+        self._maybe_release(sql)
+        _note_write(sql)
+        return cur
+
+    def executemany(self, sql, seq_params):
+        try:
+            cur = self._raw.cursor()
+            cur.executemany(sql.replace("%", "%%").replace("?", "%s"),
+                            [list(p) for p in seq_params])
+        except Exception:
+            if not self._in_explicit_txn():
+                self._safe_rollback()
+            raise
+        self._dirty = True
+        _note_write(sql)
+        return cur
+
+    def _safe_rollback(self):
+        try:
+            self._raw.rollback()
+            self._dirty = False
+        except Exception:
+            pass
+
+    def commit(self):
+        self._raw.commit()
+        self._dirty = False
+
+    def rollback(self):
+        self._raw.rollback()
+        self._dirty = False
+
+    def close(self):
+        self._raw.close()
+
+    def cursor(self, *args, **kwargs):
+        return self._raw.cursor(*args, **kwargs)
+
+
+class _SqliteConn(sqlite3.Connection):
+    """SQLite connection that bumps the write-generation like _PgConn does, so the
+    list count cache invalidates on writes under both backends (SQLite is a raw
+    connection where Postgres is wrapped)."""
+
+    def execute(self, sql, *args, **kwargs):
+        _note_write(sql)
+        return super().execute(sql, *args, **kwargs)
+
+    def executemany(self, sql, *args, **kwargs):
+        _note_write(sql)
+        return super().executemany(sql, *args, **kwargs)
+
+
+class _NullLock:
+    """No-op context manager used when SQLite-level locking is sufficient."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class Database:
+    def __init__(self, db_path=":memory:"):
+        # Concurrency model:
+        # - File DBs: one sqlite3 connection per thread (thread-local), so the
+        #   process can serve many WebSocket users without serializing every
+        #   read behind a single Python lock. WAL allows concurrent readers
+        #   plus one writer; busy_timeout makes the writer wait briefly
+        #   instead of erroring with SQLITE_BUSY.
+        # - :memory: DBs (tests): each fresh sqlite connection to ":memory:"
+        #   is a separate empty database, so we keep one shared connection
+        #   guarded by a Python lock.
+        self.db_path = db_path
+        self.dialect = "postgres" if _is_postgres_dsn(db_path) else "sqlite"
+        # :memory: is a SQLite-only concept (Postgres is always a server).
+        self._is_memory = (db_path == ":memory:")
+        self._local = threading.local()
+        self._col_cache = {}  # doctype -> set(columns); invalidated on ALTER
+        self._text_col_cache = {}  # doctype -> set(text columns); invalidated on ALTER
+        if self._is_memory:
+            self._lock = threading.RLock()
+            self._shared_conn = self._open_conn()
+            self._shared_in_transaction = False
+        else:
+            self._lock = _NullLock()
+            self._shared_conn = None
+            # Open the init-thread connection now so _setup_schema can use it
+            # via the self.conn property.
+            self._open_conn()
+        self._setup_schema()
+
+    def _open_conn(self):
+        """Open a new connection (per-backend) with the same per-conn settings.
+
+        For file/Postgres DBs the connection is stored on thread-local state so
+        the same thread reuses it; for :memory: it is returned and held as the
+        shared connection. Returns the object the `conn` property hands out:
+        the raw sqlite3 connection, or a _PgConn wrapper for Postgres.
+        """
+        conn = self._open_pg_conn() if self.dialect == "postgres" else self._open_sqlite_conn()
+        if not self._is_memory:
+            self._local.conn = conn
+            self._local.in_transaction = False
+        return conn
+
+    def _open_sqlite_conn(self):
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, factory=_SqliteConn)
+        conn.row_factory = sqlite3.Row
+        conn.create_function("erp_timestamp_epoch", 1, timestamp_epoch, deterministic=True)
+        conn.execute(f"PRAGMA journal_mode={_journal_mode()}")
+        conn.execute("PRAGMA foreign_keys=ON")
+        # Wait up to 5s for the file lock instead of raising SQLITE_BUSY when
+        # another thread is mid-write. Generous for our workload (LLM calls
+        # dwarf any DB write).
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+
+    def _open_pg_conn(self):
+        # psycopg is only needed for the Postgres backend; import lazily so a
+        # SQLite-only install (tests, local dev) doesn't require the driver.
+        import psycopg
+
+        # autocommit off: matches SQLite's implicit transaction so the existing
+        # _in_transaction + commit()/rollback() atomicity (GL submit/cancel) is
+        # preserved exactly. in_explicit_txn lets the wrapper see the
+        # thread-local flag so reads inside submit/cancel keep their snapshot.
+        return _PgConn(psycopg.connect(self.db_path, autocommit=False,
+                                       row_factory=_pg_row_factory),
+                       in_explicit_txn=lambda: self._in_transaction)
+
+    @property
+    def conn(self):
+        if self._is_memory:
+            return self._shared_conn
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = self._open_conn()
+        return conn
+
+    @property
+    def _in_transaction(self):
+        if self._is_memory:
+            return self._shared_in_transaction
+        return getattr(self._local, "in_transaction", False)
+
+    @_in_transaction.setter
+    def _in_transaction(self, value):
+        if self._is_memory:
+            self._shared_in_transaction = value
+        else:
+            self._local.in_transaction = value
+
+    def _setup_schema(self):
+        """Create all core ERP tables.
+
+        In the framework/the reference implementation, tables are auto-generated from DocType JSON.
+        Here we define them explicitly, matching the essential columns
+        that the business logic depends on.
+        """
+        stmts = [
+            # --- Master data ---
+            """CREATE TABLE IF NOT EXISTS "Company" (
+                name TEXT PRIMARY KEY,
+                company_name TEXT,
+                disabled INTEGER DEFAULT 0,
+                default_currency TEXT DEFAULT 'USD',
+                email TEXT,
+                phone TEXT,
+                address TEXT,
+                city TEXT,
+                zip_code TEXT,
+                country TEXT,
+                tax_id TEXT,
+                iban TEXT,
+                default_cost_center TEXT,
+                round_off_account TEXT,
+                round_off_cost_center TEXT,
+                default_receivable_account TEXT,
+                default_payable_account TEXT,
+                default_income_account TEXT,
+                default_expense_account TEXT,
+                stock_received_but_not_billed TEXT,
+                stock_in_hand_account TEXT,
+                stock_adjustment_account TEXT,
+                default_opening_balance_equity TEXT,
+                accumulated_depreciation_account TEXT,
+                depreciation_expense_account TEXT,
+                default_freight_in_account TEXT,
+                default_customs_account TEXT,
+                default_exchange_gain_loss_account TEXT,
+                default_unrealized_exchange_account TEXT,
+                proposal_cover_template TEXT
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "Account" (
+                name TEXT PRIMARY KEY,
+                account_name TEXT NOT NULL,
+                parent_account TEXT,
+                company TEXT,
+                root_type TEXT,  -- Asset, Liability, Equity, Income, Expense
+                report_type TEXT,  -- Balance Sheet, Profit and Loss
+                account_type TEXT,  -- Receivable, Payable, Bank, Cash, Stock, etc.
+                account_currency TEXT DEFAULT 'USD',
+                is_group INTEGER DEFAULT 0,
+                disabled INTEGER DEFAULT 0,
+                lft INTEGER DEFAULT 0,
+                rgt INTEGER DEFAULT 0,
+                FOREIGN KEY (company) REFERENCES "Company"(name)
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "Cost Center" (
+                name TEXT PRIMARY KEY,
+                cost_center_name TEXT NOT NULL,
+                company TEXT,
+                parent_cost_center TEXT,
+                is_group INTEGER DEFAULT 0,
+                disabled INTEGER DEFAULT 0,
+                FOREIGN KEY (company) REFERENCES "Company"(name)
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "Customer" (
+                name TEXT PRIMARY KEY,
+                customer_name TEXT NOT NULL,
+                disabled INTEGER DEFAULT 0,
+                customer_group TEXT,
+                territory TEXT,
+                default_currency TEXT DEFAULT 'USD',
+                default_price_list TEXT,
+                credit_limit REAL DEFAULT 0,
+                website TEXT,
+                email TEXT,
+                phone TEXT,
+                address TEXT,
+                city TEXT,
+                zip_code TEXT,
+                country TEXT,
+                tax_id TEXT,
+                contact_person TEXT,
+                contact_email TEXT,
+                contact_phone TEXT
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "Supplier" (
+                name TEXT PRIMARY KEY,
+                supplier_name TEXT NOT NULL,
+                disabled INTEGER DEFAULT 0,
+                supplier_group TEXT,
+                default_currency TEXT DEFAULT 'USD',
+                email TEXT,
+                phone TEXT,
+                address TEXT,
+                city TEXT,
+                zip_code TEXT,
+                country TEXT,
+                tax_id TEXT
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "Item" (
+                name TEXT PRIMARY KEY,
+                item_name TEXT NOT NULL,
+                disabled INTEGER DEFAULT 0,
+                item_group TEXT,
+                stock_uom TEXT DEFAULT 'Nos',
+                is_stock_item INTEGER DEFAULT 1,
+                is_fixed_asset INTEGER DEFAULT 0,
+                is_asset_tracked INTEGER DEFAULT 0,
+                valuation_method TEXT DEFAULT 'FIFO',
+                default_warehouse TEXT,
+                standard_rate REAL DEFAULT 0,
+                description TEXT
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "Warehouse" (
+                name TEXT PRIMARY KEY,
+                warehouse_name TEXT NOT NULL,
+                company TEXT,
+                parent_warehouse TEXT,
+                is_group INTEGER DEFAULT 0,
+                disabled INTEGER DEFAULT 0,
+                account TEXT,
+                address TEXT,
+                city TEXT,
+                zip_code TEXT,
+                country TEXT,
+                FOREIGN KEY (company) REFERENCES "Company"(name)
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "Fiscal Year" (
+                name TEXT PRIMARY KEY,
+                year_start_date TEXT,
+                year_end_date TEXT,
+                company TEXT
+            )""",
+
+            # --- Tax templates ---
+            """CREATE TABLE IF NOT EXISTS "Tax Template" (
+                name TEXT PRIMARY KEY,
+                title TEXT,
+                company TEXT,
+                tax_type TEXT  -- 'Sales' or 'Purchase'
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "Tax Template Detail" (
+                name TEXT PRIMARY KEY,
+                parent TEXT,
+                charge_type TEXT DEFAULT 'On Net Total',
+                account_head TEXT,
+                rate REAL DEFAULT 0,
+                description TEXT,
+                idx INTEGER DEFAULT 0,
+                FOREIGN KEY (parent) REFERENCES "Tax Template"(name)
+            )""",
+
+            # --- GL Entry (the heart of accounting) ---
+            """CREATE TABLE IF NOT EXISTS "GL Entry" (
+                name TEXT PRIMARY KEY,
+                posting_date TEXT NOT NULL,
+                account TEXT NOT NULL,
+                party_type TEXT,
+                party TEXT,
+                cost_center TEXT,
+                debit REAL DEFAULT 0,
+                credit REAL DEFAULT 0,
+                debit_in_account_currency REAL DEFAULT 0,
+                credit_in_account_currency REAL DEFAULT 0,
+                account_currency TEXT DEFAULT 'USD',
+                voucher_type TEXT,
+                voucher_no TEXT,
+                against_voucher_type TEXT,
+                against_voucher TEXT,
+                remarks TEXT,
+                is_opening TEXT DEFAULT 'No',
+                is_cancelled INTEGER DEFAULT 0,
+                company TEXT,
+                fiscal_year TEXT,
+                creation TEXT,
+                modified TEXT
+            )""",
+
+            # --- Stock Ledger Entry (the heart of inventory) ---
+            """CREATE TABLE IF NOT EXISTS "Stock Ledger Entry" (
+                name TEXT PRIMARY KEY,
+                posting_date TEXT NOT NULL,
+                posting_time TEXT DEFAULT '00:00:00',
+                item_code TEXT NOT NULL,
+                warehouse TEXT NOT NULL,
+                actual_qty REAL DEFAULT 0,
+                qty_after_transaction REAL DEFAULT 0,
+                incoming_rate REAL DEFAULT 0,
+                outgoing_rate REAL DEFAULT 0,
+                valuation_rate REAL DEFAULT 0,
+                stock_value REAL DEFAULT 0,
+                stock_value_difference REAL DEFAULT 0,
+                voucher_type TEXT,
+                voucher_no TEXT,
+                voucher_detail_no TEXT,
+                batch_no TEXT,
+                serial_no TEXT,
+                company TEXT,
+                is_cancelled INTEGER DEFAULT 0,
+                creation TEXT,
+                modified TEXT
+            )""",
+
+            # --- Bin (current stock summary per item+warehouse) ---
+            """CREATE TABLE IF NOT EXISTS "Bin" (
+                name TEXT PRIMARY KEY,
+                item_code TEXT NOT NULL,
+                warehouse TEXT NOT NULL,
+                actual_qty REAL DEFAULT 0,
+                ordered_qty REAL DEFAULT 0,
+                reserved_qty REAL DEFAULT 0,
+                projected_qty REAL DEFAULT 0,
+                valuation_rate REAL DEFAULT 0,
+                stock_value REAL DEFAULT 0,
+                UNIQUE(item_code, warehouse)
+            )""",
+
+            # --- Quotation (offer / proposal) ---
+            """CREATE TABLE IF NOT EXISTS "Quotation" (
+                name TEXT PRIMARY KEY,
+                customer TEXT,
+                customer_name TEXT,
+                transaction_date TEXT,
+                valid_till TEXT,
+                company TEXT,
+                currency TEXT DEFAULT 'USD',
+                conversion_rate REAL DEFAULT 1.0,
+                total_qty REAL DEFAULT 0,
+                total REAL DEFAULT 0,
+                net_total REAL DEFAULT 0,
+                base_total REAL DEFAULT 0,
+                base_net_total REAL DEFAULT 0,
+                base_grand_total REAL DEFAULT 0,
+                grand_total REAL DEFAULT 0,
+                total_taxes_and_charges REAL DEFAULT 0,
+                discount_amount REAL DEFAULT 0,
+                apply_discount_on TEXT DEFAULT 'Grand Total',
+                remarks TEXT,
+                status TEXT DEFAULT 'Draft',
+                docstatus INTEGER DEFAULT 0,
+                discarded INTEGER DEFAULT 0,
+                creation TEXT,
+                modified TEXT,
+                ignore_pricing_rule INTEGER DEFAULT 0,
+                external_source TEXT,
+                external_reference TEXT
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "Quotation Item" (
+                name TEXT PRIMARY KEY,
+                parent TEXT,
+                idx INTEGER DEFAULT 0,
+                item_code TEXT,
+                item_name TEXT,
+                description TEXT,
+                frequency TEXT DEFAULT 'One-time',
+                qty REAL DEFAULT 0,
+                uom TEXT DEFAULT 'Nos',
+                rate REAL DEFAULT 0,
+                price_list_rate REAL DEFAULT 0,
+                discount_percentage REAL DEFAULT 0,
+                discount_amount REAL DEFAULT 0,
+                amount REAL DEFAULT 0,
+                net_rate REAL DEFAULT 0,
+                net_amount REAL DEFAULT 0,
+                base_rate REAL DEFAULT 0,
+                base_amount REAL DEFAULT 0,
+                base_net_rate REAL DEFAULT 0,
+                base_net_amount REAL DEFAULT 0,
+                warehouse TEXT,
+                ignore_pricing_rule INTEGER DEFAULT 0,
+                external_line_reference TEXT,
+                pricing_rule TEXT,
+                FOREIGN KEY (parent) REFERENCES "Quotation"(name)
+            )""",
+
+            # --- Proposal (Sammelofferte) ---
+            # A print-only assembly of several independent Quotations into one
+            # branded PDF. No docstatus lifecycle that posts anything: it never
+            # touches the quotations it references. `discarded` lets a saved
+            # proposal be soft-deleted like other documents.
+            """CREATE TABLE IF NOT EXISTS "Proposal" (
+                name TEXT PRIMARY KEY,
+                title TEXT,
+                customer TEXT,
+                customer_name TEXT,
+                company TEXT,
+                proposal_date TEXT,
+                partner_name TEXT,
+                partner_email TEXT,
+                cover_letter TEXT,
+                appendix_filename TEXT,
+                status TEXT DEFAULT 'Draft',
+                docstatus INTEGER DEFAULT 0,
+                discarded INTEGER DEFAULT 0,
+                creation TEXT,
+                modified TEXT,
+                FOREIGN KEY (customer) REFERENCES "Customer"(name)
+            )""",
+
+            # Each row references one independent Quotation, rendered as a
+            # lettered position (A, B, C…) in the combined PDF. position_title /
+            # position_blurb are per-proposal copy; is_recommended draws the badge.
+            """CREATE TABLE IF NOT EXISTS "Proposal Item" (
+                name TEXT PRIMARY KEY,
+                parent TEXT,
+                idx INTEGER DEFAULT 0,
+                quotation TEXT,
+                position_title TEXT,
+                position_blurb TEXT,
+                is_recommended INTEGER DEFAULT 0,
+                FOREIGN KEY (parent) REFERENCES "Proposal"(name)
+            )""",
+
+            # The optional uploaded appendix PDF (e.g. a static price overview),
+            # stored as a blob so it survives container restarts (the app disk is
+            # ephemeral). 1:1 with a Proposal; kept out of the Proposal row so the
+            # generic document CRUD/list never has to serialise bytes.
+            """CREATE TABLE IF NOT EXISTS "Proposal Appendix" (
+                parent TEXT PRIMARY KEY,
+                filename TEXT,
+                data BLOB,
+                uploaded TEXT,
+                FOREIGN KEY (parent) REFERENCES "Proposal"(name)
+            )""",
+
+            # --- Sales Order ---
+            """CREATE TABLE IF NOT EXISTS "Sales Order" (
+                name TEXT PRIMARY KEY,
+                customer TEXT,
+                customer_name TEXT,
+                transaction_date TEXT,
+                delivery_date TEXT,
+                company TEXT,
+                currency TEXT DEFAULT 'USD',
+                conversion_rate REAL DEFAULT 1.0,
+                total_qty REAL DEFAULT 0,
+                total REAL DEFAULT 0,
+                net_total REAL DEFAULT 0,
+                base_total REAL DEFAULT 0,
+                base_net_total REAL DEFAULT 0,
+                base_grand_total REAL DEFAULT 0,
+                grand_total REAL DEFAULT 0,
+                total_taxes_and_charges REAL DEFAULT 0,
+                discount_amount REAL DEFAULT 0,
+                apply_discount_on TEXT DEFAULT 'Grand Total',
+                per_delivered REAL DEFAULT 0,
+                per_billed REAL DEFAULT 0,
+                remarks TEXT,
+                status TEXT DEFAULT 'Draft',
+                docstatus INTEGER DEFAULT 0,
+                discarded INTEGER DEFAULT 0,
+                creation TEXT,
+                modified TEXT,
+                ignore_pricing_rule INTEGER DEFAULT 0,
+                external_source TEXT,
+                external_reference TEXT
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "Sales Order Item" (
+                name TEXT PRIMARY KEY,
+                parent TEXT,
+                idx INTEGER DEFAULT 0,
+                item_code TEXT,
+                item_name TEXT,
+                description TEXT,
+                qty REAL DEFAULT 0,
+                delivered_qty REAL DEFAULT 0,
+                billed_qty REAL DEFAULT 0,
+                uom TEXT DEFAULT 'Nos',
+                rate REAL DEFAULT 0,
+                price_list_rate REAL DEFAULT 0,
+                discount_percentage REAL DEFAULT 0,
+                discount_amount REAL DEFAULT 0,
+                amount REAL DEFAULT 0,
+                net_rate REAL DEFAULT 0,
+                net_amount REAL DEFAULT 0,
+                base_rate REAL DEFAULT 0,
+                base_amount REAL DEFAULT 0,
+                base_net_rate REAL DEFAULT 0,
+                base_net_amount REAL DEFAULT 0,
+                warehouse TEXT,
+                quotation_item TEXT,
+                ignore_pricing_rule INTEGER DEFAULT 0,
+                external_line_reference TEXT,
+                pricing_rule TEXT,
+                FOREIGN KEY (parent) REFERENCES "Sales Order"(name)
+            )""",
+
+            # --- Purchase Order ---
+            """CREATE TABLE IF NOT EXISTS "Purchase Order" (
+                name TEXT PRIMARY KEY,
+                supplier TEXT,
+                supplier_name TEXT,
+                transaction_date TEXT,
+                schedule_date TEXT,
+                company TEXT,
+                currency TEXT DEFAULT 'USD',
+                conversion_rate REAL DEFAULT 1.0,
+                total_qty REAL DEFAULT 0,
+                total REAL DEFAULT 0,
+                net_total REAL DEFAULT 0,
+                base_total REAL DEFAULT 0,
+                base_net_total REAL DEFAULT 0,
+                base_grand_total REAL DEFAULT 0,
+                grand_total REAL DEFAULT 0,
+                total_taxes_and_charges REAL DEFAULT 0,
+                discount_amount REAL DEFAULT 0,
+                apply_discount_on TEXT DEFAULT 'Grand Total',
+                per_received REAL DEFAULT 0,
+                per_billed REAL DEFAULT 0,
+                remarks TEXT,
+                status TEXT DEFAULT 'Draft',
+                docstatus INTEGER DEFAULT 0,
+                discarded INTEGER DEFAULT 0,
+                creation TEXT,
+                modified TEXT,
+                ignore_pricing_rule INTEGER DEFAULT 0,
+                external_source TEXT,
+                external_reference TEXT
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "Purchase Order Item" (
+                name TEXT PRIMARY KEY,
+                parent TEXT,
+                idx INTEGER DEFAULT 0,
+                item_code TEXT,
+                item_name TEXT,
+                description TEXT,
+                qty REAL DEFAULT 0,
+                received_qty REAL DEFAULT 0,
+                billed_qty REAL DEFAULT 0,
+                uom TEXT DEFAULT 'Nos',
+                rate REAL DEFAULT 0,
+                price_list_rate REAL DEFAULT 0,
+                discount_percentage REAL DEFAULT 0,
+                discount_amount REAL DEFAULT 0,
+                amount REAL DEFAULT 0,
+                net_rate REAL DEFAULT 0,
+                net_amount REAL DEFAULT 0,
+                base_rate REAL DEFAULT 0,
+                base_amount REAL DEFAULT 0,
+                base_net_rate REAL DEFAULT 0,
+                base_net_amount REAL DEFAULT 0,
+                warehouse TEXT,
+                ignore_pricing_rule INTEGER DEFAULT 0,
+                external_line_reference TEXT,
+                pricing_rule TEXT,
+                FOREIGN KEY (parent) REFERENCES "Purchase Order"(name)
+            )""",
+
+            # --- Sales Invoice ---
+            """CREATE TABLE IF NOT EXISTS "Sales Invoice" (
+                name TEXT PRIMARY KEY,
+                subscription TEXT,
+                customer TEXT,
+                customer_name TEXT,
+                posting_date TEXT,
+                due_date TEXT,
+                company TEXT,
+                currency TEXT DEFAULT 'USD',
+                conversion_rate REAL DEFAULT 1.0,
+                debit_to TEXT,  -- receivable account,
+                total_qty REAL DEFAULT 0,
+                total REAL DEFAULT 0,
+                net_total REAL DEFAULT 0,
+                base_total REAL DEFAULT 0,
+                base_net_total REAL DEFAULT 0,
+                base_grand_total REAL DEFAULT 0,
+                grand_total REAL DEFAULT 0,
+                rounded_total REAL DEFAULT 0,
+                outstanding_amount REAL DEFAULT 0,
+                total_taxes_and_charges REAL DEFAULT 0,
+                discount_amount REAL DEFAULT 0,
+                apply_discount_on TEXT DEFAULT 'Grand Total',
+                is_return INTEGER DEFAULT 0,
+                return_against TEXT,
+                update_stock INTEGER DEFAULT 0,
+                is_pos INTEGER DEFAULT 0,
+                paid_amount REAL DEFAULT 0,
+                against_income_account TEXT,
+                sales_order TEXT,
+                per_billed REAL DEFAULT 0,
+                status TEXT DEFAULT 'Draft',
+                docstatus INTEGER DEFAULT 0,
+                discarded INTEGER DEFAULT 0,
+                remarks TEXT,
+                creation TEXT,
+                modified TEXT,
+                ignore_pricing_rule INTEGER DEFAULT 0,
+                external_source TEXT,
+                external_reference TEXT
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "Sales Invoice Item" (
+                name TEXT PRIMARY KEY,
+                parent TEXT,
+                idx INTEGER DEFAULT 0,
+                item_code TEXT,
+                item_name TEXT,
+                description TEXT,
+                qty REAL DEFAULT 0,
+                uom TEXT DEFAULT 'Nos',
+                rate REAL DEFAULT 0,
+                price_list_rate REAL DEFAULT 0,
+                discount_percentage REAL DEFAULT 0,
+                discount_amount REAL DEFAULT 0,
+                amount REAL DEFAULT 0,
+                net_rate REAL DEFAULT 0,
+                net_amount REAL DEFAULT 0,
+                base_rate REAL DEFAULT 0,
+                base_amount REAL DEFAULT 0,
+                base_net_rate REAL DEFAULT 0,
+                base_net_amount REAL DEFAULT 0,
+                income_account TEXT,
+                cost_center TEXT,
+                warehouse TEXT,
+                sales_order TEXT,
+                sales_order_item TEXT,
+                ignore_pricing_rule INTEGER DEFAULT 0,
+                external_line_reference TEXT,
+                pricing_rule TEXT,
+                FOREIGN KEY (parent) REFERENCES "Sales Invoice"(name)
+            )""",
+
+            # --- Purchase Invoice ---
+            """CREATE TABLE IF NOT EXISTS "Purchase Invoice" (
+                name TEXT PRIMARY KEY,
+                subscription TEXT,
+                supplier TEXT,
+                supplier_name TEXT,
+                posting_date TEXT,
+                due_date TEXT,
+                company TEXT,
+                currency TEXT DEFAULT 'USD',
+                conversion_rate REAL DEFAULT 1.0,
+                credit_to TEXT,  -- payable account,
+                total_qty REAL DEFAULT 0,
+                total REAL DEFAULT 0,
+                net_total REAL DEFAULT 0,
+                base_total REAL DEFAULT 0,
+                base_net_total REAL DEFAULT 0,
+                base_grand_total REAL DEFAULT 0,
+                grand_total REAL DEFAULT 0,
+                rounded_total REAL DEFAULT 0,
+                outstanding_amount REAL DEFAULT 0,
+                total_taxes_and_charges REAL DEFAULT 0,
+                discount_amount REAL DEFAULT 0,
+                apply_discount_on TEXT DEFAULT 'Grand Total',
+                is_return INTEGER DEFAULT 0,
+                return_against TEXT,
+                update_stock INTEGER DEFAULT 0,
+                against_expense_account TEXT,
+                purchase_order TEXT,
+                status TEXT DEFAULT 'Draft',
+                docstatus INTEGER DEFAULT 0,
+                discarded INTEGER DEFAULT 0,
+                remarks TEXT,
+                creation TEXT,
+                modified TEXT,
+                ignore_pricing_rule INTEGER DEFAULT 0,
+                external_source TEXT,
+                external_reference TEXT
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "Purchase Invoice Item" (
+                name TEXT PRIMARY KEY,
+                parent TEXT,
+                idx INTEGER DEFAULT 0,
+                item_code TEXT,
+                item_name TEXT,
+                description TEXT,
+                qty REAL DEFAULT 0,
+                uom TEXT DEFAULT 'Nos',
+                rate REAL DEFAULT 0,
+                price_list_rate REAL DEFAULT 0,
+                discount_percentage REAL DEFAULT 0,
+                discount_amount REAL DEFAULT 0,
+                amount REAL DEFAULT 0,
+                net_rate REAL DEFAULT 0,
+                net_amount REAL DEFAULT 0,
+                base_rate REAL DEFAULT 0,
+                base_amount REAL DEFAULT 0,
+                base_net_rate REAL DEFAULT 0,
+                base_net_amount REAL DEFAULT 0,
+                expense_account TEXT,
+                cost_center TEXT,
+                warehouse TEXT,
+                purchase_order TEXT,
+                purchase_order_item TEXT,
+                ignore_pricing_rule INTEGER DEFAULT 0,
+                external_line_reference TEXT,
+                pricing_rule TEXT,
+                FOREIGN KEY (parent) REFERENCES "Purchase Invoice"(name)
+            )""",
+
+            # --- Payment Entry ---
+            """CREATE TABLE IF NOT EXISTS "Payment Entry" (
+                name TEXT PRIMARY KEY,
+                payment_type TEXT,  -- Receive, Pay, Internal Transfer
+                posting_date TEXT,
+                company TEXT,
+                party_type TEXT,  -- Customer, Supplier
+                party TEXT,
+                party_name TEXT,
+                paid_from TEXT,  -- account
+                paid_to TEXT,    -- account
+                paid_amount REAL DEFAULT 0,
+                received_amount REAL DEFAULT 0,
+                currency TEXT DEFAULT 'USD',
+                conversion_rate REAL DEFAULT 1.0,
+                reference_no TEXT,
+                reference_date TEXT,
+                bank_reconciliation TEXT,
+                cost_center TEXT,
+                status TEXT DEFAULT 'Draft',
+                docstatus INTEGER DEFAULT 0,
+                discarded INTEGER DEFAULT 0,
+                remarks TEXT,
+                creation TEXT,
+                modified TEXT
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "Payment Entry Reference" (
+                name TEXT PRIMARY KEY,
+                parent TEXT,
+                idx INTEGER DEFAULT 0,
+                reference_doctype TEXT,
+                reference_name TEXT,
+                total_amount REAL DEFAULT 0,
+                outstanding_amount REAL DEFAULT 0,
+                allocated_amount REAL DEFAULT 0,
+                FOREIGN KEY (parent) REFERENCES "Payment Entry"(name)
+            )""",
+
+            # --- Journal Entry ---
+            """CREATE TABLE IF NOT EXISTS "Journal Entry" (
+                name TEXT PRIMARY KEY,
+                posting_date TEXT,
+                company TEXT,
+                voucher_type TEXT DEFAULT 'Journal Entry',
+                total_debit REAL DEFAULT 0,
+                total_credit REAL DEFAULT 0,
+                bank_reconciliation TEXT,
+                remark TEXT,
+                status TEXT DEFAULT 'Draft',
+                docstatus INTEGER DEFAULT 0,
+                discarded INTEGER DEFAULT 0,
+                creation TEXT,
+                modified TEXT
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "Journal Entry Account" (
+                name TEXT PRIMARY KEY,
+                parent TEXT,
+                idx INTEGER DEFAULT 0,
+                account TEXT NOT NULL,
+                party_type TEXT,
+                party TEXT,
+                cost_center TEXT,
+                debit_in_account_currency REAL DEFAULT 0,
+                credit_in_account_currency REAL DEFAULT 0,
+                debit REAL DEFAULT 0,
+                credit REAL DEFAULT 0,
+                reference_type TEXT,
+                reference_doctype TEXT,
+                reference_name TEXT,
+                FOREIGN KEY (parent) REFERENCES "Journal Entry"(name)
+            )""",
+
+            # --- Stock Entry (material movement) ---
+            """CREATE TABLE IF NOT EXISTS "Stock Entry" (
+                name TEXT PRIMARY KEY,
+                stock_entry_type TEXT,  -- Material Receipt, Material Issue, Material Transfer
+                posting_date TEXT,
+                posting_time TEXT DEFAULT '00:00:00',
+                company TEXT,
+                from_warehouse TEXT,
+                to_warehouse TEXT,
+                total_incoming_value REAL DEFAULT 0,
+                total_outgoing_value REAL DEFAULT 0,
+                value_difference REAL DEFAULT 0,
+                total_amount REAL DEFAULT 0,
+                status TEXT DEFAULT 'Draft',
+                docstatus INTEGER DEFAULT 0,
+                discarded INTEGER DEFAULT 0,
+                remarks TEXT,
+                creation TEXT,
+                modified TEXT
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "Stock Entry Detail" (
+                name TEXT PRIMARY KEY,
+                parent TEXT,
+                idx INTEGER DEFAULT 0,
+                item_code TEXT,
+                item_name TEXT,
+                qty REAL DEFAULT 0,
+                uom TEXT DEFAULT 'Nos',
+                s_warehouse TEXT,  -- source
+                t_warehouse TEXT,  -- target
+                basic_rate REAL DEFAULT 0,
+                basic_amount REAL DEFAULT 0,
+                valuation_rate REAL DEFAULT 0,
+                amount REAL DEFAULT 0,
+                FOREIGN KEY (parent) REFERENCES "Stock Entry"(name)
+            )""",
+
+            # --- Sales/Purchase Taxes and Charges (child table of transactions) ---
+            """CREATE TABLE IF NOT EXISTS "Sales Taxes and Charges" (
+                name TEXT PRIMARY KEY,
+                parent TEXT,
+                parenttype TEXT,
+                idx INTEGER DEFAULT 0,
+                charge_type TEXT DEFAULT 'On Net Total',
+                account_head TEXT,
+                description TEXT,
+                rate REAL DEFAULT 0,
+                tax_amount REAL DEFAULT 0,
+                total REAL DEFAULT 0,
+                base_tax_amount REAL DEFAULT 0,
+                base_total REAL DEFAULT 0,
+                included_in_print_rate INTEGER DEFAULT 0,
+                add_deduct_tax TEXT DEFAULT 'Add',
+                row_id INTEGER
+            )""",
+
+            # --- Delivery Note ---
+            """CREATE TABLE IF NOT EXISTS "Delivery Note" (
+                name TEXT PRIMARY KEY,
+                customer TEXT,
+                customer_name TEXT,
+                posting_date TEXT,
+                company TEXT,
+                currency TEXT DEFAULT 'USD',
+                conversion_rate REAL DEFAULT 1.0,
+                total_qty REAL DEFAULT 0,
+                total REAL DEFAULT 0,
+                net_total REAL DEFAULT 0,
+                base_net_total REAL DEFAULT 0,
+                base_grand_total REAL DEFAULT 0,
+                grand_total REAL DEFAULT 0,
+                total_taxes_and_charges REAL DEFAULT 0,
+                per_billed REAL DEFAULT 0,
+                is_return INTEGER DEFAULT 0,
+                return_against TEXT,
+                status TEXT DEFAULT 'Draft',
+                docstatus INTEGER DEFAULT 0,
+                discarded INTEGER DEFAULT 0,
+                remarks TEXT,
+                creation TEXT,
+                modified TEXT
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "Delivery Note Item" (
+                name TEXT PRIMARY KEY,
+                parent TEXT,
+                idx INTEGER DEFAULT 0,
+                item_code TEXT,
+                item_name TEXT,
+                description TEXT,
+                qty REAL DEFAULT 0,
+                uom TEXT DEFAULT 'Nos',
+                rate REAL DEFAULT 0,
+                price_list_rate REAL DEFAULT 0,
+                discount_percentage REAL DEFAULT 0,
+                discount_amount REAL DEFAULT 0,
+                amount REAL DEFAULT 0,
+                net_rate REAL DEFAULT 0,
+                net_amount REAL DEFAULT 0,
+                base_rate REAL DEFAULT 0,
+                base_amount REAL DEFAULT 0,
+                base_net_rate REAL DEFAULT 0,
+                base_net_amount REAL DEFAULT 0,
+                warehouse TEXT,
+                against_sales_order TEXT,
+                so_detail TEXT,
+                FOREIGN KEY (parent) REFERENCES "Delivery Note"(name)
+            )""",
+
+            # --- Purchase Receipt ---
+            """CREATE TABLE IF NOT EXISTS "Purchase Receipt" (
+                name TEXT PRIMARY KEY,
+                supplier TEXT,
+                supplier_name TEXT,
+                posting_date TEXT,
+                company TEXT,
+                currency TEXT DEFAULT 'USD',
+                conversion_rate REAL DEFAULT 1.0,
+                total_qty REAL DEFAULT 0,
+                total REAL DEFAULT 0,
+                net_total REAL DEFAULT 0,
+                base_net_total REAL DEFAULT 0,
+                base_grand_total REAL DEFAULT 0,
+                grand_total REAL DEFAULT 0,
+                total_taxes_and_charges REAL DEFAULT 0,
+                per_billed REAL DEFAULT 0,
+                is_return INTEGER DEFAULT 0,
+                return_against TEXT,
+                status TEXT DEFAULT 'Draft',
+                docstatus INTEGER DEFAULT 0,
+                discarded INTEGER DEFAULT 0,
+                remarks TEXT,
+                creation TEXT,
+                modified TEXT
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "Purchase Receipt Item" (
+                name TEXT PRIMARY KEY,
+                parent TEXT,
+                idx INTEGER DEFAULT 0,
+                item_code TEXT,
+                item_name TEXT,
+                description TEXT,
+                qty REAL DEFAULT 0,
+                uom TEXT DEFAULT 'Nos',
+                rate REAL DEFAULT 0,
+                price_list_rate REAL DEFAULT 0,
+                discount_percentage REAL DEFAULT 0,
+                discount_amount REAL DEFAULT 0,
+                amount REAL DEFAULT 0,
+                net_rate REAL DEFAULT 0,
+                net_amount REAL DEFAULT 0,
+                base_rate REAL DEFAULT 0,
+                base_amount REAL DEFAULT 0,
+                base_net_rate REAL DEFAULT 0,
+                base_net_amount REAL DEFAULT 0,
+                warehouse TEXT,
+                against_purchase_order TEXT,
+                po_detail TEXT,
+                FOREIGN KEY (parent) REFERENCES "Purchase Receipt"(name)
+            )""",
+
+            # --- POS Invoice ---
+            """CREATE TABLE IF NOT EXISTS "POS Invoice" (
+                name TEXT PRIMARY KEY,
+                customer TEXT,
+                customer_name TEXT,
+                posting_date TEXT,
+                company TEXT,
+                currency TEXT DEFAULT 'USD',
+                conversion_rate REAL DEFAULT 1.0,
+                debit_to TEXT,
+                total_qty REAL DEFAULT 0,
+                total REAL DEFAULT 0,
+                net_total REAL DEFAULT 0,
+                base_net_total REAL DEFAULT 0,
+                base_grand_total REAL DEFAULT 0,
+                grand_total REAL DEFAULT 0,
+                rounded_total REAL DEFAULT 0,
+                total_taxes_and_charges REAL DEFAULT 0,
+                paid_amount REAL DEFAULT 0,
+                outstanding_amount REAL DEFAULT 0,
+                change_amount REAL DEFAULT 0,
+                update_stock INTEGER DEFAULT 1,
+                is_return INTEGER DEFAULT 0,
+                return_against TEXT,
+                status TEXT DEFAULT 'Draft',
+                docstatus INTEGER DEFAULT 0,
+                discarded INTEGER DEFAULT 0,
+                remarks TEXT,
+                creation TEXT,
+                modified TEXT,
+                ignore_pricing_rule INTEGER DEFAULT 0,
+                external_source TEXT,
+                external_reference TEXT
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "POS Invoice Item" (
+                name TEXT PRIMARY KEY,
+                parent TEXT,
+                idx INTEGER DEFAULT 0,
+                item_code TEXT,
+                item_name TEXT,
+                description TEXT,
+                qty REAL DEFAULT 0,
+                uom TEXT DEFAULT 'Nos',
+                rate REAL DEFAULT 0,
+                price_list_rate REAL DEFAULT 0,
+                discount_percentage REAL DEFAULT 0,
+                discount_amount REAL DEFAULT 0,
+                amount REAL DEFAULT 0,
+                net_rate REAL DEFAULT 0,
+                net_amount REAL DEFAULT 0,
+                base_rate REAL DEFAULT 0,
+                base_amount REAL DEFAULT 0,
+                base_net_rate REAL DEFAULT 0,
+                base_net_amount REAL DEFAULT 0,
+                income_account TEXT,
+                cost_center TEXT,
+                warehouse TEXT,
+                ignore_pricing_rule INTEGER DEFAULT 0,
+                external_line_reference TEXT,
+                pricing_rule TEXT,
+                FOREIGN KEY (parent) REFERENCES "POS Invoice"(name)
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "POS Invoice Payment" (
+                name TEXT PRIMARY KEY,
+                parent TEXT,
+                idx INTEGER DEFAULT 0,
+                mode_of_payment TEXT,
+                account TEXT,
+                amount REAL DEFAULT 0,
+                FOREIGN KEY (parent) REFERENCES "POS Invoice"(name)
+            )""",
+
+            # --- Pricing Rule ---
+            """CREATE TABLE IF NOT EXISTS "Pricing Rule" (
+                name TEXT PRIMARY KEY,
+                title TEXT,
+                apply_on TEXT DEFAULT 'Item Code',
+                item_code TEXT,
+                item_group TEXT,
+                applicable_for TEXT,
+                customer TEXT,
+                customer_group TEXT,
+                territory TEXT,
+                supplier TEXT,
+                selling INTEGER DEFAULT 0,
+                buying INTEGER DEFAULT 0,
+                rate_or_discount TEXT DEFAULT 'Discount Percentage',
+                rate REAL DEFAULT 0,
+                discount_percentage REAL DEFAULT 0,
+                discount_amount REAL DEFAULT 0,
+                min_qty REAL DEFAULT 0,
+                max_qty REAL DEFAULT 0,
+                min_amt REAL DEFAULT 0,
+                max_amt REAL DEFAULT 0,
+                valid_from TEXT,
+                valid_upto TEXT,
+                priority INTEGER DEFAULT 0,
+                company TEXT,
+                enabled INTEGER DEFAULT 1,
+                status TEXT DEFAULT 'Active',
+                docstatus INTEGER DEFAULT 0,
+                creation TEXT,
+                modified TEXT
+            )""",
+
+            # --- Price List / Item Price (base price, "layer 1") ---
+            # A Price List is per-currency by construction: a rate only means
+            # something alongside the currency it is quoted in. Resolution
+            # therefore requires the list currency to equal the document
+            # currency rather than converting — see controllers/item_price.py.
+            """CREATE TABLE IF NOT EXISTS "Price List" (
+                name TEXT PRIMARY KEY,
+                price_list_name TEXT NOT NULL,
+                currency TEXT DEFAULT 'USD',
+                selling INTEGER DEFAULT 0,
+                buying INTEGER DEFAULT 0,
+                enabled INTEGER DEFAULT 1,
+                docstatus INTEGER DEFAULT 0,
+                discarded INTEGER DEFAULT 0,
+                creation TEXT,
+                modified TEXT
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "Item Price" (
+                name TEXT PRIMARY KEY,
+                item_code TEXT NOT NULL,
+                price_list TEXT NOT NULL,
+                customer TEXT,
+                supplier TEXT,
+                uom TEXT,
+                min_qty REAL DEFAULT 0,
+                rate REAL DEFAULT 0,
+                valid_from TEXT,
+                valid_upto TEXT,
+                enabled INTEGER DEFAULT 1,
+                docstatus INTEGER DEFAULT 0,
+                discarded INTEGER DEFAULT 0,
+                creation TEXT,
+                modified TEXT
+            )""",
+
+            # --- Budget ---
+            """CREATE TABLE IF NOT EXISTS "Budget" (
+                name TEXT PRIMARY KEY,
+                budget_against TEXT DEFAULT 'Cost Center',
+                cost_center TEXT,
+                account TEXT,
+                fiscal_year TEXT,
+                company TEXT,
+                budget_amount REAL DEFAULT 0,
+                action_if_exceeded TEXT DEFAULT 'Warn',
+                status TEXT DEFAULT 'Active',
+                docstatus INTEGER DEFAULT 0,
+                creation TEXT,
+                modified TEXT
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "Monthly Distribution" (
+                name TEXT PRIMARY KEY,
+                parent TEXT,
+                idx INTEGER DEFAULT 0,
+                month TEXT,
+                percentage REAL DEFAULT 0,
+                FOREIGN KEY (parent) REFERENCES "Budget"(name)
+            )""",
+
+            # --- Subscription ---
+            """CREATE TABLE IF NOT EXISTS "Subscription" (
+                name TEXT PRIMARY KEY,
+                party_type TEXT,
+                party TEXT,
+                company TEXT,
+                start_date TEXT,
+                end_date TEXT,
+                billing_interval TEXT DEFAULT 'Monthly',
+                current_invoice_start TEXT,
+                current_invoice_end TEXT,
+                status TEXT DEFAULT 'Active',
+                docstatus INTEGER DEFAULT 0,
+                discarded INTEGER DEFAULT 0,
+                creation TEXT,
+                modified TEXT
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "Subscription Plan" (
+                name TEXT PRIMARY KEY,
+                parent TEXT,
+                idx INTEGER DEFAULT 0,
+                item_code TEXT,
+                item_name TEXT,
+                qty REAL DEFAULT 1,
+                rate REAL DEFAULT 0,
+                FOREIGN KEY (parent) REFERENCES "Subscription"(name)
+            )""",
+
+            # --- Bank Accounts / Statement Imports / Transactions ---
+            """CREATE TABLE IF NOT EXISTS "Bank Account" (
+                name TEXT PRIMARY KEY,
+                account_name TEXT NOT NULL,
+                company TEXT NOT NULL,
+                account TEXT NOT NULL,
+                iban TEXT NOT NULL,
+                currency TEXT NOT NULL,
+                bank_name TEXT,
+                bic TEXT,
+                disabled INTEGER DEFAULT 0,
+                docstatus INTEGER DEFAULT 0,
+                creation TEXT,
+                modified TEXT,
+                FOREIGN KEY (company) REFERENCES "Company"(name),
+                FOREIGN KEY (account) REFERENCES "Account"(name)
+            )""",
+
+            """CREATE UNIQUE INDEX IF NOT EXISTS "ux_bank_account_iban"
+                ON "Bank Account" (iban)""",
+
+            """CREATE TABLE IF NOT EXISTS "Bank Statement Import" (
+                name TEXT PRIMARY KEY,
+                bank_account TEXT NOT NULL,
+                company TEXT NOT NULL,
+                source TEXT DEFAULT 'Manual Upload',
+                source_filename TEXT,
+                source_sha256 TEXT NOT NULL,
+                schema_version TEXT,
+                message_id TEXT,
+                statement_id TEXT,
+                statement_index INTEGER DEFAULT 1,
+                electronic_sequence_number TEXT,
+                account_iban TEXT,
+                currency TEXT,
+                from_date TEXT,
+                to_date TEXT,
+                opening_balance REAL,
+                closing_balance REAL,
+                credit_total REAL DEFAULT 0,
+                debit_total REAL DEFAULT 0,
+                entry_count INTEGER DEFAULT 0,
+                booked_entry_count INTEGER DEFAULT 0,
+                detail_count INTEGER DEFAULT 0,
+                imported_entry_count INTEGER DEFAULT 0,
+                duplicate_entry_count INTEGER DEFAULT 0,
+                warning_count INTEGER DEFAULT 0,
+                warnings_json TEXT,
+                status TEXT DEFAULT 'Imported',
+                imported_by TEXT,
+                docstatus INTEGER DEFAULT 0,
+                creation TEXT,
+                modified TEXT,
+                FOREIGN KEY (bank_account) REFERENCES "Bank Account"(name),
+                FOREIGN KEY (company) REFERENCES "Company"(name)
+            )""",
+
+            """CREATE UNIQUE INDEX IF NOT EXISTS "ux_bank_statement_source"
+                ON "Bank Statement Import" (source_sha256, statement_index)""",
+
+            # Kept outside the generic document registry so raw bank XML is
+            # never returned by ordinary list/get-document API calls.
+            """CREATE TABLE IF NOT EXISTS "Bank Statement Source" (
+                import_name TEXT PRIMARY KEY,
+                source_data BLOB NOT NULL,
+                FOREIGN KEY (import_name) REFERENCES "Bank Statement Import"(name)
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "Bank Transaction" (
+                name TEXT PRIMARY KEY,
+                bank_account TEXT,
+                bank_account_id TEXT,
+                bank_statement_import TEXT,
+                posting_date TEXT,
+                value_date TEXT,
+                deposit REAL DEFAULT 0,
+                withdrawal REAL DEFAULT 0,
+                currency TEXT,
+                description TEXT,
+                remittance_information TEXT,
+                reference_number TEXT,
+                external_id TEXT,
+                weak_external_id INTEGER DEFAULT 0,
+                account_service_reference TEXT,
+                entry_reference TEXT,
+                credit_debit_indicator TEXT,
+                reversal_indicator INTEGER DEFAULT 0,
+                bank_transaction_code TEXT,
+                proprietary_bank_code TEXT,
+                batch_transaction_count INTEGER,
+                counterparty_name TEXT,
+                counterparty_iban TEXT,
+                end_to_end_id TEXT,
+                payment_information_id TEXT,
+                uetr TEXT,
+                structured_reference_type TEXT,
+                structured_reference TEXT,
+                exchange_source_currency TEXT,
+                exchange_target_currency TEXT,
+                exchange_rate REAL,
+                detail_count INTEGER DEFAULT 0,
+                allocated_amount REAL DEFAULT 0,
+                unallocated_amount REAL DEFAULT 0,
+                reference_doctype TEXT,
+                reference_name TEXT,
+                reconciled_by TEXT,
+                reconciled_at TEXT,
+                status TEXT DEFAULT 'Unreconciled',
+                docstatus INTEGER DEFAULT 0,
+                creation TEXT,
+                modified TEXT,
+                FOREIGN KEY (bank_account) REFERENCES "Account"(name),
+                FOREIGN KEY (bank_account_id) REFERENCES "Bank Account"(name),
+                FOREIGN KEY (bank_statement_import) REFERENCES "Bank Statement Import"(name)
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "Bank Transaction Detail" (
+                name TEXT PRIMARY KEY,
+                parent TEXT NOT NULL,
+                idx INTEGER DEFAULT 0,
+                external_id TEXT,
+                amount REAL DEFAULT 0,
+                currency TEXT,
+                credit_debit_indicator TEXT,
+                bank_transaction_code TEXT,
+                proprietary_bank_code TEXT,
+                payment_information_id TEXT,
+                instruction_id TEXT,
+                end_to_end_id TEXT,
+                uetr TEXT,
+                transaction_id TEXT,
+                mandate_id TEXT,
+                debtor_name TEXT,
+                debtor_iban TEXT,
+                creditor_name TEXT,
+                creditor_iban TEXT,
+                ultimate_debtor_name TEXT,
+                ultimate_creditor_name TEXT,
+                creditor_reference_type TEXT,
+                creditor_reference TEXT,
+                remittance_information TEXT,
+                FOREIGN KEY (parent) REFERENCES "Bank Transaction"(name)
+            )""",
+
+            """CREATE INDEX IF NOT EXISTS "ix_bank_transaction_detail_parent"
+                ON "Bank Transaction Detail" (parent, idx)""",
+
+            # Audit trail for bank reconciliation decisions. A transaction can
+            # have only one active reconciliation. A multi-bank Journal Entry
+            # may be linked once per bank account; reversed rows remain for
+            # review.
+            """CREATE TABLE IF NOT EXISTS "Bank Reconciliation" (
+                name TEXT PRIMARY KEY,
+                bank_transaction TEXT NOT NULL,
+                bank_account TEXT NOT NULL,
+                group_id TEXT,
+                group_head INTEGER DEFAULT 1,
+                mode TEXT NOT NULL,
+                voucher_type TEXT NOT NULL,
+                voucher_no TEXT NOT NULL,
+                amount REAL NOT NULL,
+                status TEXT DEFAULT 'Active',
+                created_by TEXT,
+                created_at TEXT,
+                reversed_by TEXT,
+                reversed_at TEXT,
+                FOREIGN KEY (bank_transaction) REFERENCES "Bank Transaction"(name),
+                FOREIGN KEY (bank_account) REFERENCES "Account"(name)
+            )""",
+
+            """CREATE UNIQUE INDEX IF NOT EXISTS "ux_bank_reconciliation_active_transaction"
+                ON "Bank Reconciliation" (bank_transaction) WHERE status = 'Active'""",
+
+            # --- Chat Sessions ---
+            """CREATE TABLE IF NOT EXISTS "Chat Session" (
+                id TEXT PRIMARY KEY,
+                title TEXT DEFAULT 'New Chat',
+                user_id TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )""",
+
+            # --- Chat Messages (conversation persistence) ---
+            """CREATE TABLE IF NOT EXISTS "Chat Message" (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                role TEXT NOT NULL,
+                message_type TEXT DEFAULT 'chat',
+                content TEXT,
+                metadata_json TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (session_id) REFERENCES "Chat Session"(id)
+            )""",
+
+            # --- Chat Attachments (PDFs, images, and Office docs uploaded via chat) ---
+            # openai_file_id/openai_file_expires_at cache the OpenAI Files API
+            # upload for Office formats (sent to the model by file_id, reused
+            # across turns, re-uploaded once the 30-day expiry lapses).
+            """CREATE TABLE IF NOT EXISTS "Chat Attachment" (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                user_id TEXT,
+                filename TEXT NOT NULL,
+                mime_type TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                file_path TEXT NOT NULL,
+                openai_file_id TEXT,
+                openai_file_expires_at INTEGER,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (session_id) REFERENCES "Chat Session"(id)
+            )""",
+
+            # --- Report Drafts (chat-authored analytics reports) ---
+            """CREATE TABLE IF NOT EXISTS "Report Draft" (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                description TEXT,
+                definition_json TEXT NOT NULL,
+                created_by TEXT,
+                source_chat_session_id TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )""",
+
+            # --- Authentication ---
+            """CREATE TABLE IF NOT EXISTS "User" (
+                name TEXT PRIMARY KEY,
+                email TEXT NOT NULL UNIQUE,
+                full_name TEXT NOT NULL,
+                hashed_password TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'viewer',
+                enabled INTEGER DEFAULT 1,
+                creation TEXT,
+                modified TEXT
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "Invite" (
+                token TEXT PRIMARY KEY,
+                email TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'viewer',
+                created_by TEXT,
+                used INTEGER DEFAULT 0,
+                creation TEXT,
+                FOREIGN KEY (created_by) REFERENCES "User"(name)
+            )""",
+
+            # Third-party (Google / Apple) sign-in identities. One User may hold
+            # several (password + Google + Apple); a provider account maps to at
+            # most one User via the UNIQUE(provider, subject). `subject` is the
+            # provider's stable per-user id (OIDC `sub`), so it survives the user
+            # changing their provider-side email. Password stays on User (an
+            # OAuth-only user just carries a sentinel, non-matchable hash).
+            """CREATE TABLE IF NOT EXISTS "User OAuth Identity" (
+                name TEXT PRIMARY KEY,
+                user_name TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                email TEXT,
+                creation TEXT,
+                UNIQUE(provider, subject),
+                FOREIGN KEY (user_name) REFERENCES "User"(name)
+            )""",
+
+            # Short-lived, one-use browser binding for OIDC login/link flows.
+            # The raw verifier lives only in an HttpOnly cookie; only its hash
+            # is persisted, so a leaked database row is not a usable flow token.
+            """CREATE TABLE IF NOT EXISTS "OAuth Flow" (
+                id TEXT PRIMARY KEY,
+                verifier_hash TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                user_name TEXT,
+                invite_token TEXT,
+                nonce TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                consumed INTEGER DEFAULT 0,
+                creation TEXT DEFAULT CURRENT_TIMESTAMP
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "Generated PDF" (
+                id TEXT PRIMARY KEY, user_id TEXT NOT NULL, doctype TEXT NOT NULL,
+                document_name TEXT NOT NULL, modified TEXT, filename TEXT NOT NULL,
+                sha256 TEXT NOT NULL, data BLOB NOT NULL, created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "Settings" (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )""",
+
+            # Per-USER preferences — distinct from the global admin-only Settings
+            # above. A key->value bag scoped to one User; any authenticated user
+            # reads/writes ONLY their own rows via /auth/my-settings (not admin).
+            # Consumers: `columns.<doctype>` (personal list columns), `language`.
+            """CREATE TABLE IF NOT EXISTS "User Preference" (
+                user_name TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT,
+                PRIMARY KEY (user_name, key)
+            )""",
+
+            # Bearer API keys for the programmatic chat API (off by default via
+            # the `chat_api_enabled` Settings flag). Tokens are stored hashed
+            # (sha256); `key_prefix` is a display-only fragment. `role` bounds the
+            # agent's tool access; `session_owner` is the user_id the key's chat
+            # sessions are owned under (isolated from human users). See
+            # docs/chat-api.md.
+            # Per-user API keys (v2): a key BELONGS to a User and can never act
+            # above its owner — `role` is only a CAP; the effective role is
+            # min(cap, owner's current role) resolved live at auth time, so a
+            # demotion or disable applies to existing keys immediately.
+            """CREATE TABLE IF NOT EXISTS "Api Key" (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                owner TEXT NOT NULL,
+                key_hash TEXT UNIQUE,
+                key_prefix TEXT,
+                role TEXT DEFAULT 'manager',
+                session_owner TEXT,
+                created_at TEXT,
+                last_used_at TEXT,
+                revoked INTEGER DEFAULT 0
+            )""",
+
+            """CREATE TABLE IF NOT EXISTS "MCP OAuth Client" (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, redirect_uris TEXT NOT NULL,
+                auth_method TEXT NOT NULL, secret_hash TEXT, created_at INTEGER NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS "MCP OAuth Request" (
+                id TEXT PRIMARY KEY, params TEXT NOT NULL, expires_at INTEGER NOT NULL,
+                consumed INTEGER DEFAULT 0
+            )""",
+            """CREATE TABLE IF NOT EXISTS "MCP OAuth Code" (
+                hash TEXT PRIMARY KEY, client_id TEXT NOT NULL, key_id TEXT NOT NULL,
+                redirect_uri TEXT NOT NULL, challenge TEXT NOT NULL, resource TEXT NOT NULL,
+                scope TEXT NOT NULL, expires_at INTEGER NOT NULL, consumed INTEGER DEFAULT 0
+            )""",
+            """CREATE TABLE IF NOT EXISTS "MCP OAuth Token" (
+                hash TEXT PRIMARY KEY, kind TEXT NOT NULL, client_id TEXT NOT NULL,
+                key_id TEXT NOT NULL, resource TEXT NOT NULL, scope TEXT NOT NULL,
+                expires_at INTEGER NOT NULL, consumed INTEGER DEFAULT 0
+            )""",
+
+            # Exchange rates for multi-currency. A lookup carries forward the
+            # most recent rate on/before a transaction's date; the rate is then
+            # snapshotted onto the document, so editing this table never changes
+            # already-posted books. exchange_rate = units of to_currency per 1
+            # unit of from_currency (e.g. EUR->USD 1.10 means 1 EUR = 1.10 USD).
+            """CREATE TABLE IF NOT EXISTS "Currency Exchange" (
+                name TEXT PRIMARY KEY,
+                date TEXT,
+                from_currency TEXT,
+                to_currency TEXT,
+                exchange_rate REAL,
+                creation TEXT,
+                modified TEXT
+            )""",
+
+            # --- Unit-level asset identity + reservations ---
+            # An Asset is one physical unit of an asset-tracked Item (the Item
+            # stays the *type* and carries the pricing). Owned, not consumed:
+            # nothing in lambda_erp/assets/ touches the Stock Ledger or the GL,
+            # so these tables cannot affect an existing deployment's books.
+            # Tracking is opt-in per Item via `is_asset_tracked` (migration 21),
+            # which defaults to 0. See docs/adr-0002-asset-and-reservation.md.
+            """CREATE TABLE IF NOT EXISTS "Asset" (
+                name TEXT PRIMARY KEY,
+                asset_name TEXT,
+                item_code TEXT,
+                asset_tag TEXT,
+                warehouse TEXT,
+                company TEXT,
+                status TEXT DEFAULT 'Available',
+                purchase_date TEXT,
+                purchase_value REAL DEFAULT 0,
+                meter_reading REAL DEFAULT 0,
+                meter_uom TEXT,
+                notes TEXT,
+                disabled INTEGER DEFAULT 0,
+                discarded INTEGER DEFAULT 0,
+                docstatus INTEGER DEFAULT 0,
+                creation TEXT,
+                modified TEXT
+            )""",
+
+            # A half-open [from, to) commitment against either one Asset
+            # (`asset` set) or `qty` units of an item+warehouse pool. Bounds are
+            # normalised to fixed-width 'YYYY-MM-DD HH:MM:SS', which is what
+            # lets the overlap test be a plain TEXT comparison on both backends.
+            """CREATE TABLE IF NOT EXISTS "Reservation" (
+                name TEXT PRIMARY KEY,
+                item_code TEXT,
+                warehouse TEXT,
+                asset TEXT,
+                allocation_mode TEXT,
+                qty REAL DEFAULT 1,
+                from_datetime TEXT,
+                to_datetime TEXT,
+                status TEXT DEFAULT 'Reserved',
+                party_type TEXT,
+                party TEXT,
+                voucher_type TEXT,
+                voucher_no TEXT,
+                voucher_detail_no TEXT,
+                purpose TEXT,
+                notes TEXT,
+                company TEXT,
+                discarded INTEGER DEFAULT 0,
+                docstatus INTEGER DEFAULT 0,
+                creation TEXT,
+                modified TEXT
+            )""",
+        ]
+
+        for stmt in stmts:
+            self.conn.execute(self._ddl(stmt))
+        self.conn.commit()
+        self._migrate()
+        self._ensure_list_indexes()
+
+    def _ddl(self, stmt: str) -> str:
+        """Translate SQLite DDL to the active dialect. No-op for SQLite.
+
+        For Postgres: SQLite's `REAL` is 8-byte (double); Postgres `REAL` is
+        only 4-byte, so map to DOUBLE PRECISION to keep float arithmetic
+        identical (the validation suite's balances depend on it). And
+        `INTEGER PRIMARY KEY AUTOINCREMENT` becomes BIGSERIAL.
+        """
+        if self.dialect != "postgres":
+            return stmt
+        import re
+        stmt = re.sub(r"\bINTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b",
+                      "BIGSERIAL PRIMARY KEY", stmt, flags=re.IGNORECASE)
+        stmt = re.sub(r"\bAUTOINCREMENT\b", "", stmt, flags=re.IGNORECASE)
+        stmt = re.sub(r"\bREAL\b", "DOUBLE PRECISION", stmt, flags=re.IGNORECASE)
+        # SQLite's BLOB is Postgres' BYTEA (used for the Proposal appendix PDF).
+        stmt = re.sub(r"\bBLOB\b", "BYTEA", stmt, flags=re.IGNORECASE)
+        return stmt
+
+    # -----------------------------------------------------------------
+    # Migrations
+    #
+    # Each entry is (version, name, callable). The runner applies each
+    # migration exactly once, records it in _SchemaMigrations, and commits.
+    # Versions are monotonically increasing integers — do not renumber or
+    # remove existing migrations. To add a new one, append the next version.
+    # Migrations must be idempotent: they run against both fresh databases
+    # (after CREATE TABLE) and existing databases that may already have the
+    # new columns from earlier ad-hoc ALTERs, so guard with PRAGMA checks.
+    # -----------------------------------------------------------------
+
+    MIGRATIONS = None  # populated just below __init_subclass__ — see end of class
+
+    def _add_column_if_missing(self, table: str, column: str, definition: str) -> None:
+        if column not in self._get_table_columns(table):
+            self.conn.execute(self._ddl(f'ALTER TABLE "{table}" ADD COLUMN {column} {definition}'))
+            self._col_cache.pop(table, None)
+            self._text_col_cache.pop(table, None)
+
+    def _alter_table_lock_safe(self, statements, cache_tables, *,
+                               lock_timeout_ms=3000, retries=8, backoff=0.5):
+        """Run ALTER TABLE DDL with a bounded lock wait + retry on Postgres.
+
+        A schema change (ADD/DROP COLUMN) needs an ACCESS EXCLUSIVE lock; during
+        a rolling deploy the OLD app revision is still live and querying the
+        table, so an unbounded ALTER blocks *indefinitely* — and because these
+        migrations run in the app lifespan before it serves, a blocked ALTER
+        fails the container's startup probe and crash-loops the revision (this
+        actually happened in production). Bounding `lock_timeout` turns "hang
+        forever" into "fail fast", and retrying catches a gap between the old
+        revision's queries. If every attempt times out it raises, so the caller
+        (e.g. the plugin migration runner) can retry on the next boot rather
+        than hang. SQLite has no concurrent revision, so it runs directly."""
+        if self.dialect != "postgres":
+            for s in statements:
+                self.conn.execute(self._ddl(s))
+            self.conn.commit()
+            for t in cache_tables:
+                self._col_cache.pop(t, None)
+                self._text_col_cache.pop(t, None)
+            return
+
+        import time as _time
+        last = None
+        try:
+            for _ in range(retries):
+                try:
+                    self.conn.execute(f"SET lock_timeout = '{int(lock_timeout_ms)}ms'")
+                    for s in statements:
+                        self.conn.execute(self._ddl(s))
+                    self.conn.commit()
+                    for t in cache_tables:
+                        self._col_cache.pop(t, None)
+                        self._text_col_cache.pop(t, None)
+                    return
+                except Exception as e:
+                    last = e
+                    self.conn.rollback()
+                    _time.sleep(backoff)
+            raise RuntimeError(
+                f"lock-contended DDL failed after {retries} attempts: {statements!r}: {last!r}"
+            )
+        finally:
+            # lock_timeout is a session setting; restore the default so it
+            # doesn't leak onto later queries on this (pooled) connection.
+            try:
+                self.conn.execute("RESET lock_timeout")
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+
+    def ensure_column(self, table: str, column: str, definition: str) -> None:
+        """Idempotently add a column if it's missing, LOCK-SAFELY. Public helper
+        for plugin migrations registered via api.services.register_migration.
+
+        On Postgres the ADD COLUMN is bounded by `lock_timeout` + retry so a
+        migration can't hang the boot against a live old revision during a
+        rolling deploy (see _alter_table_lock_safe). SQLite adds directly. The
+        `definition` is the SQLite-flavoured column type (e.g. "TEXT",
+        "INTEGER DEFAULT 0"); it is translated per dialect via _ddl."""
+        if column in self._get_table_columns(table):
+            return
+        self._alter_table_lock_safe(
+            [f'ALTER TABLE "{table}" ADD COLUMN {column} {definition}'], [table])
+
+    def drop_column(self, table: str, column: str) -> None:
+        """Idempotently drop a column if present, LOCK-SAFELY (same rolling-deploy
+        protection as ensure_column). No-op if the column is already gone.
+        Requires SQLite >= 3.35 for the SQLite backend (DROP COLUMN support)."""
+        if column not in self._get_table_columns(table):
+            return
+        self._alter_table_lock_safe(
+            [f'ALTER TABLE "{table}" DROP COLUMN "{column}"'], [table])
+
+    def _migrate(self):
+        """Run each pending migration in order, tracking applied versions."""
+        self.conn.execute(
+            """CREATE TABLE IF NOT EXISTS "_SchemaMigrations" (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+            )"""
+        )
+        self.conn.commit()
+
+        applied = {
+            row[0]
+            for row in self.conn.execute('SELECT version FROM "_SchemaMigrations"').fetchall()
+        }
+
+        for version, name, fn in self.MIGRATIONS:
+            if version in applied:
+                continue
+            try:
+                fn(self)
+                self.conn.execute(
+                    'INSERT INTO "_SchemaMigrations" (version, name, applied_at) VALUES (?, ?, ?)',
+                    [version, name, _datetime.datetime.utcnow().isoformat(timespec="seconds")],
+                )
+                self.conn.commit()
+            except Exception:
+                # Preserve the historical best-effort policy for migrations
+                # 1–31. New migrations must fail visibly: running without a
+                # required column or uniqueness constraint is not safe.
+                self.conn.rollback()
+                if version >= 32:
+                    raise RuntimeError(f"Required migration {version} ({name}) failed")
+
+    def _all_user_tables(self) -> list:
+        """Base tables in the active DB, minus internal bookkeeping."""
+        if self.dialect == "postgres":
+            rows = self.conn.execute(
+                "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        return [
+            r[0] for r in rows
+            if not str(r[0]).startswith("_") and not str(r[0]).startswith("sqlite_")
+        ]
+
+    def _ensure_list_indexes(self) -> None:
+        """Reconcile legacy creation indexes and parsed-instant list indexes.
+
+        PostgreSQL indexes parsed instants for efficient range queries. SQLite
+        evaluates the parser at query time: persisting an index that calls a
+        connection-local UDF would break ordinary sqlite3 writers and imports.
+        Apply after core/plugin schema setup; failures retry on subsequent boots.
+        """
+        for table in self._all_user_tables():
+            try:
+                columns = self._get_table_columns(table)
+                text_columns = self._get_text_columns(table)
+            except Exception:
+                continue
+            indexes = []
+            if "creation" in columns:
+                indexes.append((f"ix_{table.replace(' ', '_')}_creation", '"creation"'))
+            if "name" in columns:
+                for field in ("creation", "modified", "occurred_at"):
+                    if field in text_columns:
+                        # Hash names to stay within PostgreSQL's 63-byte limit.
+                        import hashlib
+                        suffix = hashlib.sha256(f"{table}/{field}".encode()).hexdigest()[:16]
+                        idx = f"ix_time_{suffix}"
+                        if self.dialect == "postgres":
+                            indexes.append((idx, f'erp_timestamp_epoch("{field}"), name'))
+                        else:
+                            # Remove only our prototype's own indexes on any
+                            # database that ran the pre-release master commit.
+                            self.conn.execute(f'DROP INDEX IF EXISTS "{idx}"')
+                            self.conn.commit()
+            for idx, expression in indexes:
+                try:
+                    self.conn.execute(f'CREATE INDEX IF NOT EXISTS "{idx}" ON "{table}" ({expression})')
+                    self.conn.commit()
+                except Exception:
+                    self.conn.rollback()
+
+    # --- Core query interface (mirrors framework.db) ---
+
+    def sql(self, query, values=None, as_dict=True):
+        """Execute raw SQL. Mirrors framework.db.sql().
+
+        For file DBs the lock is a no-op: each thread has its own connection,
+        and SQLite's own file-level locking + WAL is enough. For :memory:
+        the Python lock prevents concurrent execute() calls on the single
+        shared connection (which otherwise raises "bad parameter or other
+        API misuse").
+        """
+        with self._lock:
+            cursor = self.conn.execute(query, values or [])
+            # Only fetch when the statement produced a result set. SQLite's
+            # fetchall() after an INSERT/UPDATE/DELETE harmlessly returns [];
+            # psycopg raises ("the last operation didn't produce records"). A
+            # NULL cursor.description means no result set on both drivers.
+            rows = cursor.fetchall() if cursor.description is not None else []
+        if as_dict:
+            return [_dict(dict(row)) for row in rows]
+        return [tuple(row) for row in rows]
+
+    def get_value(self, doctype, name, fieldname=None, filters=None):
+        """Get a single field value. Mirrors framework.db.get_value().
+
+        Usage:
+            db.get_value("Customer", "CUST-001", "customer_name")
+            db.get_value("Customer", {"customer_group": "Retail"}, "name")
+        """
+        if fieldname is None:
+            fieldname = "name"
+
+        fields = fieldname if isinstance(fieldname, (list, tuple)) else [fieldname]
+        field_str = self._select_fields(doctype, fields)
+
+        if isinstance(name, dict) or filters:
+            filt = name if isinstance(name, dict) else (filters or {})
+            where_parts = []
+            params = []
+            for k, v in filt.items():
+                where_parts.append(f'"{k}" = ?')
+                params.append(v)
+            where = " AND ".join(where_parts) if where_parts else "1=1"
+            query = f'SELECT {field_str} FROM "{doctype}" WHERE {where} LIMIT 1'
+            rows = self.sql(query, params)
+        else:
+            query = f'SELECT {field_str} FROM "{doctype}" WHERE name = ? LIMIT 1'
+            rows = self.sql(query, [name])
+
+        if not rows:
+            return None
+
+        if isinstance(fieldname, (list, tuple)):
+            return rows[0]
+        return rows[0].get(fieldname)
+
+    def get_all(self, doctype, filters=None, fields=None, order_by=None, limit=None):
+        """Get all matching records. Mirrors framework.db.get_all()."""
+        if fields is None:
+            fields = ["name"]
+        if isinstance(fields, str):
+            fields = [fields]
+
+        if fields == ["*"]:
+            field_str = "*"
+        else:
+            field_str = self._select_fields(doctype, fields)
+        query = f'SELECT {field_str} FROM "{doctype}"'
+
+        params = []
+        if filters:
+            where_parts = []
+            for k, v in filters.items():
+                if isinstance(v, (list, tuple)) and len(v) == 2:
+                    op, val = v
+                    where_parts.append(f'"{k}" {op} ?')
+                    params.append(val)
+                else:
+                    where_parts.append(f'"{k}" = ?')
+                    params.append(v)
+            query += " WHERE " + " AND ".join(where_parts)
+
+        if order_by:
+            query += f" ORDER BY {order_by}"
+        if limit:
+            query += f" LIMIT {limit}"
+
+        return self.sql(query, params)
+
+    def set_value(self, doctype, name, fieldname, value=None):
+        """Set a single field value. Mirrors framework.db.set_value()."""
+        if doctype in _TIMED_MASTERS:
+            fields = dict(fieldname) if isinstance(fieldname, dict) else {fieldname: value}
+            if "modified" in self._get_table_columns(doctype):
+                fields.setdefault("modified", now())
+            fieldname = fields
+        if isinstance(fieldname, dict):
+            sets = ", ".join(f'"{k}" = ?' for k in fieldname)
+            params = list(fieldname.values()) + [name]
+        else:
+            sets = f'"{fieldname}" = ?'
+            params = [value, name]
+
+        with self._lock:
+            self.conn.execute(f'UPDATE "{doctype}" SET {sets} WHERE name = ?', params)
+            if not self._in_transaction:
+                self.conn.commit()
+
+    def exists(self, doctype, name=None, filters=None):
+        """Check if a record exists."""
+        if name and not filters:
+            rows = self.sql(f'SELECT name FROM "{doctype}" WHERE name = ?', [name])
+        elif filters:
+            where_parts = []
+            params = []
+            for k, v in filters.items():
+                where_parts.append(f'"{k}" = ?')
+                params.append(v)
+            where = " AND ".join(where_parts)
+            rows = self.sql(f'SELECT name FROM "{doctype}" WHERE {where} LIMIT 1', params)
+        else:
+            return False
+        return bool(rows)
+
+    def _get_table_columns(self, doctype):
+        """Get column names for a table (cached; invalidated on ALTER)."""
+        cached = self._col_cache.get(doctype)
+        if cached is not None:
+            return cached
+        if self.dialect == "postgres":
+            rows = self.conn.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = ?",
+                [doctype],
+            ).fetchall()
+            cols = {row[0] for row in rows}
+        else:
+            cursor = self.conn.execute(f'PRAGMA table_info("{doctype}")')
+            cols = {row[1] for row in cursor.fetchall()}
+        self._col_cache[doctype] = cols
+        return cols
+
+    def _get_text_columns(self, doctype):
+        """Text/character columns of a table — the ones worth matching a
+        free-text search against. Discovered from the live schema so new
+        columns become searchable automatically. Cached; invalidated on ALTER."""
+        cached = self._text_col_cache.get(doctype)
+        if cached is not None:
+            return cached
+        if self.dialect == "postgres":
+            rows = self.conn.execute(
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_name = ?",
+                [doctype],
+            ).fetchall()
+            cols = {
+                row[0]
+                for row in rows
+                if "char" in (row[1] or "").lower() or (row[1] or "").lower() in ("text", "citext")
+            }
+        else:
+            cursor = self.conn.execute(f'PRAGMA table_info("{doctype}")')
+            cols = {
+                row[1]
+                for row in cursor.fetchall()
+                if any(t in (row[2] or "").upper() for t in ("CHAR", "CLOB", "TEXT"))
+            }
+        self._text_col_cache[doctype] = cols
+        return cols
+
+    def _select_fields(self, doctype, fields):
+        """Build the SELECT column list, selecting only columns that exist and
+        padding the rest as NULL. SQLite silently returns an unknown quoted
+        identifier as a string literal; Postgres errors. Padding missing fields
+        as NULL gives portable behaviour (None for absent columns) and supports
+        the cross-doctype field lists the codebase relies on."""
+        valid = self._get_table_columns(doctype)
+        return ", ".join(f'"{f}"' if f in valid else f'NULL AS "{f}"' for f in fields)
+
+    def insert(self, doctype, doc):
+        """Insert a record from a dict. Ignores fields not in the table schema."""
+        valid_columns = self._get_table_columns(doctype)
+        if doctype in _TIMED_MASTERS:
+            doc = dict(doc)
+            stamp = now()
+            for field in ("creation", "modified"):
+                if field in valid_columns and not doc.get(field):
+                    doc[field] = stamp
+        fields = [f for f in doc.keys() if f in valid_columns]
+        if not fields:
+            return
+        placeholders = ", ".join(["?"] * len(fields))
+        field_str = ", ".join(f'"{f}"' for f in fields)
+        values = [doc[f] for f in fields]
+        with self._lock:
+            self.conn.execute(
+                f'INSERT INTO "{doctype}" ({field_str}) VALUES ({placeholders})', values
+            )
+            if not self._in_transaction:
+                self.conn.commit()
+
+    def insert_many(self, doctype, docs):
+        """Insert multiple records."""
+        if not docs:
+            return
+        if doctype in _TIMED_MASTERS:
+            stamp = now()
+            columns = self._get_table_columns(doctype)
+            docs = [dict(doc) for doc in docs]
+            for doc in docs:
+                for field in ("creation", "modified"):
+                    if field in columns and not doc.get(field):
+                        doc[field] = stamp
+        fields = list(docs[0].keys())
+        placeholders = ", ".join(["?"] * len(fields))
+        field_str = ", ".join(f'"{f}"' for f in fields)
+        values = [[doc.get(f) for f in fields] for doc in docs]
+        self.conn.executemany(
+            f'INSERT INTO "{doctype}" ({field_str}) VALUES ({placeholders})', values
+        )
+        if not self._in_transaction:
+            self.conn.commit()
+
+    def delete(self, doctype, name=None, filters=None):
+        """Delete a record."""
+        with self._lock:
+            if name:
+                self.conn.execute(f'DELETE FROM "{doctype}" WHERE name = ?', [name])
+            elif filters:
+                where_parts = []
+                params = []
+                for k, v in filters.items():
+                    where_parts.append(f'"{k}" = ?')
+                    params.append(v)
+                where = " AND ".join(where_parts)
+                self.conn.execute(f'DELETE FROM "{doctype}" WHERE {where}', params)
+            if not self._in_transaction:
+                self.conn.commit()
+
+    @contextmanager
+    def atomic(self, *, exclusive_master_edit=False):
+        """Compose document/plugin writes, including nested operations."""
+        import uuid
+        with self._lock:
+            # Opening a thread's first connection initializes transaction state.
+            # Do this before marking the block active, or inserts may auto-commit.
+            self.conn
+            outer = self._in_transaction
+            if outer and exclusive_master_edit:
+                raise ValueError('Structural master edits must start their own transaction; lock upgrades inside a document workflow are unsupported')
+            point = 'atomic_' + uuid.uuid4().hex
+            self._in_transaction = True
+            try:
+                if not outer and self.dialect == 'sqlite' and not self.conn.in_transaction:
+                    # Take the write reservation before validating a snapshot.
+                    self.conn.execute('BEGIN IMMEDIATE')
+                self.sql(f'SAVEPOINT {point}')
+                try:
+                    if self.dialect == 'postgres':
+                        # Normal workflows share this lock and remain concurrent.
+                        # A rare structural master edit excludes them while checking
+                        # references, including the first concurrent use of a master.
+                        lock = 'pg_advisory_xact_lock' if exclusive_master_edit else 'pg_advisory_xact_lock_shared'
+                        self.sql(f'SELECT {lock}(?)', [715624180031])
+                    yield
+                except BaseException:
+                    self.sql(f'ROLLBACK TO SAVEPOINT {point}')
+                    self.sql(f'RELEASE SAVEPOINT {point}')
+                    if not outer:
+                        self.conn.rollback()
+                    raise
+                self.sql(f'RELEASE SAVEPOINT {point}')
+                if not outer:
+                    self.conn.commit()
+            except BaseException:
+                if not outer:
+                    self.conn.rollback()
+                raise
+            finally:
+                self._in_transaction = outer
+
+    def commit(self):
+        with self._lock:
+            self.conn.commit()
+
+    def rollback(self):
+        self.conn.rollback()
+
+    def close(self):
+        self.conn.close()
+
+
+# Module-level singleton, initialized by setup()
+# -----------------------------------------------------------------
+# Schema migrations
+#
+# Each tuple: (version: int, name: str, callable(db: Database) -> None).
+# Numbers are monotonic — never renumber or remove applied migrations.
+# Add new migrations by appending with the next integer.
+# -----------------------------------------------------------------
+
+def _m001_chat_message_session_id(db: "Database") -> None:
+    db._add_column_if_missing("Chat Message", "session_id", "TEXT")
+
+
+def _m002_chat_session_user_id(db: "Database") -> None:
+    db._add_column_if_missing("Chat Session", "user_id", "TEXT")
+
+
+def _m003_transactional_remarks(db: "Database") -> None:
+    for table in ("Quotation", "Sales Order", "Purchase Order"):
+        db._add_column_if_missing(table, "remarks", "TEXT")
+
+
+def _m004_master_disabled_flag(db: "Database") -> None:
+    for table in ("Company", "Cost Center", "Customer", "Supplier", "Item", "Warehouse"):
+        db._add_column_if_missing(table, "disabled", "INTEGER DEFAULT 0")
+
+
+def _m005_company_stock_in_hand_account(db: "Database") -> None:
+    # The field existed in code (purchase_receipt.py / delivery_note.py) but
+    # not in the schema. Without it, GL entries were silently skipped because
+    # SQLite's quoted-identifier quirk returns None instead of erroring.
+    db._add_column_if_missing("Company", "stock_in_hand_account", "TEXT")
+
+
+def _m006_company_opening_balance_equity(db: "Database") -> None:
+    # Added so opening-stock (and in future other opening-balance) flows have
+    # a dedicated contra instead of distorting Stock Adjustment or SRBNB.
+    db._add_column_if_missing("Company", "default_opening_balance_equity", "TEXT")
+
+
+def _m007_pos_invoice_return_fields(db: "Database") -> None:
+    # POS Invoice had no return flow; add the fields that mirror Sales
+    # Invoice so make_pos_return can record is_return/return_against.
+    db._add_column_if_missing("POS Invoice", "is_return", "INTEGER DEFAULT 0")
+    db._add_column_if_missing("POS Invoice", "return_against", "TEXT")
+
+
+def _m008_report_draft_source_chat_session_id(db: "Database") -> None:
+    db._add_column_if_missing("Report Draft", "source_chat_session_id", "TEXT")
+
+
+def _m009_company_charge_accounts(db: "Database") -> None:
+    """Add the two standard charge accounts (Freight In, Customs & Duties)
+    to every existing company and wire them onto the Company defaults.
+
+    For fresh companies going forward this is handled in
+    `setup_chart_of_accounts`. This migration backfills on-disk DBs that
+    predate the charge-account work so the LLM / UI has somewhere to
+    route supplier-invoice freight and customs charges.
+    """
+    db._add_column_if_missing("Company", "default_freight_in_account", "TEXT")
+    db._add_column_if_missing("Company", "default_customs_account", "TEXT")
+
+    companies = db.conn.execute('SELECT name FROM "Company"').fetchall()
+    for row in companies:
+        company = row[0]
+        abbr = company[:4].upper()
+        op_ex = f"Operating Expenses - {abbr}"
+        op_ex_exists = db.conn.execute(
+            'SELECT 1 FROM "Account" WHERE name = ?', [op_ex]
+        ).fetchone()
+        if not op_ex_exists:
+            # Odd shape — skip silently rather than crash the migration.
+            continue
+
+        for label, acct_type in (("Freight In", "Chargeable"),
+                                 ("Customs & Duties", "Chargeable")):
+            acct_name = f"{label} - {abbr}"
+            exists = db.conn.execute(
+                'SELECT 1 FROM "Account" WHERE name = ?', [acct_name]
+            ).fetchone()
+            if exists:
+                continue
+            db.conn.execute(
+                'INSERT INTO "Account" (name, account_name, parent_account, '
+                'company, root_type, report_type, account_type, '
+                'account_currency, is_group) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)',
+                [acct_name, label, op_ex, company, "Expense",
+                 "Profit and Loss", acct_type,
+                 db.conn.execute(
+                     'SELECT default_currency FROM "Company" WHERE name = ?',
+                     [company],
+                 ).fetchone()[0] or "USD"],
+            )
+
+        db.conn.execute(
+            'UPDATE "Company" SET '
+            'default_freight_in_account = COALESCE(default_freight_in_account, ?), '
+            'default_customs_account = COALESCE(default_customs_account, ?) '
+            'WHERE name = ?',
+            [f"Freight In - {abbr}", f"Customs & Duties - {abbr}", company],
+        )
+
+
+def _m010_master_zip_code(db: "Database") -> None:
+    # Postal code is free text — values like "8400", "ZH 8400" and "59123" are
+    # all valid — so it's TEXT, never numeric.
+    for table in ("Company", "Customer", "Supplier", "Warehouse"):
+        db._add_column_if_missing(table, "zip_code", "TEXT")
+    # Warehouse never had an address block in the schema even though the form
+    # exposes an Address field; add it so warehouse address/city/country/zip
+    # actually persist (set_value would otherwise error on the missing columns).
+    for col in ("address", "city", "country"):
+        db._add_column_if_missing("Warehouse", col, "TEXT")
+
+
+def _m011_payment_entry_currency(db: "Database") -> None:
+    # Payment Entry gains a currency + conversion_rate so it can settle a
+    # foreign-currency invoice and post realized FX gain/loss.
+    db._add_column_if_missing("Payment Entry", "currency", "TEXT DEFAULT 'USD'")
+    db._add_column_if_missing("Payment Entry", "conversion_rate", "REAL DEFAULT 1.0")
+
+
+def _m012_exchange_gain_loss_account(db: "Database") -> None:
+    """Add the Exchange Gain/Loss account to every existing company and wire it
+    onto Company.default_exchange_gain_loss_account. Mirrors the charge-account
+    backfill (_m009); fresh companies get it via setup_chart_of_accounts.
+    """
+    db._add_column_if_missing("Company", "default_exchange_gain_loss_account", "TEXT")
+
+    companies = db.conn.execute('SELECT name FROM "Company"').fetchall()
+    for row in companies:
+        company = row[0]
+        abbr = company[:4].upper()
+        op_ex = f"Operating Expenses - {abbr}"
+        if not db.conn.execute('SELECT 1 FROM "Account" WHERE name = ?', [op_ex]).fetchone():
+            continue
+
+        acct_name = f"Exchange Gain/Loss - {abbr}"
+        if not db.conn.execute('SELECT 1 FROM "Account" WHERE name = ?', [acct_name]).fetchone():
+            currency = db.conn.execute(
+                'SELECT default_currency FROM "Company" WHERE name = ?', [company]
+            ).fetchone()[0] or "USD"
+            db.conn.execute(
+                'INSERT INTO "Account" (name, account_name, parent_account, company, '
+                'root_type, report_type, account_type, account_currency, is_group) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)',
+                [acct_name, "Exchange Gain/Loss", op_ex, company, "Expense",
+                 "Profit and Loss", "", currency],
+            )
+
+        db.conn.execute(
+            'UPDATE "Company" SET default_exchange_gain_loss_account = '
+            'COALESCE(default_exchange_gain_loss_account, ?) WHERE name = ?',
+            [acct_name, company],
+        )
+
+
+def _m013_unrealized_exchange_account(db: "Database") -> None:
+    """Add the Unrealized Exchange Gain/Loss account to every existing company
+    and wire Company.default_unrealized_exchange_account. Mirrors _m012."""
+    db._add_column_if_missing("Company", "default_unrealized_exchange_account", "TEXT")
+
+    companies = db.conn.execute('SELECT name FROM "Company"').fetchall()
+    for row in companies:
+        company = row[0]
+        abbr = company[:4].upper()
+        op_ex = f"Operating Expenses - {abbr}"
+        if not db.conn.execute('SELECT 1 FROM "Account" WHERE name = ?', [op_ex]).fetchone():
+            continue
+
+        acct_name = f"Unrealized Exchange Gain/Loss - {abbr}"
+        if not db.conn.execute('SELECT 1 FROM "Account" WHERE name = ?', [acct_name]).fetchone():
+            currency = db.conn.execute(
+                'SELECT default_currency FROM "Company" WHERE name = ?', [company]
+            ).fetchone()[0] or "USD"
+            db.conn.execute(
+                'INSERT INTO "Account" (name, account_name, parent_account, company, '
+                'root_type, report_type, account_type, account_currency, is_group) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)',
+                [acct_name, "Unrealized Exchange Gain/Loss", op_ex, company, "Expense",
+                 "Profit and Loss", "", currency],
+            )
+
+        db.conn.execute(
+            'UPDATE "Company" SET default_unrealized_exchange_account = '
+            'COALESCE(default_unrealized_exchange_account, ?) WHERE name = ?',
+            [acct_name, company],
+        )
+
+
+def _m014_company_iban(db: "Database") -> None:
+    """Add Company.iban (bank account for payment instructions / QR-bills)."""
+    db._add_column_if_missing("Company", "iban", "TEXT")
+
+
+# Submittable transactional doctypes — those with a Draft/Submitted/Cancelled
+# lifecycle. `discarded` is the soft-delete flag for voided drafts.
+_SUBMITTABLE_DOCTYPES = (
+    "Quotation", "Sales Order", "Sales Invoice", "Delivery Note",
+    "Purchase Order", "Purchase Invoice", "Purchase Receipt",
+    "Payment Entry", "Journal Entry", "Stock Entry", "POS Invoice",
+)
+
+
+def _m015_document_discarded(db: "Database") -> None:
+    """Add the `discarded` soft-delete flag to every submittable doctype.
+
+    Voiding an unwanted DRAFT sets discarded=1 (status 'Discarded') instead of
+    hard-deleting it — the row is kept for the audit trail and hidden from
+    default lists. Cancel (for submitted docs) is unaffected."""
+    for table in _SUBMITTABLE_DOCTYPES:
+        db._add_column_if_missing(table, "discarded", "INTEGER DEFAULT 0")
+
+
+def _m016_customer_contact_person(db: "Database") -> None:
+    """Add a named contact person (Ansprechperson) to the Customer master:
+    a free-text name plus their own email and phone, kept separate from the
+    company-level email/phone already on the record."""
+    db._add_column_if_missing("Customer", "contact_person", "TEXT")
+    db._add_column_if_missing("Customer", "contact_email", "TEXT")
+    db._add_column_if_missing("Customer", "contact_phone", "TEXT")
+
+
+def _m017_proposal_cover_template(db: "Database") -> None:
+    """Add Company.proposal_cover_template — the default cover-letter text a new
+    Proposal (Sammelofferte) pre-fills, so account managers don't retype the
+    salutation/intro every time. May contain {placeholders} resolved at build.
+
+    The Proposal / Proposal Item / Proposal Appendix tables themselves are
+    created by _setup_schema (CREATE TABLE IF NOT EXISTS runs every startup);
+    only this column on the pre-existing Company table needs a migration."""
+    db._add_column_if_missing("Company", "proposal_cover_template", "TEXT")
+
+
+def _m018_quotation_item_frequency(db: "Database") -> None:
+    """Add Quotation Item.frequency — the billing cadence of an offer line
+    (One-time / Monthly / Quarterly / Half-Yearly / Yearly, matching the
+    Subscription billing intervals). One-time and recurring lines are totalled
+    separately on the offer; existing rows are NULL, treated as One-time."""
+    db._add_column_if_missing("Quotation Item", "frequency", "TEXT")
+
+
+def _m019_api_keys_per_user(db: "Database") -> None:
+    """API keys v2 — per-user credentials (clean break, deliberate).
+
+    v1 keys were org-global objects minted by admins with a free-standing role
+    and a synthetic identity; anyone holding the token WAS the key. v2 binds
+    every key to a User (self-service creation, effective role capped by the
+    owner's live role). Existing v1 rows are DROPPED, not migrated — decided
+    2026-07-14: no legacy rules; holders simply re-issue their keys.
+    """
+    if "owner" in db._get_table_columns("Api Key"):
+        return  # fresh install — table already has the v2 shape
+    db.conn.execute('DROP TABLE "Api Key"')
+    db.conn.execute(
+        """CREATE TABLE "Api Key" (
+            id TEXT PRIMARY KEY,
+            name TEXT,
+            owner TEXT NOT NULL,
+            key_hash TEXT UNIQUE,
+            key_prefix TEXT,
+            role TEXT DEFAULT 'manager',
+            session_owner TEXT,
+            created_at TEXT,
+            last_used_at TEXT,
+            revoked INTEGER DEFAULT 0
+        )"""
+    )
+    db._col_cache.pop("Api Key", None)
+    db._text_col_cache.pop("Api Key", None)
+
+
+def _m020_chat_attachment_openai_file(db: "Database") -> None:
+    """Cache the OpenAI Files API id (+ its expiry) on a chat attachment, so an
+    uploaded Office file is sent to the model by file_id — reused across turns
+    and re-uploaded only once its 30-day expires_after lapses."""
+    db._add_column_if_missing("Chat Attachment", "openai_file_id", "TEXT")
+    db._add_column_if_missing("Chat Attachment", "openai_file_expires_at", "INTEGER")
+
+
+def _m021_item_is_asset_tracked(db: "Database") -> None:
+    """Opt an Item in to unit-level Asset tracking. Defaults to 0, so every
+    existing item in every existing deployment keeps behaving exactly as
+    before — no stock movement starts demanding unit identities. Only items a
+    user explicitly flags get Assets and reservations."""
+    db._add_column_if_missing("Item", "is_asset_tracked", "INTEGER DEFAULT 0")
+
+
+def _m022_company_default_tax_templates(db: "Database") -> None:
+    """Per-company default sales/purchase Tax Templates. When a selling/buying
+    document is created with NO `taxes` rows at all, create_document applies the
+    matching default so VAT/MWST is not silently omitted (see api/services.py).
+    Both default to NULL, so existing deployments are unaffected until a default
+    is wired — e.g. the CH pack points the sales default at the 8.1% MWST
+    template. Passing an explicit empty `taxes: []` still means a tax-free doc."""
+    db._add_column_if_missing("Company", "default_sales_tax_template", "TEXT")
+    db._add_column_if_missing("Company", "default_purchase_tax_template", "TEXT")
+
+
+def _m023_camt_bank_statement_import(db: "Database") -> None:
+    """Extend existing Bank Transactions with lossless CAMT import metadata.
+
+    The new Bank Account/import/detail tables are created by the normal
+    CREATE TABLE IF NOT EXISTS schema pass before migrations run. Only the
+    pre-existing Bank Transaction table needs additive columns here.
+    """
+    columns = {
+        "bank_account_id": "TEXT",
+        "bank_statement_import": "TEXT",
+        "value_date": "TEXT",
+        "currency": "TEXT",
+        "remittance_information": "TEXT",
+        "external_id": "TEXT",
+        "weak_external_id": "INTEGER DEFAULT 0",
+        "account_service_reference": "TEXT",
+        "entry_reference": "TEXT",
+        "credit_debit_indicator": "TEXT",
+        "reversal_indicator": "INTEGER DEFAULT 0",
+        "bank_transaction_code": "TEXT",
+        "proprietary_bank_code": "TEXT",
+        "batch_transaction_count": "INTEGER",
+        "counterparty_name": "TEXT",
+        "counterparty_iban": "TEXT",
+        "end_to_end_id": "TEXT",
+        "payment_information_id": "TEXT",
+        "uetr": "TEXT",
+        "structured_reference_type": "TEXT",
+        "structured_reference": "TEXT",
+        "exchange_source_currency": "TEXT",
+        "exchange_target_currency": "TEXT",
+        "exchange_rate": "REAL",
+        "detail_count": "INTEGER DEFAULT 0",
+    }
+    existing = db._get_table_columns("Bank Transaction")
+    statements = [
+        f'ALTER TABLE "Bank Transaction" ADD COLUMN {column} {definition}'
+        for column, definition in columns.items()
+        if column not in existing
+    ]
+    statements.append(
+        'CREATE UNIQUE INDEX IF NOT EXISTS "ux_bank_transaction_external_id" '
+        'ON "Bank Transaction" (external_id)'
+    )
+    db._alter_table_lock_safe(statements, ["Bank Transaction"])
+
+
+def _m024_bank_reconciliation(db: "Database") -> None:
+    """Add auditable CAMT reconciliation links to existing accounting data."""
+    db._add_column_if_missing("Payment Entry", "bank_reconciliation", "TEXT")
+    db._add_column_if_missing("Journal Entry", "bank_reconciliation", "TEXT")
+    db._add_column_if_missing("Journal Entry Account", "reference_doctype", "TEXT")
+    db._add_column_if_missing("Bank Transaction", "reconciled_by", "TEXT")
+    db._add_column_if_missing("Bank Transaction", "reconciled_at", "TEXT")
+
+
+def _m025_bank_reconciliation_multi_account_voucher(db: "Database") -> None:
+    """Allow one voucher to reconcile one bank movement per bank account.
+
+    Version 24 allowed only one active reconciliation for an entire voucher.
+    That rejects legitimate multi-bank journals (for example one CHF fee and
+    one USD fee collected in a single Journal Entry). Keep the conservative
+    one-use rule at the bank-account leg instead.
+    """
+    db.ensure_column("Bank Reconciliation", "bank_account", "TEXT")
+    db._alter_table_lock_safe([
+        'DROP INDEX IF EXISTS "ux_bank_reconciliation_active_voucher"',
+        'UPDATE "Bank Reconciliation" SET bank_account = ('
+        'SELECT bt.bank_account FROM "Bank Transaction" bt '
+        'WHERE bt.name = bank_transaction'
+        ') WHERE bank_account IS NULL',
+        'CREATE UNIQUE INDEX IF NOT EXISTS "ux_bank_reconciliation_active_voucher_account" '
+        'ON "Bank Reconciliation" (voucher_type, voucher_no, bank_account) '
+        "WHERE status = 'Active'",
+    ], ["Bank Reconciliation"])
+
+
+def _m026_bank_reconciliation_groups(db: "Database") -> None:
+    """Allow one exact voucher bank leg to cover a group of transactions.
+
+    A group has one head row so the database can still enforce that a voucher's
+    bank-account movement is consumed at most once, while every imported bank
+    transaction retains its own auditable reconciliation row.
+    """
+    db.ensure_column("Bank Reconciliation", "group_id", "TEXT")
+    db.ensure_column("Bank Reconciliation", "group_head", "INTEGER DEFAULT 1")
+    db._alter_table_lock_safe([
+        'UPDATE "Bank Reconciliation" SET group_id = name WHERE group_id IS NULL',
+        'UPDATE "Bank Reconciliation" SET group_head = 1 WHERE group_head IS NULL',
+        'DROP INDEX IF EXISTS "ux_bank_reconciliation_active_voucher_account"',
+        'CREATE UNIQUE INDEX IF NOT EXISTS "ux_bank_reconciliation_active_group_head" '
+        'ON "Bank Reconciliation" (voucher_type, voucher_no, bank_account) '
+        "WHERE status = 'Active' AND group_head = 1",
+    ], ["Bank Reconciliation"])
+
+
+def _m027_reservation_allocation_mode(db: "Database") -> None:
+    db.ensure_column("Reservation", "allocation_mode", "TEXT")
+    db._alter_table_lock_safe([
+        'UPDATE "Reservation" SET allocation_mode = '
+        "CASE WHEN COALESCE(asset, '') = '' THEN 'Pool' ELSE 'Unit' END "
+        "WHERE allocation_mode IS NULL",
+    ], ["Reservation"])
+
+
+def _m028_order_planning(db: "Database") -> None:
+    """Repair derived counters only; never change vouchers or posted ledgers."""
+    with db.atomic():
+        for order, movement, move_line, invoice, inv_line, progress, percent, planning in (
+            ('Sales Order', 'Delivery Note', 'so_detail', 'Sales Invoice', 'sales_order_item', 'delivered_qty', 'per_delivered', 'reserved_qty'),
+            ('Purchase Order', 'Purchase Receipt', 'po_detail', 'Purchase Invoice', 'purchase_order_item', 'received_qty', 'per_received', 'ordered_qty'),
+        ):
+            for kind, field in ((movement, move_line), (invoice, inv_line)):
+                index = 'idx_' + kind.lower().replace(' ', '_') + '_order_line'
+                db.sql(f'CREATE INDEX IF NOT EXISTS "{index}" ON "{kind} Item" ("{field}")')
+            def total(kind, line, stock_only=False):
+                return (f'(SELECT COALESCE(SUM(r.qty), 0) FROM "{kind} Item" r '
+                        f'JOIN "{kind}" p ON p.name = r.parent WHERE r."{line}" = i.name AND p.docstatus = 1'
+                        + (' AND p.update_stock = 1' if stock_only else '') + ')')
+            db.sql(f'UPDATE "{order} Item" AS i SET "{progress}" = {total(movement, move_line)} + {total(invoice, inv_line, True)}, billed_qty = {total(invoice, inv_line)}')
+            assignments = []
+            for child, parent in ((progress, percent), ('billed_qty', 'per_billed')):
+                if parent in db._get_table_columns(order):
+                    assignments.append(f'"{parent}" = COALESCE((SELECT SUM(i."{child}") * 100.0 / NULLIF(SUM(i.qty), 0) FROM "{order} Item" i WHERE i.parent = o.name), 0)')
+            db.sql(f'UPDATE "{order}" AS o SET ' + ', '.join(assignments))
+            db.sql(f'INSERT INTO "Bin" (name, item_code, warehouse) '
+                   f'SELECT DISTINCT i.item_code || \'-\' || i.warehouse, i.item_code, i.warehouse FROM "{order} Item" i '
+                   f'JOIN "{order}" p ON p.name = i.parent JOIN "Item" m ON m.name = i.item_code '
+                   'JOIN "Warehouse" w ON w.name = i.warehouse WHERE p.docstatus = 1 AND m.is_stock_item = 1 '
+                   'ON CONFLICT DO NOTHING')
+            db.sql(f'UPDATE "Bin" AS b SET "{planning}" = (SELECT COALESCE(SUM(CASE WHEN i.qty > COALESCE(i."{progress}", 0) '
+                   f'THEN i.qty - COALESCE(i."{progress}", 0) ELSE 0 END), 0) FROM "{order} Item" i '
+                   f'JOIN "{order}" p ON p.name = i.parent JOIN "Item" m ON m.name = i.item_code '
+                   'WHERE p.docstatus = 1 AND m.is_stock_item = 1 AND i.item_code = b.item_code AND i.warehouse = b.warehouse)')
+        db.sql('UPDATE "Sales Order" SET status = CASE WHEN per_delivered >= 100 AND per_billed >= 100 THEN \'Completed\' '
+               'WHEN per_delivered > 0 AND per_delivered < 100 THEN \'To Deliver\' '
+               'WHEN per_billed > 0 AND per_billed < 100 THEN \'To Bill\' ELSE \'To Deliver and Bill\' END WHERE docstatus = 1')
+
+
+def _m029_subscription_discarded(db: "Database") -> None:
+    db._add_column_if_missing('Subscription', 'discarded', 'INTEGER DEFAULT 0')
+    db.sql("UPDATE \"Subscription\" SET discarded = 1 WHERE status = 'Discarded'")
+    for table in ('Sales Invoice', 'Purchase Invoice'):
+        db._add_column_if_missing(table, 'subscription', 'TEXT')
+
+
+def _m030_generated_pdfs(db: "Database") -> None:
+    # The shared startup DDL creates the table (BLOB -> BYTEA on Postgres).
+    db.sql('CREATE INDEX IF NOT EXISTS idx_generated_pdf_expiry ON "Generated PDF" (expires_at)')
+
+
+def _m031_time_queries(db):
+    if db.dialect == "postgres":
+        db.conn.execute(POSTGRES_TIMESTAMP_FUNCTION)
+    # Historical timestamps are unknown: leave existing rows NULL. Filling them
+    # with migration time would falsely report every old master as new activity.
+    for table in _TIMED_MASTERS:
+        db.ensure_column(table, "creation", "TEXT")
+        db.ensure_column(table, "modified", "TEXT")
+
+
+# Document tables whose lines carry an externally-agreed price, and which can
+# therefore opt out of Pricing Rule application. Both invoice types, both
+# orders and the quotation: every document `apply_pricing_rules` touches.
+_PRICED_DOCUMENTS = [
+    ("Quotation", "Quotation Item"),
+    ("Sales Order", "Sales Order Item"),
+    ("Sales Invoice", "Sales Invoice Item"),
+    ("POS Invoice", "POS Invoice Item"),
+    ("Purchase Order", "Purchase Order Item"),
+    ("Purchase Invoice", "Purchase Invoice Item"),
+]
+
+
+def _m032_ignore_pricing_rule(db: "Database") -> None:
+    """Let a document declare that its rates were agreed elsewhere.
+
+    Before this, the only way to stop `apply_pricing_rules` overwriting a
+    supplied rate was to send rate=0 — which the engine reads as an explicit
+    free line, the opposite of what an externally-priced line means. A partner
+    system that has already computed a contractual charge had no way to say so,
+    and because pricing runs inside validate() the overwrite also repeated on
+    every later draft save.
+
+    Defaults to 0 everywhere, so existing documents price exactly as before.
+    The per-item flag covers mixed documents where only some lines are
+    externally priced."""
+    for doc_table, item_table in _PRICED_DOCUMENTS:
+        db.ensure_column(doc_table, "ignore_pricing_rule", "INTEGER DEFAULT 0")
+        db.ensure_column(item_table, "ignore_pricing_rule", "INTEGER DEFAULT 0")
+        # The engine has always stamped the winning rule onto the line, but no
+        # item table had the column, so db.insert silently dropped it and the
+        # provenance was lost. Persist it: "why is this rate what it is" is the
+        # first question anyone asks about an automatically adjusted price.
+        db.ensure_column(item_table, "pricing_rule", "TEXT")
+
+
+def _m033_external_source(db: "Database") -> None:
+    """Identify documents owned by an upstream system.
+
+    An integration that creates documents here needs a durable, unique handle
+    on what it already sent, so a retry after an uncertain outcome finds the
+    existing document instead of creating a second one. HTTP-level idempotency
+    is not enough: the retry may happen days later, from another process.
+
+    The same marker also makes two invariants structural rather than
+    conventional. An externally-sourced document defaults to
+    ignore_pricing_rule=1 (its rates are already agreed), and must not carry
+    update_stock=1 (the upstream system's own stock movement already accounts
+    for the goods; see the guard in accounting/sales_invoice.py)."""
+    for doc_table, item_table in _PRICED_DOCUMENTS:
+        db.ensure_column(doc_table, "external_source", "TEXT")
+        db.ensure_column(doc_table, "external_reference", "TEXT")
+        db.ensure_column(item_table, "external_line_reference", "TEXT")
+        # Partial index: rows without an external reference are the norm and
+        # must not collide with each other on NULL.
+        db.conn.execute(db._ddl(
+            f'CREATE UNIQUE INDEX IF NOT EXISTS '
+            f'"ux_{doc_table.replace(" ", "_").lower()}_external" '
+            f'ON "{doc_table}" (external_source, external_reference) '
+            f'WHERE external_source IS NOT NULL AND external_reference IS NOT NULL'
+        ))
+        db.conn.commit()
+
+
+def _m034_price_list(db: "Database") -> None:
+    """Base prices per customer class, replacing one global rate per item.
+
+    Item.standard_rate is a single number per item: every customer, every
+    currency, the same price. Customer.default_price_list has existed since the
+    first schema but pointed at nothing, and price_list_rate was a column on
+    every transaction line that no master ever populated — so a percentage
+    discount computed off it was a discount from an undefined base.
+
+    Price List + Item Price fill that layer. With no rows configured,
+    resolution falls through to standard_rate exactly as before."""
+    db.ensure_column("Company", "default_price_list", "TEXT")
+
+
+def _m035_pricing_rule_dimensions(db: "Database") -> None:
+    """Match rules on more than item_code.
+
+    The masters have carried customer_group, territory and item_group all
+    along; the rule engine looked at none of them, so expressing "wholesale
+    pays list minus 15%" needed one rule per item. Existing rules get
+    apply_on='Item Code' and a NULL applicable_for, which reproduces their
+    current matching exactly."""
+    db.ensure_column("Pricing Rule", "apply_on", "TEXT DEFAULT 'Item Code'")
+    db.ensure_column("Pricing Rule", "item_group", "TEXT")
+    db.ensure_column("Pricing Rule", "applicable_for", "TEXT")
+    db.ensure_column("Pricing Rule", "customer", "TEXT")
+    db.ensure_column("Pricing Rule", "customer_group", "TEXT")
+    db.ensure_column("Pricing Rule", "territory", "TEXT")
+    db.ensure_column("Pricing Rule", "supplier", "TEXT")
+    db.ensure_column("Pricing Rule", "max_qty", "REAL DEFAULT 0")
+    db.ensure_column("Pricing Rule", "min_amt", "REAL DEFAULT 0")
+    db.ensure_column("Pricing Rule", "max_amt", "REAL DEFAULT 0")
+    # Existing rows predate apply_on and must keep matching on item_code.
+    db.conn.execute(
+        'UPDATE "Pricing Rule" SET apply_on = ? WHERE apply_on IS NULL',
+        ["Item Code"],
+    )
+    db.conn.commit()
+
+
+def _m036_external_identity_integrity(db: "Database") -> None:
+    # Reconcile pre-release databases where m033 swallowed an index failure.
+    # Existing duplicates must be resolved explicitly; never erase their history.
+    _m033_external_source(db)
+    for _, item_table in _PRICED_DOCUMENTS:
+        db.conn.execute(db._ddl(
+            f'CREATE UNIQUE INDEX IF NOT EXISTS '
+            f'"ux_{item_table.replace(" ", "_").lower()}_external_line" '
+            f'ON "{item_table}" (parent, external_line_reference) '
+            f'WHERE external_line_reference IS NOT NULL'
+        ))
+    db.conn.commit()
+
+
+def _m037_pricing_record_lifecycle(db: "Database") -> None:
+    # Non-submittable documents still use draft/discard state in generic CRUD.
+    for table in ("Price List", "Item Price"):
+        db.ensure_column(table, "docstatus", "INTEGER DEFAULT 0")
+        db.ensure_column(table, "discarded", "INTEGER DEFAULT 0")
+
+
+def _m038_customer_website(db: "Database") -> None:
+    db.ensure_column("Customer", "website", "TEXT")
+
+
+def _m040_msme_document_intelligence(db: "Database") -> None:
+    """MSME document intelligence tables (see msme/documents/migrations.py)."""
+    from msme.documents.migrations import migrate_document_intelligence
+    migrate_document_intelligence(db)
+
+
+def _m041_msme_compliance_workspace(db: "Database") -> None:
+    """MSME compliance workspace tables (see msme/compliance/migrations.py)."""
+    from msme.compliance.migrations import migrate_compliance_workspace
+    migrate_compliance_workspace(db)
+
+
+def _m042_msme_credit_readiness(db: "Database") -> None:
+    """MSME credit-readiness and scheme tables (see msme/credit/migrations.py)."""
+    from msme.credit.migrations import migrate_credit
+    migrate_credit(db)
+
+
+def _m043_msme_reconciliation(db: "Database") -> None:
+    """MSME document <-> bank transaction reconciliation matches (see msme/reconciliation/migrations.py)."""
+    from msme.reconciliation.migrations import migrate_reconciliation
+    migrate_reconciliation(db)
+
+
+def _m039_connection_app_type(db: "Database") -> None:
+    db.ensure_column("Api Key", "app_type", "TEXT DEFAULT 'other'")
+
+
+Database.MIGRATIONS = [
+    (1, "chat_message_session_id", _m001_chat_message_session_id),
+    (2, "chat_session_user_id", _m002_chat_session_user_id),
+    (3, "transactional_remarks", _m003_transactional_remarks),
+    (4, "master_disabled_flag", _m004_master_disabled_flag),
+    (5, "company_stock_in_hand_account", _m005_company_stock_in_hand_account),
+    (6, "company_opening_balance_equity", _m006_company_opening_balance_equity),
+    (7, "pos_invoice_return_fields", _m007_pos_invoice_return_fields),
+    (8, "report_draft_source_chat_session_id", _m008_report_draft_source_chat_session_id),
+    (9, "company_charge_accounts", _m009_company_charge_accounts),
+    (10, "master_zip_code", _m010_master_zip_code),
+    (11, "payment_entry_currency", _m011_payment_entry_currency),
+    (12, "exchange_gain_loss_account", _m012_exchange_gain_loss_account),
+    (13, "unrealized_exchange_account", _m013_unrealized_exchange_account),
+    (14, "company_iban", _m014_company_iban),
+    (15, "document_discarded", _m015_document_discarded),
+    (16, "customer_contact_person", _m016_customer_contact_person),
+    (17, "proposal_cover_template", _m017_proposal_cover_template),
+    (18, "quotation_item_frequency", _m018_quotation_item_frequency),
+    (19, "api_keys_per_user", _m019_api_keys_per_user),
+    (20, "chat_attachment_openai_file", _m020_chat_attachment_openai_file),
+    (21, "item_is_asset_tracked", _m021_item_is_asset_tracked),
+    (22, "company_default_tax_templates", _m022_company_default_tax_templates),
+    (23, "camt_bank_statement_import", _m023_camt_bank_statement_import),
+    (24, "bank_reconciliation", _m024_bank_reconciliation),
+    (25, "bank_reconciliation_multi_account_voucher", _m025_bank_reconciliation_multi_account_voucher),
+    (26, "bank_reconciliation_groups", _m026_bank_reconciliation_groups),
+    (27, "reservation_allocation_mode", _m027_reservation_allocation_mode),
+    (28, "order_planning_from_posted_documents", _m028_order_planning),
+    (29, "subscription_discarded", _m029_subscription_discarded),
+    (30, "generated_pdfs", _m030_generated_pdfs),
+    (31, "time_queries_and_master_timestamps", _m031_time_queries),
+    (32, "ignore_pricing_rule", _m032_ignore_pricing_rule),
+    (33, "external_source", _m033_external_source),
+    (34, "price_list", _m034_price_list),
+    (35, "pricing_rule_dimensions", _m035_pricing_rule_dimensions),
+    (36, "external_identity_integrity", _m036_external_identity_integrity),
+    (37, "pricing_record_lifecycle", _m037_pricing_record_lifecycle),
+    (38, "customer_website", _m038_customer_website),
+    (39, "connection_app_type", _m039_connection_app_type),
+    (40, "msme_document_intelligence", _m040_msme_document_intelligence),
+    (41, "msme_compliance_workspace", _m041_msme_compliance_workspace),
+    (42, "msme_credit_readiness", _m042_msme_credit_readiness),
+    (43, "msme_reconciliation", _m043_msme_reconciliation),
+]
+
+
+_db = None
+
+
+def get_db():
+    global _db
+    if _db is None:
+        _db = Database()
+    return _db
+
+
+def setup(db_path=":memory:"):
+    """Initialize the database. Call once at startup."""
+    global _db
+    _db = Database(db_path)
+    return _db

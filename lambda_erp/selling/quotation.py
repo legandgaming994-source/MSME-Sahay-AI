@@ -1,0 +1,309 @@
+"""
+Quotation (Sales Offer / Proposal).
+
+A Quotation is the first step in the sales cycle:
+  Quotation -> Sales Order -> Delivery Note -> Sales Invoice
+
+It represents an offer to a customer with pricing, validity dates, and terms.
+Key behaviors:
+- Does NOT create GL entries (it's just a proposal)
+- Can be converted to a Sales Order via make_sales_order()
+- Tracks status: Draft -> Submitted/Open -> Ordered/Lost/Expired
+"""
+
+from lambda_erp.model import Document
+from lambda_erp.utils import _dict, flt, getdate, nowdate, new_name
+from lambda_erp.database import get_db
+from lambda_erp.controllers.taxes_and_totals import calculate_taxes_and_totals
+from lambda_erp.controllers.defaults import (
+    set_default_currency, apply_external_source_defaults,
+    derived_pricing_fields, derived_line_pricing_fields,
+)
+from lambda_erp.controllers.item_price import set_item_defaults
+from lambda_erp.exceptions import ValidationError
+
+class Quotation(Document):
+    DOCTYPE = "Quotation"
+    SUBMITTABLE = True
+    CHILD_TABLES = {
+        "items": ("Quotation Item", None),
+        "taxes": ("Sales Taxes and Charges", None),
+    }
+    PREFIX = "QTN"
+
+    LINK_FIELDS = {
+        "customer": "Customer",
+        "company": "Company",
+    }
+    CHILD_LINK_FIELDS = {
+        "items": {
+            "item_code": "Item",
+            "warehouse": "Warehouse",
+        },
+        "taxes": {
+            "account_head": "Account",
+            "cost_center": "Cost Center",
+        },
+    }
+
+    def validate(self):
+        """Validate the quotation before saving.
+
+        Mirrors the reference implementation's Quotation.validate() which calls:
+        - super().validate() (SellingController -> AccountsController -> TransactionBase)
+        - validate_uom_is_integer
+        - validate_valid_till
+        - set_customer_name
+        """
+        if not self.customer:
+            raise ValidationError("Customer is required")
+        if not self.get("items"):
+            raise ValidationError("At least one item is required")
+        if not self.transaction_date:
+            self.transaction_date = nowdate()
+
+        self._validate_valid_till()
+        apply_external_source_defaults(self)
+        self._set_customer_name()
+        set_default_currency(self, "Customer", "customer")
+        self._set_item_defaults()
+
+        from lambda_erp.controllers.pricing_rule import apply_pricing_rules
+        apply_pricing_rules(self)
+
+
+        # Calculate taxes and totals (the core shared calculation)
+        calculate_taxes_and_totals(self)
+        self._apply_frequency_split()
+
+    def _apply_frequency_split(self):
+        """When the offer mixes one-time and recurring lines, the headline
+        totals AND the tax rows reflect the ONE-TIME part only — recurring
+        periods are presented separately (on the PDF) and must not inflate the
+        one-time grand total. A quote with no recurring lines is left exactly as
+        the shared engine computed it."""
+        import copy
+        from lambda_erp.controllers.taxes_and_totals import (
+            has_recurring_items, calculate_taxes_and_totals,
+            ONE_TIME_FREQUENCY, _item_frequency,
+        )
+
+        if not has_recurring_items(self):
+            return
+
+        items = self.get("items") or []
+        one_time_items = [it for it in items if _item_frequency(it) == ONE_TIME_FREQUENCY]
+        taxes = self.get("taxes") or []
+
+        # Re-run the standard engine on the one-time items alone, then copy its
+        # results back so the document's totals and tax rows are self-consistent.
+        tmp = {
+            "items": copy.deepcopy(one_time_items),
+            "taxes": copy.deepcopy(taxes),
+            "conversion_rate": self.get("conversion_rate") or 1.0,
+        }
+        calculate_taxes_and_totals(tmp)
+
+        total_fields = [
+            "total", "base_total", "net_total", "base_net_total",
+            "total_taxes_and_charges", "base_total_taxes_and_charges",
+            "grand_total", "base_grand_total", "rounded_total", "rounding_adjustment",
+        ]
+        for f in total_fields:
+            self[f] = flt(tmp.get(f) or 0, 2)
+
+        # Bring each tax row down to its one-time amount so the printed MWSt line
+        # matches the one-time Gesamttotal.
+        tmp_taxes = tmp.get("taxes") or []
+        for i, tax in enumerate(taxes):
+            src = tmp_taxes[i] if i < len(tmp_taxes) else {}
+            for tf in ("tax_amount", "base_tax_amount", "total", "base_total"):
+                tax[tf] = flt(src.get(tf) or 0, 2)
+
+    def _validate_valid_till(self):
+        if self.valid_till and getdate(self.valid_till) < getdate(self.transaction_date):
+            raise ValidationError("Valid till date cannot be before transaction date")
+
+    def _set_customer_name(self):
+        if not self.customer_name and self.customer:
+            db = get_db()
+            self.customer_name = db.get_value("Customer", self.customer, "customer_name")
+
+    def _set_item_defaults(self):
+        """Names, units and unsupplied rates. See controllers/item_price.py."""
+        set_item_defaults(self, "Customer", "customer")
+
+    def on_submit(self):
+        """On submit, set status to Open."""
+        self._data["status"] = "Open"
+        self._persist()
+
+    def on_cancel(self):
+        pass
+
+    def is_expired(self):
+        """Check if quotation validity has expired."""
+        if self.valid_till:
+            return getdate(self.valid_till) < getdate(nowdate())
+        return False
+
+def make_sales_order(quotation_name):
+    """Convert a Quotation into a Sales Order.
+
+    This is the standard document flow: Quotation -> Sales Order.
+
+    the reference implementation uses get_mapped_doc() which copies fields from source to target
+    based on a mapping configuration. We do the same thing directly.
+    """
+    from lambda_erp.selling.sales_order import SalesOrder
+
+    db = get_db()
+    quotation = Quotation.load(quotation_name)
+
+    if quotation.docstatus != 1:
+        raise ValidationError("Quotation must be submitted before creating Sales Order")
+
+    if quotation.is_expired():
+        raise ValidationError("Validity period of this quotation has ended")
+
+    # Map Quotation fields to Sales Order
+    so = SalesOrder(
+        **derived_pricing_fields(quotation, is_return=False),
+        customer=quotation.customer,
+        customer_name=quotation.customer_name,
+        company=quotation.company,
+        currency=quotation.currency,
+        conversion_rate=quotation.conversion_rate,
+        transaction_date=nowdate(),
+    )
+
+    # Map items
+    for item in quotation.get("items"):
+        so.append("items", _dict(
+            **derived_line_pricing_fields(item),
+            item_code=item.get("item_code"),
+            item_name=item.get("item_name"),
+            description=item.get("description"),
+            qty=item.get("qty"),
+            uom=item.get("uom"),
+            rate=item.get("rate"),
+            price_list_rate=item.get("price_list_rate"),
+            discount_percentage=item.get("discount_percentage"),
+            discount_amount=item.get("discount_amount"),
+            warehouse=item.get("warehouse"),
+            quotation_item=item.get("name"),
+        ))
+
+    # Map taxes
+    for tax in quotation.get("taxes") or []:
+        so.append("taxes", _dict(
+            charge_type=tax.get("charge_type"),
+            account_head=tax.get("account_head"),
+            description=tax.get("description"),
+            rate=tax.get("rate"),
+            tax_amount=0,  # will be recalculated
+            included_in_print_rate=tax.get("included_in_print_rate"),
+        ))
+
+    # Update quotation status
+    db.set_value("Quotation", quotation_name, "status", "Ordered")
+
+    return so
+
+def make_sales_invoice_from_quotation(quotation_name):
+    """Convert a Quotation directly into a Sales Invoice (skip Sales Order)."""
+    from lambda_erp.accounting.sales_invoice import SalesInvoice
+
+    db = get_db()
+    quotation = Quotation.load(quotation_name)
+
+    if quotation.docstatus != 1:
+        raise ValidationError("Quotation must be submitted before creating Sales Invoice")
+
+    if quotation.is_expired():
+        raise ValidationError("Validity period of this quotation has ended")
+
+    sinv = SalesInvoice(
+        **derived_pricing_fields(quotation, is_return=False),
+        customer=quotation.customer,
+        customer_name=quotation.customer_name,
+        company=quotation.company,
+        currency=quotation.currency,
+        conversion_rate=quotation.conversion_rate,
+        posting_date=nowdate(),
+    )
+
+    for item in quotation.get("items"):
+        sinv.append("items", _dict(
+            **derived_line_pricing_fields(item),
+            item_code=item.get("item_code"),
+            item_name=item.get("item_name"),
+            description=item.get("description"),
+            qty=item.get("qty"),
+            uom=item.get("uom"),
+            rate=item.get("rate"),
+            price_list_rate=item.get("price_list_rate"),
+            discount_percentage=item.get("discount_percentage"),
+            discount_amount=item.get("discount_amount"),
+            warehouse=item.get("warehouse"),
+        ))
+
+    for tax in quotation.get("taxes") or []:
+        sinv.append("taxes", _dict(
+            charge_type=tax.get("charge_type"),
+            account_head=tax.get("account_head"),
+            description=tax.get("description"),
+            rate=tax.get("rate"),
+            tax_amount=0,
+            included_in_print_rate=tax.get("included_in_print_rate"),
+        ))
+
+    db.set_value("Quotation", quotation_name, "status", "Ordered")
+
+    return sinv
+
+def make_delivery_note_from_quotation(quotation_name):
+    """Convert a Quotation directly into a Delivery Note (skip Sales Order)."""
+    from lambda_erp.stock.delivery_note import DeliveryNote
+
+    db = get_db()
+    quotation = Quotation.load(quotation_name)
+
+    if quotation.docstatus != 1:
+        raise ValidationError("Quotation must be submitted before creating Delivery Note")
+
+    if quotation.is_expired():
+        raise ValidationError("Validity period of this quotation has ended")
+
+    dn = DeliveryNote(
+        customer=quotation.customer,
+        customer_name=quotation.customer_name,
+        company=quotation.company,
+        currency=quotation.currency,
+        conversion_rate=quotation.conversion_rate,
+        posting_date=nowdate(),
+    )
+
+    for item in quotation.get("items"):
+        dn.append("items", _dict(
+            item_code=item.get("item_code"),
+            item_name=item.get("item_name"),
+            description=item.get("description"),
+            qty=item.get("qty"),
+            uom=item.get("uom"),
+            rate=item.get("rate"),
+            warehouse=item.get("warehouse"),
+        ))
+
+    for tax in quotation.get("taxes") or []:
+        dn.append("taxes", _dict(
+            charge_type=tax.get("charge_type"),
+            account_head=tax.get("account_head"),
+            description=tax.get("description"),
+            rate=tax.get("rate"),
+            tax_amount=0,
+        ))
+
+    db.set_value("Quotation", quotation_name, "status", "Ordered")
+
+    return dn
